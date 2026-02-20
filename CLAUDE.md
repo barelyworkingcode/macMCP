@@ -43,11 +43,11 @@ Entry point reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON 
 ## Build
 
 ```bash
-swift build                  # standalone
-../relay/build.sh            # builds macMCP + relay -> /Applications/Relay.app
+swift build              # debug
+./build.sh               # release, codesigned, installs to ~/.local/bin, registers with Relay
 ```
 
-Binary bundled to `Relay.app/Contents/MacOS/macmcp`. Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3.
+Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3.
 
 ## Adding a Service
 

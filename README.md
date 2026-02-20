@@ -106,34 +106,42 @@ Grant these in System Settings > Privacy & Security as needed:
 - **Messages** -- Full Disk Access (reads `chat.db` directly)
 - **Mail** -- Automation permission for Mail.app (uses JXA)
 
-## Build
+## Build & Install
 
 ```bash
 swift build              # debug
-./build.sh               # release, codesigned
+./build.sh               # release, codesigned, installs to ~/.local/bin, registers with Relay
 ```
 
-The release binary lands at `.build/release/macmcp`.
+`build.sh` installs the binary to `~/.local/bin/macmcp` and registers it with Relay (if installed).
 
 ## Configuration
 
-Add the server to your MCP client config. Example for Claude Desktop (`claude_desktop_config.json`):
+### With Relay (recommended)
+
+`build.sh` handles registration automatically. To register manually:
+
+```bash
+relay mcp register --name macMCP --command ~/.local/bin/macmcp
+```
+
+### Standalone
+
+Add to your MCP client config (e.g. `claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "macmcp": {
-      "command": "/path/to/macmcp"
+      "command": "~/.local/bin/macmcp"
     }
   }
 }
 ```
 
-Replace `/path/to/macmcp` with the actual binary path (e.g. `.build/release/macmcp` or the path inside `Relay.app/Contents/MacOS/macmcp`).
-
 ## Companion App
 
-macMCP is designed to work with [Relay](https://github.com/barelyworkingcode/relay), an MCP host app for macOS. The `build.sh` in the relay repo bundles macMCP into `Relay.app`.
+macMCP is designed to work with [Relay](https://github.com/barelyworkingcode/relay), an MCP orchestrator for macOS. Relay proxies multiple MCP servers through a single authenticated connection.
 
 ## Acknowledgements
 
