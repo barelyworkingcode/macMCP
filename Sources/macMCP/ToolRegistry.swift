@@ -10,10 +10,6 @@ struct ToolRegistration {
 class ToolRegistry {
     private var registrations: [String: ToolRegistration] = [:]
 
-    func register(_ tool: MCPTool, handler: @escaping ToolHandler) {
-        registrations[tool.name] = ToolRegistration(tool: tool, handler: handler)
-    }
-
     func register(_ tool: MCPTool, category: String, handler: @escaping ToolHandler) {
         var t = tool
         t.category = category

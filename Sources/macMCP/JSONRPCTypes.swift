@@ -86,10 +86,6 @@ enum JSONValue: Codable, Equatable {
         return nil
     }
 
-    var arrayValue: [JSONValue]? {
-        if case .array(let a) = self { return a }
-        return nil
-    }
 }
 
 typealias JSONObject = [String: JSONValue]
