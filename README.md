@@ -139,9 +139,12 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 }
 ```
 
-## Companion App
+## Related Projects
 
-macMCP is designed to work with [Relay](https://github.com/barelyworkingcode/relay), an MCP orchestrator for macOS. Relay proxies multiple MCP servers through a single authenticated connection.
+macMCP is part of a trio of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 41 tools -- scoped by per-token permissions so different projects can have different access levels.
+
+- **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator for macOS. macMCP self-registers with Relay via `relay mcp register`, and Relay proxies its tools through a single token-authenticated connection with per-tool permissions.
+- **[Eve](https://github.com/barelyworkingcode/eve)** -- Multi-provider LLM web interface with projects, file editing, and terminal. When both Eve and macMCP register with Relay, LLM sessions gain access to macOS-native tools.
 
 ## Acknowledgements
 
