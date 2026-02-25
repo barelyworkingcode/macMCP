@@ -1,30 +1,37 @@
 import Foundation
 
 enum MailService {
-    private static func runJXA(_ script: String) -> (output: String, error: String?) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-l", "JavaScript", "-e", script]
+    private static func runJXA(_ script: String, retries: Int = 2) -> (output: String, error: String?) {
+        for attempt in 0...retries {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            process.arguments = ["-l", "JavaScript", "-e", script]
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return ("", "failed to run osascript: \(error.localizedDescription)")
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                return ("", "failed to run osascript: \(error.localizedDescription)")
+            }
+
+            let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let errOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            if process.terminationStatus != 0 {
+                if attempt < retries && errOutput.contains("-1728") {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    continue
+                }
+                return (output, errOutput.isEmpty ? "osascript exited with status \(process.terminationStatus)" : errOutput)
+            }
+            return (output, nil)
         }
-
-        let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let errOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        if process.terminationStatus != 0 {
-            return (output, errOutput.isEmpty ? "osascript exited with status \(process.terminationStatus)" : errOutput)
-        }
-        return (output, nil)
+        return ("", "max retries exceeded")
     }
 
     private static func escapeJSString(_ s: String) -> String {
@@ -33,6 +40,40 @@ enum MailService {
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\t", with: "\\t")
+    }
+
+    /// JXA snippet that resolves a mailbox by enumerating objects instead of byName().
+    /// byName() creates a lazy Apple Event specifier that intermittently fails with -1728.
+    private static func mailboxJXA(account: String?, mailbox: String, varName: String = "mbox") -> String {
+        let escapedMailbox = escapeJSString(mailbox)
+        if let account = account {
+            let escapedAccount = escapeJSString(account)
+            return """
+            var \(varName) = (function() {
+                var accts = mail.accounts();
+                for (var i = 0; i < accts.length; i++) {
+                    if (accts[i].name() === '\(escapedAccount)') {
+                        var mboxes = accts[i].mailboxes();
+                        for (var j = 0; j < mboxes.length; j++) {
+                            if (mboxes[j].name() === '\(escapedMailbox)') return mboxes[j];
+                        }
+                        throw new Error('mailbox not found: \(escapedMailbox)');
+                    }
+                }
+                throw new Error('account not found: \(escapedAccount)');
+            })();
+            """
+        } else {
+            return """
+            var \(varName) = (function() {
+                var mboxes = mail.mailboxes();
+                for (var i = 0; i < mboxes.length; i++) {
+                    if (mboxes[i].name() === '\(escapedMailbox)') return mboxes[i];
+                }
+                throw new Error('mailbox not found: \(escapedMailbox)');
+            })();
+            """
+        }
     }
 
     // MARK: - Tool Handlers
@@ -57,7 +98,12 @@ enum MailService {
         if let account = args?["account"]?.stringValue {
             let escaped = escapeJSString(account)
             accountFilter = """
-            var acct = mail.accounts.byName('\(escaped)');
+            var accts = mail.accounts();
+            var acct = null;
+            for (var i = 0; i < accts.length; i++) {
+                if (accts[i].name() === '\(escaped)') { acct = accts[i]; break; }
+            }
+            if (!acct) throw new Error('account not found: \(escaped)');
             var mailboxes = acct.mailboxes();
             """
         } else {
@@ -83,15 +129,7 @@ enum MailService {
     private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let limit = args?["limit"]?.intValue ?? 10
-        let escapedMailbox = escapeJSString(mailbox)
-
-        let mailboxAccess: String
-        if let account = args?["account"]?.stringValue {
-            let escapedAccount = escapeJSString(account)
-            mailboxAccess = "var mbox = mail.accounts.byName('\(escapedAccount)').mailboxes.byName('\(escapedMailbox)');"
-        } else {
-            mailboxAccess = "var mbox = mail.mailboxes.byName('\(escapedMailbox)');"
-        }
+        let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
         let script = """
         var mail = Application('Mail');
@@ -121,15 +159,7 @@ enum MailService {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let escapedMailbox = escapeJSString(mailbox)
-
-        let mailboxAccess: String
-        if let account = args?["account"]?.stringValue {
-            let escapedAccount = escapeJSString(account)
-            mailboxAccess = "var mbox = mail.accounts.byName('\(escapedAccount)').mailboxes.byName('\(escapedMailbox)');"
-        } else {
-            mailboxAccess = "var mbox = mail.mailboxes.byName('\(escapedMailbox)');"
-        }
+        let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
         let escapedId = escapeJSString(messageId)
 
@@ -171,25 +201,13 @@ enum MailService {
         let limit = args?["limit"]?.intValue ?? 10
         let escapedQuery = escapeJSString(query).lowercased()
 
-        let mailboxAccess: String
-        if let account = args?["account"]?.stringValue {
-            let escapedAccount = escapeJSString(account)
-            if let mailbox = args?["mailbox"]?.stringValue {
-                let escapedMailbox = escapeJSString(mailbox)
-                mailboxAccess = "var mbox = mail.accounts.byName('\(escapedAccount)').mailboxes.byName('\(escapedMailbox)'); var msgs = mbox.messages();"
-            } else {
-                mailboxAccess = "var mbox = mail.accounts.byName('\(escapedAccount)').mailboxes.byName('INBOX'); var msgs = mbox.messages();"
-            }
-        } else if let mailbox = args?["mailbox"]?.stringValue {
-            let escapedMailbox = escapeJSString(mailbox)
-            mailboxAccess = "var mbox = mail.mailboxes.byName('\(escapedMailbox)'); var msgs = mbox.messages();"
-        } else {
-            mailboxAccess = "var mbox = mail.mailboxes.byName('INBOX'); var msgs = mbox.messages();"
-        }
+        let searchMailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: searchMailbox)
 
         let script = """
         var mail = Application('Mail');
         \(mailboxAccess)
+        var msgs = mbox.messages();
         var query = '\(escapedQuery)';
         var results = [];
         for (var i = 0; i < msgs.length && results.length < \(limit); i++) {
@@ -277,19 +295,9 @@ enum MailService {
         let sourceMailbox = args?["source_mailbox"]?.stringValue ?? "INBOX"
 
         let escapedId = escapeJSString(messageId)
-        let escapedSource = escapeJSString(sourceMailbox)
-        let escapedTarget = escapeJSString(targetMailbox)
-
-        let mailboxAccess: String
-        let targetAccess: String
-        if let account = args?["account"]?.stringValue {
-            let escapedAccount = escapeJSString(account)
-            mailboxAccess = "var acct = mail.accounts.byName('\(escapedAccount)'); var srcMbox = acct.mailboxes.byName('\(escapedSource)');"
-            targetAccess = "var destMbox = acct.mailboxes.byName('\(escapedTarget)');"
-        } else {
-            mailboxAccess = "var srcMbox = mail.mailboxes.byName('\(escapedSource)');"
-            targetAccess = "var destMbox = mail.mailboxes.byName('\(escapedTarget)');"
-        }
+        let account = args?["account"]?.stringValue
+        let mailboxAccess = mailboxJXA(account: account, mailbox: sourceMailbox, varName: "srcMbox")
+        let targetAccess = mailboxJXA(account: account, mailbox: targetMailbox, varName: "destMbox")
 
         let script = """
         var mail = Application('Mail');
@@ -326,15 +334,7 @@ enum MailService {
 
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let escapedId = escapeJSString(messageId)
-        let escapedMailbox = escapeJSString(mailbox)
-
-        let mailboxAccess: String
-        if let account = args?["account"]?.stringValue {
-            let escapedAccount = escapeJSString(account)
-            mailboxAccess = "var mbox = mail.accounts.byName('\(escapedAccount)').mailboxes.byName('\(escapedMailbox)');"
-        } else {
-            mailboxAccess = "var mbox = mail.mailboxes.byName('\(escapedMailbox)');"
-        }
+        let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
         let script = """
         var mail = Application('Mail');
