@@ -13,6 +13,7 @@ let package = Package(
                 .linkedFramework("Contacts"),
                 .linkedFramework("CoreLocation"),
                 .linkedFramework("Foundation"),
+                .linkedFramework("AppKit"),
             ]
         )
     ]

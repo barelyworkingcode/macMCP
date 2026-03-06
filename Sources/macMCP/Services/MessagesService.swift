@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SQLite3
 
@@ -31,6 +32,16 @@ enum MessagesService {
             return String(cString: cStr)
         }
         return ""
+    }
+
+    /// Extract plain text from the attributedBody blob in chat.db.
+    /// The blob uses NSArchiver's typedstream format containing an NSAttributedString.
+    private static func extractText(fromAttributedBody data: Data) -> String? {
+        if let attrStr = NSUnarchiver.unarchiveObject(with: data) as? NSAttributedString {
+            let text = attrStr.string
+            return text.isEmpty ? nil : text
+        }
+        return nil
     }
 
     // MARK: - Tool Handlers
@@ -89,7 +100,7 @@ enum MessagesService {
         defer { sqlite3_close(db) }
 
         let sql = """
-            SELECT m.text, m.is_from_me, m.date
+            SELECT m.text, m.is_from_me, m.date, m.attributedBody
             FROM message m
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             JOIN chat c ON c.ROWID = cmj.chat_id
@@ -109,9 +120,19 @@ enum MessagesService {
 
         var messages: [[String: Any]] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
-            let text = columnText(stmt, 0)
+            var text = columnText(stmt, 0)
             let isFromMe = sqlite3_column_int64(stmt, 1) == 1
             let appleTimestamp = sqlite3_column_int64(stmt, 2)
+
+            // Fall back to attributedBody when text column is empty
+            if text.isEmpty,
+               let blobPtr = sqlite3_column_blob(stmt, 3) {
+                let blobSize = Int(sqlite3_column_bytes(stmt, 3))
+                if blobSize > 0 {
+                    let data = Data(bytes: blobPtr, count: blobSize)
+                    text = extractText(fromAttributedBody: data) ?? ""
+                }
+            }
 
             // Apple timestamps in chat.db are in nanoseconds since 2001-01-01
             let unixSeconds = Double(appleTimestamp) / 1_000_000_000.0 + appleEpochOffset
