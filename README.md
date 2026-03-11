@@ -139,13 +139,15 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 }
 ```
 
-## Related Projects
+## Ecosystem
 
-macMCP is part of a trio of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 41 tools -- scoped by per-token permissions so different projects can have different access levels.
+macMCP is part of the Relay ecosystem. Each project works independently, but together they provide LLMs with secure access to macOS.
 
-- **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator for macOS. macMCP self-registers with Relay via `relay mcp register`, and Relay proxies its tools through a single token-authenticated connection with per-tool permissions.
-- **[fsMCP](https://github.com/barelyworkingcode/fsmcp)** -- Cross-platform file system MCP server (read, write, edit, glob, grep, bash). Complements macMCP's macOS-native tools with file manipulation capabilities.
-- **[Eve](https://github.com/barelyworkingcode/eve)** -- Multi-provider LLM web interface with projects, file editing, and terminal. When both Eve and macMCP register with Relay, LLM sessions gain access to macOS-native tools.
+- **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator. Proxies macMCP tools through token-authenticated connections with per-tool permissions.
+- **[fsMCP](https://github.com/barelyworkingcode/fsmcp)** -- File system MCP server (read, write, edit, glob, grep, bash). Complements macMCP's macOS-native tools.
+- **[Eve](https://github.com/barelyworkingcode/eve)** -- Browser-based LLM frontend.
+- **[relayLLM](https://github.com/barelyworkingcode/relayLLM)** -- LLM engine service.
+- **[relayScheduler](https://github.com/barelyworkingcode/relayScheduler)** -- Task scheduler for automated LLM prompts.
 
 ## Acknowledgements
 

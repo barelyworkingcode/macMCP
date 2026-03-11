@@ -57,3 +57,10 @@ Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, Core
 4. Use `schema()`, `stringProp()`, `boolProp()`, etc. from `ToolRegistry` for input schemas
 5. Return results via `textResult()`, `errorResult()`, or `jsonResult()`
 6. Call `FooService.register(registry)` in `main.swift`
+
+## Ecosystem
+
+macMCP is part of the Relay ecosystem. It complements fsMCP's file system tools with macOS-native capabilities.
+
+- `../relay/` -- MCP orchestrator. Proxies macMCP tools through token-authenticated connections with per-tool permissions.
+- `../fsMCP/` -- TypeScript MCP server with 6 file system tools. Complements macMCP's macOS-native tools.
