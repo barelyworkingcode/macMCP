@@ -60,3 +60,7 @@ func enumProp(_ description: String, values: [String]) -> JSONValue {
         "enum": .array(values.map { .string($0) })
     ])
 }
+
+func numberProp(_ description: String) -> JSONValue {
+    .object(["type": .string("number"), "description": .string(description)])
+}

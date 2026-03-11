@@ -1,10 +1,6 @@
 import CoreLocation
 import Foundation
 
-private func numberProp(_ description: String) -> JSONValue {
-    .object(["type": .string("number"), "description": .string(description)])
-}
-
 // CLLocationManager delegate that captures a single location update.
 private class LocationDelegate: NSObject, CLLocationManagerDelegate {
     let semaphore = DispatchSemaphore(value: 0)

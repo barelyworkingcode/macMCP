@@ -197,6 +197,117 @@ enum MessagesService {
         return textResult("message sent to \(to)")
     }
 
+    private static func extractDouble(_ args: JSONObject?, key: String) -> Double? {
+        guard let val = args?[key] else { return nil }
+        switch val {
+        case .double(let d): return d
+        case .int(let i): return Double(i)
+        case .string(let s): return Double(s)
+        default: return nil
+        }
+    }
+
+    private static func searchMessages(_ args: JSONObject?) -> MCPCallResult {
+        let limit = args?["limit"]?.intValue ?? 100
+
+        // Compute Apple epoch nanosecond cutoff
+        let cutoffDate: Date
+        if let sinceStr = args?["since"]?.stringValue, !sinceStr.isEmpty {
+            guard let parsed = iso8601.date(from: sinceStr) else {
+                return errorResult("invalid ISO 8601 date for 'since'")
+            }
+            cutoffDate = parsed
+        } else {
+            let hoursAgo = extractDouble(args, key: "hours_ago") ?? 24.0
+            cutoffDate = Date(timeIntervalSinceNow: -hoursAgo * 3600)
+        }
+        let appleNanos = Int64((cutoffDate.timeIntervalSince1970 - appleEpochOffset) * 1_000_000_000)
+
+        let contact = args?["contact"]?.stringValue
+
+        guard let db = openDB() else {
+            return errorResult("failed to open Messages database")
+        }
+        defer { sqlite3_close(db) }
+
+        var sql = """
+            SELECT m.text, m.attributedBody, m.is_from_me, m.date,
+                   h.id AS sender_id,
+                   c.chat_identifier, c.display_name, c.service_name
+            FROM message m
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            JOIN chat c ON c.ROWID = cmj.chat_id
+            LEFT JOIN handle h ON h.ROWID = m.handle_id
+            WHERE m.date > ?1
+            """
+
+        if contact != nil {
+            sql += """
+                 AND cmj.chat_id IN (SELECT chj.chat_id FROM chat_handle_join chj \
+                JOIN handle h2 ON h2.ROWID = chj.handle_id WHERE h2.id = ?3)
+                """
+        }
+
+        sql += " ORDER BY m.date DESC LIMIT ?2"
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return errorResult("failed to prepare query: \(String(cString: sqlite3_errmsg(db)))")
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_int64(stmt, 1, appleNanos)
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        if let contact {
+            sqlite3_bind_text(stmt, 3, contact, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        }
+
+        var messages: [[String: Any]] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            var text = columnText(stmt, 0)
+            let isFromMe = sqlite3_column_int64(stmt, 2) == 1
+            let appleTimestamp = sqlite3_column_int64(stmt, 3)
+            let senderId = columnText(stmt, 4)
+            let chatIdentifier = columnText(stmt, 5)
+            let displayName = columnText(stmt, 6)
+            let serviceName = columnText(stmt, 7)
+
+            // Fall back to attributedBody when text column is empty
+            if text.isEmpty,
+               let blobPtr = sqlite3_column_blob(stmt, 1) {
+                let blobSize = Int(sqlite3_column_bytes(stmt, 1))
+                if blobSize > 0 {
+                    let data = Data(bytes: blobPtr, count: blobSize)
+                    text = extractText(fromAttributedBody: data) ?? ""
+                }
+            }
+
+            // Skip messages with no text content
+            if text.isEmpty { continue }
+
+            let unixSeconds = Double(appleTimestamp) / 1_000_000_000.0 + appleEpochOffset
+            let date = Date(timeIntervalSince1970: unixSeconds)
+            let dateStr = iso8601.string(from: date)
+
+            var msg: [String: Any] = [
+                "text": text,
+                "is_from_me": isFromMe,
+                "date": dateStr,
+                "chat_identifier": chatIdentifier,
+                "service": serviceName,
+            ]
+            if !isFromMe && !senderId.isEmpty {
+                msg["sender"] = senderId
+            }
+            if !displayName.isEmpty {
+                msg["display_name"] = displayName
+            }
+            messages.append(msg)
+        }
+
+        return jsonResult(messages)
+    }
+
     // MARK: - Registration
 
     static func register(_ registry: ToolRegistry) {
@@ -232,6 +343,24 @@ enum MessagesService {
             ),
             category: cat,
             handler: getChat
+        )
+
+        registry.register(
+            MCPTool(
+                name: "messages_search",
+                description: "Search messages across all chats with time-based filtering. Requires Full Disk Access.",
+                inputSchema: schema(
+                    properties: [
+                        "hours_ago": numberProp("How far back to search in hours (default 24)"),
+                        "since": stringProp("ISO 8601 date to search from (overrides hours_ago)"),
+                        "contact": stringProp("Phone number or email to scope to chats involving this person"),
+                        "limit": intProp("Maximum number of messages to return (default 100)")
+                    ]
+                ),
+                annotations: MCPAnnotations(readOnlyHint: true)
+            ),
+            category: cat,
+            handler: searchMessages
         )
 
         registry.register(
