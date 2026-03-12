@@ -416,7 +416,7 @@ enum MailService {
                 description: "Get full email content by message ID. Pass the same account and mailbox used in the mail_get_emails call that returned this ID.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
                         "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
                         "mailbox": stringProp("Mailbox the message is in (default: Inbox). Case-insensitive.")
                     ],
@@ -472,7 +472,7 @@ enum MailService {
                 description: "Move an email to a different mailbox.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
                         "source_mailbox": stringProp("Current mailbox of the message (default: Inbox). Case-insensitive."),
                         "target_mailbox": stringProp("Destination mailbox name from mail_list_mailboxes. Case-insensitive."),
                         "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts.")
@@ -490,7 +490,7 @@ enum MailService {
                 description: "Mark an email as read or unread.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
                         "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
                         "mailbox": stringProp("Mailbox the message is in (default: Inbox). Case-insensitive.")

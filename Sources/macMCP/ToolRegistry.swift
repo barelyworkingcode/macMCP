@@ -45,6 +45,12 @@ func stringProp(_ description: String) -> JSONValue {
     .object(["type": .string("string"), "description": .string(description)])
 }
 
+/// Schema property that accepts a string or integer value. Use for ID fields
+/// where LLMs may emit the value as a bare number instead of a quoted string.
+func stringOrIntProp(_ description: String) -> JSONValue {
+    .object(["type": .array([.string("string"), .string("integer")]), "description": .string(description)])
+}
+
 func intProp(_ description: String) -> JSONValue {
     .object(["type": .string("integer"), "description": .string(description)])
 }
