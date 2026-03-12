@@ -49,10 +49,10 @@ enum RemindersService {
         registry.register(
             MCPTool(
                 name: "reminders_list",
-                description: "List reminders from the Reminders app. Optionally filter by list name.",
+                description: "List reminders. Returns title, completed status, priority, list name, and optional due_date/notes.",
                 inputSchema: schema(
                     properties: [
-                        "list_name": stringProp("Filter by reminder list name")
+                        "list_name": stringProp("Reminder list name to filter by (case-insensitive). Omit to list all reminders.")
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -95,14 +95,14 @@ enum RemindersService {
         registry.register(
             MCPTool(
                 name: "reminders_create",
-                description: "Create a new reminder in the Reminders app.",
+                description: "Create a new reminder.",
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Reminder title"),
-                        "list_name": stringProp("Reminder list name (uses default list if omitted)"),
-                        "due_date": stringProp("Due date in ISO 8601 format"),
+                        "list_name": stringProp("Reminder list name (case-insensitive). Uses default list if omitted."),
+                        "due_date": stringProp("Due date in ISO 8601 format (e.g. 2025-03-15T09:00:00Z)"),
                         "notes": stringProp("Notes for the reminder"),
-                        "priority": intProp("Priority from 0 (none) to 9 (highest)")
+                        "priority": intProp("Priority: 0 = none, 1-4 = high, 5 = medium, 6-9 = low")
                     ],
                     required: ["title"]
                 )
@@ -159,10 +159,10 @@ enum RemindersService {
         registry.register(
             MCPTool(
                 name: "reminders_complete",
-                description: "Mark a reminder as complete by title.",
+                description: "Mark a reminder as complete. Matches by title (case-insensitive). Only matches incomplete reminders.",
                 inputSchema: schema(
                     properties: [
-                        "title": stringProp("Title of the reminder to mark complete")
+                        "title": stringProp("Title of the reminder to complete")
                     ],
                     required: ["title"]
                 )

@@ -50,12 +50,13 @@ enum MailService {
             let escapedAccount = escapeJSString(account)
             return """
             var \(varName) = (function() {
+                var target = '\(escapedMailbox)'.toLowerCase();
                 var accts = mail.accounts();
                 for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name() === '\(escapedAccount)') {
+                    if (accts[i].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
                         var mboxes = accts[i].mailboxes();
                         for (var j = 0; j < mboxes.length; j++) {
-                            if (mboxes[j].name() === '\(escapedMailbox)') return mboxes[j];
+                            if (mboxes[j].name().toLowerCase() === target) return mboxes[j];
                         }
                         throw new Error('mailbox not found: \(escapedMailbox)');
                     }
@@ -66,9 +67,10 @@ enum MailService {
         } else {
             return """
             var \(varName) = (function() {
+                var target = '\(escapedMailbox)'.toLowerCase();
                 var mboxes = mail.mailboxes();
                 for (var i = 0; i < mboxes.length; i++) {
-                    if (mboxes[i].name() === '\(escapedMailbox)') return mboxes[i];
+                    if (mboxes[i].name().toLowerCase() === target) return mboxes[i];
                 }
                 throw new Error('mailbox not found: \(escapedMailbox)');
             })();
@@ -127,7 +129,7 @@ enum MailService {
     }
 
     private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
-        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let mailbox = args?["mailbox"]?.stringValue ?? "Inbox"
         let limit = args?["limit"]?.intValue ?? 10
         let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
@@ -155,10 +157,10 @@ enum MailService {
     }
 
     private static func getEmail(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
-        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let mailbox = args?["mailbox"]?.stringValue ?? "Inbox"
         let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
         let escapedId = escapeJSString(messageId)
@@ -201,7 +203,7 @@ enum MailService {
         let limit = args?["limit"]?.intValue ?? 10
         let escapedQuery = escapeJSString(query).lowercased()
 
-        let searchMailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let searchMailbox = args?["mailbox"]?.stringValue ?? "Inbox"
         let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: searchMailbox)
 
         let script = """
@@ -286,13 +288,13 @@ enum MailService {
     }
 
     private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         guard let targetMailbox = args?["target_mailbox"]?.stringValue else {
             return errorResult("target_mailbox is required")
         }
-        let sourceMailbox = args?["source_mailbox"]?.stringValue ?? "INBOX"
+        let sourceMailbox = args?["source_mailbox"]?.stringValue ?? "Inbox"
 
         let escapedId = escapeJSString(messageId)
         let account = args?["account"]?.stringValue
@@ -325,14 +327,14 @@ enum MailService {
     }
 
     private static func markRead(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         guard let read = args?["read"]?.boolValue else {
             return errorResult("read is required")
         }
 
-        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let mailbox = args?["mailbox"]?.stringValue ?? "Inbox"
         let escapedId = escapeJSString(messageId)
         let mailboxAccess = mailboxJXA(account: args?["account"]?.stringValue, mailbox: mailbox)
 
@@ -394,11 +396,11 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get a list of emails from a mailbox",
+                description: "List emails from a mailbox. Returns id, subject, sender, date, and read status. Use the returned id with mail_get_email to fetch full body content.",
                 inputSchema: schema(
                     properties: [
-                        "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)"),
+                        "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
+                        "mailbox": stringProp("Mailbox name from mail_list_mailboxes (default: Inbox). Case-insensitive."),
                         "limit": intProp("Maximum number of emails to return (default: 10)")
                     ]
                 ),
@@ -411,12 +413,12 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get a single email by message ID, including full body content",
+                description: "Get full email content by message ID. Pass the same account and mailbox used in the mail_get_emails call that returned this ID.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID"),
-                        "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)")
+                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
+                        "mailbox": stringProp("Mailbox the message is in (default: Inbox). Case-insensitive.")
                     ],
                     required: ["message_id"]
                 ),
@@ -429,12 +431,12 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject or sender",
+                description: "Search emails by subject or sender. Returns id, subject, sender, date, and read status.",
                 inputSchema: schema(
                     properties: [
-                        "query": stringProp("Search query to match against subject and sender"),
-                        "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name to search in"),
+                        "query": stringProp("Search text matched against subject and sender (case-insensitive)"),
+                        "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
+                        "mailbox": stringProp("Mailbox to search in (default: Inbox). Case-insensitive."),
                         "limit": intProp("Maximum number of results (default: 10)")
                     ],
                     required: ["query"]
@@ -448,11 +450,11 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_send",
-                description: "Send an email via Mail.app",
+                description: "Send an email via Mail.app.",
                 inputSchema: schema(
                     properties: [
                         "to": stringProp("Recipient email address"),
-                        "subject": stringProp("Email subject"),
+                        "subject": stringProp("Email subject line"),
                         "body": stringProp("Email body text"),
                         "cc": stringProp("CC recipient email address"),
                         "bcc": stringProp("BCC recipient email address")
@@ -467,13 +469,13 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_move",
-                description: "Move an email to a different mailbox",
+                description: "Move an email to a different mailbox.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID of the email to move"),
-                        "source_mailbox": stringProp("Source mailbox name (default: INBOX)"),
-                        "target_mailbox": stringProp("Destination mailbox name"),
-                        "account": stringProp("Account name")
+                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "source_mailbox": stringProp("Current mailbox of the message (default: Inbox). Case-insensitive."),
+                        "target_mailbox": stringProp("Destination mailbox name from mail_list_mailboxes. Case-insensitive."),
+                        "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts.")
                     ],
                     required: ["message_id", "target_mailbox"]
                 )
@@ -485,13 +487,13 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_mark_read",
-                description: "Mark an email as read or unread",
+                description: "Mark an email as read or unread.",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID of the email"),
+                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
-                        "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)")
+                        "account": stringProp("Account name from mail_list_accounts. Omit to search across all accounts."),
+                        "mailbox": stringProp("Mailbox the message is in (default: Inbox). Case-insensitive.")
                     ],
                     required: ["message_id", "read"]
                 )

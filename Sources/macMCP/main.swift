@@ -77,6 +77,7 @@ while let line = readLine(strippingNewline: true) {
         if let args = req.params?["arguments"]?.objectValue {
             arguments = args
         }
+
         let result = registry.call(name: name, arguments: arguments)
 
         let contentValues: [JSONValue] = result.content.map { c in

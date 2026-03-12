@@ -71,6 +71,29 @@ enum JSONValue: Codable, Equatable {
         return nil
     }
 
+    /// Tolerant string accessor for ID-like parameters.
+    /// Handles two LM Studio quirks:
+    /// - Numeric values sent unquoted (coerces int/double → string)
+    /// - Double-quoted strings where the LLM outputs "63926" and the MCP client
+    ///   wraps it again, producing \"63926\" as the decoded string value
+    var coercedStringValue: String? {
+        switch self {
+        case .string(var s):
+            // Strip surrounding double-quote characters from double-encoded strings.
+            while s.count >= 2 && s.hasPrefix("\"") && s.hasSuffix("\"") {
+                s = String(s.dropFirst().dropLast())
+            }
+            return s
+        case .int(let i): return String(i)
+        case .double(let d):
+            if d == d.rounded(.towardZero) && !d.isInfinite {
+                return String(Int(d))
+            }
+            return String(d)
+        default: return nil
+        }
+    }
+
     var intValue: Int? {
         if case .int(let i) = self { return i }
         return nil

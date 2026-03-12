@@ -316,10 +316,10 @@ enum MessagesService {
         registry.register(
             MCPTool(
                 name: "messages_list_chats",
-                description: "List recent chat conversations from Messages.app",
+                description: "List recent chat conversations from Messages.app. Returns chat_identifier, service, and display_name for each chat.",
                 inputSchema: schema(
                     properties: [
-                        "limit": intProp("Maximum number of chats to return (default 20)")
+                        "limit": intProp("Maximum number of chats to return (default: 20)")
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -331,11 +331,11 @@ enum MessagesService {
         registry.register(
             MCPTool(
                 name: "messages_get_chat",
-                description: "Get messages from a specific chat conversation",
+                description: "Get messages from a specific chat. Returns text, sender, date, and direction for each message.",
                 inputSchema: schema(
                     properties: [
-                        "chat_id": stringProp("The chat_identifier to retrieve messages from"),
-                        "limit": intProp("Maximum number of messages to return (default 50)")
+                        "chat_id": stringProp("chat_identifier from messages_list_chats results"),
+                        "limit": intProp("Maximum number of messages to return (default: 50)")
                     ],
                     required: ["chat_id"]
                 ),
@@ -348,13 +348,13 @@ enum MessagesService {
         registry.register(
             MCPTool(
                 name: "messages_search",
-                description: "Search messages across all chats with time-based filtering. Requires Full Disk Access.",
+                description: "Search messages across all chats. Requires Full Disk Access.",
                 inputSchema: schema(
                     properties: [
-                        "hours_ago": numberProp("How far back to search in hours (default 24)"),
-                        "since": stringProp("ISO 8601 date to search from (overrides hours_ago)"),
-                        "contact": stringProp("Phone number or email to scope to chats involving this person"),
-                        "limit": intProp("Maximum number of messages to return (default 100)")
+                        "hours_ago": numberProp("How many hours back to search (default: 24). Ignored if 'since' is provided."),
+                        "since": stringProp("ISO 8601 date to search from. Overrides hours_ago if both are provided."),
+                        "contact": stringProp("Phone number or email to filter to chats with this person"),
+                        "limit": intProp("Maximum number of messages to return (default: 100)")
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -366,7 +366,7 @@ enum MessagesService {
         registry.register(
             MCPTool(
                 name: "messages_send",
-                description: "Send an iMessage to a phone number or email address",
+                description: "Send an iMessage via Messages.app.",
                 inputSchema: schema(
                     properties: [
                         "to": stringProp("Recipient phone number or email address"),

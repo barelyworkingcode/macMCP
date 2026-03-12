@@ -23,25 +23,25 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_list",
-            description: "Search or list contacts. Returns names, phones, emails, and addresses.",
+            description: "Search or list contacts. Returns id, name, phones, emails, and addresses.",
             inputSchema: schema(properties: [
-                "query": stringProp("Name search filter"),
+                "query": stringProp("Name to search for. Omit to list all contacts."),
             ]),
             annotations: MCPAnnotations(readOnlyHint: true)
         ), category: cat, handler: contactsList)
 
         registry.register(MCPTool(
             name: "contacts_get",
-            description: "Get a single contact by identifier.",
+            description: "Get full details for a single contact.",
             inputSchema: schema(properties: [
-                "id": stringProp("Contact identifier"),
+                "id": stringProp("Contact id from contacts_list results"),
             ], required: ["id"]),
             annotations: MCPAnnotations(readOnlyHint: true)
         ), category: cat, handler: contactsGet)
 
         registry.register(MCPTool(
             name: "contacts_create",
-            description: "Create a new contact.",
+            description: "Create a new contact. Returns the new contact id.",
             inputSchema: schema(properties: [
                 "first_name": stringProp("First name"),
                 "last_name": stringProp("Last name"),
@@ -55,9 +55,9 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_update",
-            description: "Update an existing contact.",
+            description: "Update an existing contact. Only provided fields are changed.",
             inputSchema: schema(properties: [
-                "id": stringProp("Contact identifier"),
+                "id": stringProp("Contact id from contacts_list results"),
                 "first_name": stringProp("First name"),
                 "last_name": stringProp("Last name"),
                 "phone": stringProp("Phone number"),
@@ -70,22 +70,22 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_delete",
-            description: "Delete a contact.",
+            description: "Delete a contact permanently.",
             inputSchema: schema(properties: [
-                "id": stringProp("Contact identifier"),
+                "id": stringProp("Contact id from contacts_list results"),
             ], required: ["id"])
         ), category: cat, handler: contactsDelete)
 
         registry.register(MCPTool(
             name: "contacts_list_groups",
-            description: "List all contact groups.",
+            description: "List all contact groups. Returns id and name for each group.",
             inputSchema: emptySchema(),
             annotations: MCPAnnotations(readOnlyHint: true)
         ), category: cat, handler: contactsListGroups)
 
         registry.register(MCPTool(
             name: "contacts_create_group",
-            description: "Create a contact group.",
+            description: "Create a contact group. Returns the new group id.",
             inputSchema: schema(properties: [
                 "name": stringProp("Group name"),
             ], required: ["name"])
@@ -95,8 +95,8 @@ enum ContactsService {
             name: "contacts_add_to_group",
             description: "Add a contact to a group.",
             inputSchema: schema(properties: [
-                "contact_id": stringProp("Contact identifier"),
-                "group_id": stringProp("Group identifier"),
+                "contact_id": stringProp("Contact id from contacts_list results"),
+                "group_id": stringProp("Group id from contacts_list_groups results"),
             ], required: ["contact_id", "group_id"])
         ), category: cat, handler: contactsAddToGroup)
 
@@ -104,16 +104,16 @@ enum ContactsService {
             name: "contacts_remove_from_group",
             description: "Remove a contact from a group.",
             inputSchema: schema(properties: [
-                "contact_id": stringProp("Contact identifier"),
-                "group_id": stringProp("Group identifier"),
+                "contact_id": stringProp("Contact id from contacts_list results"),
+                "group_id": stringProp("Group id from contacts_list_groups results"),
             ], required: ["contact_id", "group_id"])
         ), category: cat, handler: contactsRemoveFromGroup)
 
         registry.register(MCPTool(
             name: "contacts_search_by_phone",
-            description: "Search contacts by phone number.",
+            description: "Search contacts by phone number. Normalizes formatting before matching.",
             inputSchema: schema(properties: [
-                "phone": stringProp("Phone number to search for"),
+                "phone": stringProp("Phone number to search for (any format)"),
             ], required: ["phone"]),
             annotations: MCPAnnotations(readOnlyHint: true)
         ), category: cat, handler: contactsSearchByPhone)
