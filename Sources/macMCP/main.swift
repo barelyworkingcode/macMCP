@@ -1,4 +1,9 @@
+import AppKit
 import Foundation
+
+// NSApplication is required for macOS to honour TCC grants (Location Services, etc.)
+// .prohibited = no Dock icon, no activation — purely for the TCC/permission subsystem.
+NSApplication.shared.setActivationPolicy(.prohibited)
 
 let registry = ToolRegistry()
 

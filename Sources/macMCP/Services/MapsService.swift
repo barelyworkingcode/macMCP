@@ -65,18 +65,22 @@ enum MapsService {
         }
 
         let geocoder = CLGeocoder()
-        let semaphore = DispatchSemaphore(value: 0)
         var placemarks: [CLPlacemark]?
         var geocodeError: Error?
+        var done = false
 
         geocoder.geocodeAddressString(query) { results, error in
             placemarks = results
             geocodeError = error
-            semaphore.signal()
+            done = true
         }
 
-        let timeout = semaphore.wait(timeout: .now() + 15)
-        if timeout == .timedOut {
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
+
+        if !done {
             geocoder.cancelGeocode()
             return errorResult("search timed out")
         }

@@ -6,19 +6,22 @@ enum RemindersService {
 
     private static func ensureAccess() -> String? {
         var granted = false
-        let sem = DispatchSemaphore(value: 0)
+        var done = false
         if #available(macOS 14.0, *) {
             store.requestFullAccessToReminders { ok, _ in
                 granted = ok
-                sem.signal()
+                done = true
             }
         } else {
             store.requestAccess(to: .reminder) { ok, _ in
                 granted = ok
-                sem.signal()
+                done = true
             }
         }
-        sem.wait()
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
         if !granted { return "reminders access denied" }
         return nil
     }
@@ -26,12 +29,15 @@ enum RemindersService {
     private static func fetchReminders(in calendars: [EKCalendar]?) -> [EKReminder] {
         let predicate = store.predicateForReminders(in: calendars)
         var results: [EKReminder] = []
-        let sem = DispatchSemaphore(value: 0)
+        var done = false
         store.fetchReminders(matching: predicate) { reminders in
             results = reminders ?? []
-            sem.signal()
+            done = true
         }
-        sem.wait()
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
         return results
     }
 

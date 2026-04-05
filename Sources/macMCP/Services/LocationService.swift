@@ -6,20 +6,30 @@ private func numberProp(_ description: String) -> JSONValue {
 }
 
 // CLLocationManager delegate that captures a single location update.
+// Uses CFRunLoop instead of semaphore because CLLocationManager requires
+// an active RunLoop on its thread to deliver delegate callbacks.
 private class LocationDelegate: NSObject, CLLocationManagerDelegate {
-    let semaphore = DispatchSemaphore(value: 0)
     var location: CLLocation?
     var error: Error?
+    var done = false
+    private var runLoop: CFRunLoop?
+
+    func setRunLoop(_ rl: CFRunLoop) { runLoop = rl }
+
+    private func finish() {
+        done = true
+        if let rl = runLoop { CFRunLoopStop(rl) }
+    }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         location = locations.last
         manager.stopUpdatingLocation()
-        semaphore.signal()
+        finish()
     }
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         self.error = error
-        semaphore.signal()
+        finish()
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -32,7 +42,7 @@ private class LocationDelegate: NSObject, CLLocationManagerDelegate {
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "location access denied"]
             )
-            semaphore.signal()
+            finish()
         }
     }
 }
@@ -100,33 +110,39 @@ enum LocationService {
     // MARK: - Handlers
 
     private static func getCurrentLocation() -> MCPCallResult {
-        let manager = CLLocationManager()
+        // CLLocationManager requires an active RunLoop on the creating thread.
+        // Run the main thread's RunLoop in small steps to process callbacks.
         let delegate = LocationDelegate()
+        delegate.setRunLoop(CFRunLoopGetMain())
+
+        let manager = CLLocationManager()
         manager.delegate = delegate
         manager.desiredAccuracy = kCLLocationAccuracyBest
 
         let status = manager.authorizationStatus
         if status == .notDetermined {
             manager.requestWhenInUseAuthorization()
-            // Authorization callback will start updating location.
         } else if status == .authorized || status == .authorizedAlways {
             manager.startUpdatingLocation()
         } else {
             return errorResult("location access denied")
         }
 
-        let timeout = delegate.semaphore.wait(timeout: .now() + 15)
-        if timeout == .timedOut {
-            manager.stopUpdatingLocation()
-            return errorResult("timed out waiting for location")
+        // Pump the RunLoop to deliver delegate callbacks.
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !delegate.done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
         }
+
+        // Keep manager alive through the RunLoop so ARC doesn't release it early.
+        withExtendedLifetime(manager) {}
 
         if let error = delegate.error {
             return errorResult("location error: \(error.localizedDescription)")
         }
 
         guard let loc = delegate.location else {
-            return errorResult("no location available")
+            return errorResult("timed out waiting for location")
         }
 
         let result: [String: Any] = [
@@ -140,18 +156,22 @@ enum LocationService {
 
     private static func geocode(address: String) -> MCPCallResult {
         let geocoder = CLGeocoder()
-        let semaphore = DispatchSemaphore(value: 0)
         var placemarks: [CLPlacemark]?
         var geocodeError: Error?
+        var done = false
 
         geocoder.geocodeAddressString(address) { results, error in
             placemarks = results
             geocodeError = error
-            semaphore.signal()
+            done = true
         }
 
-        let timeout = semaphore.wait(timeout: .now() + 15)
-        if timeout == .timedOut {
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
+
+        if !done {
             geocoder.cancelGeocode()
             return errorResult("geocode timed out")
         }
@@ -184,18 +204,22 @@ enum LocationService {
     private static func reverseGeocode(latitude: Double, longitude: Double) -> MCPCallResult {
         let geocoder = CLGeocoder()
         let location = CLLocation(latitude: latitude, longitude: longitude)
-        let semaphore = DispatchSemaphore(value: 0)
         var placemarks: [CLPlacemark]?
         var geocodeError: Error?
+        var done = false
 
         geocoder.reverseGeocodeLocation(location) { results, error in
             placemarks = results
             geocodeError = error
-            semaphore.signal()
+            done = true
         }
 
-        let timeout = semaphore.wait(timeout: .now() + 15)
-        if timeout == .timedOut {
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
+
+        if !done {
             geocoder.cancelGeocode()
             return errorResult("reverse geocode timed out")
         }

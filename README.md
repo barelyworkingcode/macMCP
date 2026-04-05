@@ -102,7 +102,7 @@ Grant these in System Settings > Privacy & Security as needed:
 - **Contacts** -- Contacts access
 - **Calendar** -- Calendars access
 - **Reminders** -- Reminders access
-- **Location** -- Location Services
+- **Location** -- Location Services (on first use, macOS will prompt to allow; click **Allow**)
 - **Messages** -- Full Disk Access (reads `chat.db` directly)
 - **Mail** -- Automation permission for Mail.app (uses JXA)
 

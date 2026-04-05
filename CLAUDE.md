@@ -13,7 +13,7 @@ ToolRegistry.swift   Tool registration map + JSON schema builder helpers
 Services/            One file per service, each a caseless enum namespace
 ```
 
-Entry point reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON to stdout. No async, no concurrency -- all async APIs bridged via `DispatchSemaphore`.
+Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macOS TCC permission support, then reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON to stdout. No async, no concurrency -- all async APIs bridged synchronously via `CFRunLoopRunInMode`.
 
 ## Services
 
@@ -22,7 +22,7 @@ Entry point reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON 
 | Calendar | 3 | EventKit `EKEventStore` |
 | Contacts | 10 | `CNContactStore` |
 | Reminders | 3 | EventKit `EKEventStore` |
-| Location | 3 | CoreLocation (semaphore, 15s timeout) |
+| Location | 3 | CoreLocation (RunLoop-pumped, 15s timeout) |
 | Maps | 3 | `CLGeocoder` + `NSWorkspace` URL schemes |
 | Capture | 2 | `/usr/sbin/screencapture`, `/usr/bin/afrecord` |
 | Mail | 8 | JXA via `/usr/bin/osascript -l JavaScript` |
@@ -34,7 +34,7 @@ Entry point reads stdin line-by-line, dispatches to `ToolRegistry`, writes JSON 
 ## Key Patterns
 
 - **Service = caseless enum** with `static register(_ registry: ToolRegistry)` and private static handlers `(JSONObject?) -> MCPCallResult`.
-- **Sync-over-async** -- semaphores bridge EventKit/CoreLocation/URLSession to synchronous. Safe because single-threaded.
+- **Sync-over-async** -- `CFRunLoopRunInMode` pumps the main RunLoop to deliver callbacks synchronously. All async APIs (EventKit, CoreLocation, CLGeocoder, URLSession, CNContactStore) use this pattern. Semaphores are not used because `NSApplication.shared` routes completions through the main RunLoop, which semaphores would deadlock.
 - **Permissions re-requested** on every tool call. macOS caches the grant, so this is idempotent.
 - **No throws across service boundary** -- all errors returned as `MCPCallResult(isError: true)`.
 - **Messages reads require Full Disk Access** (direct SQLite on `chat.db`).
@@ -47,7 +47,7 @@ swift build              # debug
 ./build.sh               # release, codesigned, installs to ~/.local/bin, registers with Relay
 ```
 
-Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3.
+Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3, AppKit. The binary embeds an `Info.plist` via `-sectcreate` for macOS permission prompts (Location Services).
 
 ## Adding a Service
 

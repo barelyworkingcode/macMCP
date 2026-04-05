@@ -122,13 +122,16 @@ enum ContactsService {
     // MARK: - Access
 
     private static func requestAccess() -> Bool {
-        let semaphore = DispatchSemaphore(value: 0)
         var granted = false
+        var done = false
         store.requestAccess(for: .contacts) { ok, _ in
             granted = ok
-            semaphore.signal()
+            done = true
         }
-        semaphore.wait()
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
         return granted
     }
 

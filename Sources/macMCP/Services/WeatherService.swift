@@ -113,18 +113,22 @@ enum WeatherService {
             return errorResult("invalid URL")
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
         var resultData: Data?
         var resultError: Error?
+        var done = false
 
         URLSession.shared.dataTask(with: url) { data, _, error in
             resultData = data
             resultError = error
-            semaphore.signal()
+            done = true
         }.resume()
 
-        let timeout = semaphore.wait(timeout: .now() + 15)
-        if timeout == .timedOut {
+        let deadline = Date(timeIntervalSinceNow: 15)
+        while !done && Date() < deadline {
+            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        }
+
+        if !done {
             return errorResult("request timed out")
         }
 
