@@ -129,6 +129,32 @@ enum MailService {
         }
     }
 
+    /// Returns JXA snippets to set the sender address. `from` takes precedence over `account` lookup.
+    private static func senderJXA(from: String?, account: String?) -> (lines: String, prop: String) {
+        if let from = from {
+            let escapedFrom = escapeJSString(from)
+            return ("var senderAddr = '\(escapedFrom)';", "msg.sender = senderAddr;")
+        }
+        if let account = account {
+            let escapedAccount = escapeJSString(account)
+            let lines = """
+            var senderAddr = (function() {
+                var accts = mail.accounts();
+                for (var i = 0; i < accts.length; i++) {
+                    if (accts[i].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+                        var addrs = accts[i].emailAddresses();
+                        if (addrs.length > 0) return addrs[0];
+                        throw new Error('account has no email addresses: \(escapedAccount)');
+                    }
+                }
+                throw new Error('account not found: \(escapedAccount)');
+            })();
+            """
+            return (lines, "msg.sender = senderAddr;")
+        }
+        return ("", "")
+    }
+
     // MARK: - Tool Handlers
 
     private static func listAccounts(_ args: JSONObject?) -> MCPCallResult {
@@ -340,7 +366,9 @@ enum MailService {
         return textResult(output)
     }
 
-    private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
+    /// Shared email composition: validates params, builds JXA, runs it.
+    /// `visible` controls whether a compose window opens. `finalAction` is the JXA after recipients are set.
+    private static func composeEmail(_ args: JSONObject?, visible: Bool, finalAction: String, successMessage: String) -> MCPCallResult {
         guard let to = args?["to"]?.stringValue else {
             return errorResult("to is required")
         }
@@ -378,20 +406,32 @@ enum MailService {
             """
         }
 
+        let senderSnippet = senderJXA(from: args?["from"]?.stringValue, account: args?["account"]?.stringValue)
+        let visibleProp = visible ? "" : ",\n    visible: false"
+
         let script = """
         var mail = Application('Mail');
+        \(senderSnippet.lines)
         var msg = mail.OutgoingMessage({
             subject: '\(escapedSubject)',
-            content: '\(escapedBody)'
+            content: '\(escapedBody)'\(visibleProp)
         });
         mail.outgoingMessages.push(msg);
         \(recipientLines)
-        msg.send();
-        'sent';
+        \(senderSnippet.prop)
+        \(finalAction)
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
-        return textResult(output.isEmpty ? "email sent" : output)
+        return textResult(output.isEmpty ? successMessage : output)
+    }
+
+    private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
+        composeEmail(args, visible: true, finalAction: "msg.send();\n'sent';", successMessage: "email sent")
+    }
+
+    private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
+        composeEmail(args, visible: false, finalAction: "mail.save(msg);\n'draft created';", successMessage: "draft created")
     }
 
     private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
@@ -548,13 +588,36 @@ enum MailService {
                         "subject": stringProp("Email subject"),
                         "body": stringProp("Email body text"),
                         "cc": stringProp("CC recipient email address"),
-                        "bcc": stringProp("BCC recipient email address")
+                        "bcc": stringProp("BCC recipient email address"),
+                        "from": stringProp("Sender email address (overrides account lookup)"),
+                        "account": stringProp("Account name to send from (uses default account if omitted)")
                     ],
                     required: ["to", "subject", "body"]
                 )
             ),
             category: cat,
             handler: sendEmail
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_create_draft",
+                description: "Create an email draft in Mail.app's Drafts folder. Does NOT send the email",
+                inputSchema: schema(
+                    properties: [
+                        "to": stringProp("Recipient email address"),
+                        "subject": stringProp("Email subject"),
+                        "body": stringProp("Email body text"),
+                        "cc": stringProp("CC recipient email address"),
+                        "bcc": stringProp("BCC recipient email address"),
+                        "from": stringProp("Sender email address (overrides account lookup)"),
+                        "account": stringProp("Account name to save draft in (uses default account if omitted)")
+                    ],
+                    required: ["to", "subject", "body"]
+                )
+            ),
+            category: cat,
+            handler: createDraft
         )
 
         registry.register(

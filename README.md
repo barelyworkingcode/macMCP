@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 41 tools across 11 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools across 11 services. No external dependencies.
 
 ## Tools
 
@@ -61,6 +61,7 @@ Standalone Swift MCP server exposing macOS-native tools via stdio. 41 tools acro
 | `mail_get_email` | Get a single email with full body |
 | `mail_search` | Search by subject or sender |
 | `mail_send` | Send an email |
+| `mail_create_draft` | Create an email draft (does not send) |
 | `mail_move` | Move an email to another mailbox |
 | `mail_mark_read` | Mark as read/unread |
 
@@ -141,7 +142,7 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 
 ## Related Projects
 
-macMCP is part of a trio of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 41 tools -- scoped by per-token permissions so different projects can have different access levels.
+macMCP is part of a trio of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 42 tools -- scoped by per-token permissions so different projects can have different access levels.
 
 - **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator for macOS. macMCP self-registers with Relay via `relay mcp register`, and Relay proxies its tools through a single token-authenticated connection with per-tool permissions.
 - **[fsMCP](https://github.com/barelyworkingcode/fsmcp)** -- Cross-platform file system MCP server (read, write, edit, glob, grep, bash). Complements macMCP's macOS-native tools with file manipulation capabilities.

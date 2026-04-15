@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 41 tools across 11 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools across 11 services. No external dependencies.
 
 ## Architecture
 
