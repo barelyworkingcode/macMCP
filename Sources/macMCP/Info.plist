@@ -6,6 +6,12 @@
 	<string>com.barelyworkingcode.macmcp</string>
 	<key>CFBundleName</key>
 	<string>macMCP</string>
+	<key>CFBundleExecutable</key>
+	<string>macmcp</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>macMCP needs your location for weather, mapping, and location tools.</string>
 	<key>NSLocationUsageDescription</key>

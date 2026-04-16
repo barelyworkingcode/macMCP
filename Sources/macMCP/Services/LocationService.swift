@@ -110,6 +110,10 @@ enum LocationService {
     // MARK: - Handlers
 
     private static func getCurrentLocation() -> MCPCallResult {
+        guard CLLocationManager.locationServicesEnabled() else {
+            return errorResult("location services are disabled system-wide. Enable in System Settings > Privacy & Security > Location Services")
+        }
+
         // CLLocationManager requires an active RunLoop on the creating thread.
         // Run the main thread's RunLoop in small steps to process callbacks.
         let delegate = LocationDelegate()
@@ -122,10 +126,27 @@ enum LocationService {
         let status = manager.authorizationStatus
         if status == .notDetermined {
             manager.requestWhenInUseAuthorization()
+            // Wait up to 5 seconds for the system authorization prompt.
+            // When spawned as a stdio subprocess (e.g. via an MCP host), macOS
+            // often cannot show the TCC dialog, so fail fast with guidance.
+            let authDeadline = Date(timeIntervalSinceNow: 5)
+            while manager.authorizationStatus == .notDetermined && Date() < authDeadline {
+                CFRunLoopRunInMode(.defaultMode, 0.25, true)
+            }
+            let updated = manager.authorizationStatus
+            if updated == .authorized || updated == .authorizedAlways {
+                manager.startUpdatingLocation()
+            } else if updated == .notDetermined {
+                withExtendedLifetime(manager) {}
+                return errorResult("location permission not determined — the system prompt may not have appeared. Grant access manually: System Settings > Privacy & Security > Location Services > macmcp")
+            } else {
+                withExtendedLifetime(manager) {}
+                return errorResult("location access denied. Grant access in System Settings > Privacy & Security > Location Services > macmcp")
+            }
         } else if status == .authorized || status == .authorizedAlways {
             manager.startUpdatingLocation()
         } else {
-            return errorResult("location access denied")
+            return errorResult("location access denied. Grant access in System Settings > Privacy & Security > Location Services > macmcp")
         }
 
         // Pump the RunLoop to deliver delegate callbacks.

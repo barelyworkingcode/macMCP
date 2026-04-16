@@ -2,12 +2,24 @@ import AppKit
 import Foundation
 
 // NSApplication is required for macOS to honour TCC grants (Location Services, etc.)
-// .prohibited = no Dock icon, no activation — purely for the TCC/permission subsystem.
-NSApplication.shared.setActivationPolicy(.prohibited)
+// .accessory = no Dock icon, but can receive events and display system dialogs (TCC
+// prompts). .prohibited would suppress TCC prompts entirely when spawned as a subprocess.
+NSApplication.shared.setActivationPolicy(.accessory)
+
+// --request-permissions: trigger TCC prompts interactively, then exit.
+// Designed to be run once from a terminal (e.g. during build/install) so that
+// macOS shows the permission dialogs. TCC prompts don't appear when the process
+// is spawned as a stdio subprocess by another app.
+if CommandLine.arguments.contains("--request-permissions") {
+    let result = PermissionsService.requestAll()
+    print(result)
+    exit(0)
+}
 
 let registry = ToolRegistry()
 
 // Register all services
+PermissionsService.register(registry)
 CalendarService.register(registry)
 ContactsService.register(registry)
 RemindersService.register(registry)
