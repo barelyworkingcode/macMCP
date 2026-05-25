@@ -44,23 +44,22 @@ echo "Installed: $APP_BUNDLE"
 # Symlink the binary so existing PATH-based invocations still work.
 ln -sf "macmcp.app/Contents/MacOS/macmcp" "$INSTALL_DIR/macmcp"
 
-# Request TCC permissions interactively. Launching via `open` makes macmcp
-# the responsible process for TCC attribution (running the binary directly
-# would attribute prompts to whatever shell is the parent, e.g. iTerm).
-# Calendars/Contacts/Reminders panes in modern macOS have no manual + button,
-# so the prompt must be triggered from macmcp itself or those grants are
-# unreachable.
-echo ""
-echo "Requesting macOS permissions (approve any system dialogs that appear)..."
-open "$APP_BUNDLE" --args --request-permissions
-# Brief pause to let prompts surface before the script exits.
-sleep 2
-echo ""
-
-# Register with Relay (best-effort, relay may not be installed)
+# Register with Relay (best-effort, relay may not be installed).
+# --tcc-services declares which macOS TCC services macMCP touches so Relay's
+# Settings UI can offer a "Reset Permissions" button on this MCP card. The
+# button is the canonical way to grant macMCP its TCC permissions: it spawns
+# the binary from the relay tray (matching runtime attribution) instead of
+# from this install script's parent shell (which would attribute prompts to
+# iTerm/Terminal and create the wrong TCC entries).
 RELAY="/Applications/Relay.app/Contents/MacOS/relay"
 if [ -x "$RELAY" ]; then
-    "$RELAY" mcp register --name macMCP --command "$MACOS_DIR/macmcp"
+    "$RELAY" mcp register --name macMCP \
+        --command "$MACOS_DIR/macmcp" \
+        --tcc-services calendar,contacts,reminders,microphone,appleevents
+    echo ""
+    echo "Next: open Relay > Settings > MCP Servers > macMCP > Reset Permissions"
+    echo "      to trigger TCC prompts attributed to macmcp (or to Relay as its"
+    echo "      responsible parent), so they persist across rebuilds."
 else
     echo "Relay not found at $RELAY, skipping registration"
 fi
