@@ -17,6 +17,9 @@ BIN=".build/release/macmcp"
 mkdir -p "$MACOS_DIR"
 cp "$BIN" "$MACOS_DIR/macmcp"
 cp Sources/macMCP/Info.plist "$CONTENTS/Info.plist"
+# PkgInfo is the legacy 8-byte type/creator file; LaunchServices refuses to
+# `open` bundles without it (manifests as Finder/open returning error -600).
+printf "APPL????" > "$CONTENTS/PkgInfo"
 
 # Code signing -- mirrors relay's pattern so the cdhash stays stable across
 # rebuilds (TCC keys grants off the designated requirement when Developer ID
@@ -41,13 +44,17 @@ echo "Installed: $APP_BUNDLE"
 # Symlink the binary so existing PATH-based invocations still work.
 ln -sf "macmcp.app/Contents/MacOS/macmcp" "$INSTALL_DIR/macmcp"
 
-# Request TCC permissions interactively. macOS only shows permission prompts
-# when the process runs from an interactive terminal — not when spawned as a
-# stdio subprocess. Running this here means the user grants permissions once
-# during install, and they work through Relay going forward.
+# Request TCC permissions interactively. Launching via `open` makes macmcp
+# the responsible process for TCC attribution (running the binary directly
+# would attribute prompts to whatever shell is the parent, e.g. iTerm).
+# Calendars/Contacts/Reminders panes in modern macOS have no manual + button,
+# so the prompt must be triggered from macmcp itself or those grants are
+# unreachable.
 echo ""
 echo "Requesting macOS permissions (approve any system dialogs that appear)..."
-"$MACOS_DIR/macmcp" --request-permissions
+open "$APP_BUNDLE" --args --request-permissions
+# Brief pause to let prompts surface before the script exits.
+sleep 2
 echo ""
 
 # Register with Relay (best-effort, relay may not be installed)
