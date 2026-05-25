@@ -16,5 +16,15 @@
 	<string>macMCP needs your location for weather, mapping, and location tools.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>macMCP needs your location for weather, mapping, and location tools.</string>
+	<key>NSContactsUsageDescription</key>
+	<string>macMCP needs access to Contacts so the LLM can search and read your address book.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>macMCP needs access to Calendars so the LLM can read and manage your events.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>macMCP needs access to Reminders so the LLM can read and manage your reminders.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>macMCP sends Apple Events to Mail and Messages so the LLM can read, search, and send through those apps.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>macMCP needs microphone access so the LLM can record audio via the capture tools.</string>
 </dict>
 </plist>

@@ -25,11 +25,11 @@ cp Sources/macMCP/Info.plist "$CONTENTS/Info.plist"
 IDENTITY="${RELAY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -o '"[^"]*"' | head -1 | tr -d '"' || true)}"
 if [ -n "$IDENTITY" ]; then
     echo "Signing with: $IDENTITY"
-    SIGN_ARGS=(--force --sign "$IDENTITY" --options runtime --timestamp)
+    SIGN_ARGS=(--force --sign "$IDENTITY" --entitlements macmcp.entitlements --options runtime --timestamp)
 else
     echo "No Developer ID found, ad-hoc signing"
-    # Ad-hoc can't --timestamp (no cert authority), but runtime stays on for parity.
-    SIGN_ARGS=(--force --sign - --options runtime)
+    # Ad-hoc can't --timestamp (no cert authority), but runtime + entitlements stay on for parity.
+    SIGN_ARGS=(--force --sign - --entitlements macmcp.entitlements --options runtime)
 fi
 # Sign inner binary first, then the bundle (innermost-first is the codesign rule).
 codesign "${SIGN_ARGS[@]}" "$MACOS_DIR/macmcp"

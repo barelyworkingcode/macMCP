@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		Hardened runtime gates AppleEvents: a process can only be the "responsible
+		parent" for a child that sends AppleEvents (e.g. /usr/bin/osascript spawned
+		by MailService / MessagesService) if it declares this entitlement. Without
+		it, TCC cannot route the "macMCP wants to control Mail" prompt correctly
+		and the AppleEvent is blocked.
+	-->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>
