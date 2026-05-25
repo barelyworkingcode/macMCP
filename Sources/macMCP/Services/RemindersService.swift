@@ -4,25 +4,19 @@ import Foundation
 enum RemindersService {
     private static let store = EKEventStore()
 
+    /// Read-only check; see CalendarService.hasAccess for full rationale.
+    /// Returns nil if authorized, otherwise an error string for the tool result.
     private static func ensureAccess() -> String? {
-        var granted = false
-        var done = false
+        let status = EKEventStore.authorizationStatus(for: .reminder)
+        let ok: Bool
         if #available(macOS 14.0, *) {
-            store.requestFullAccessToReminders { ok, _ in
-                granted = ok
-                done = true
-            }
+            ok = (status == .fullAccess)
         } else {
-            store.requestAccess(to: .reminder) { ok, _ in
-                granted = ok
-                done = true
-            }
+            ok = (status == .authorized)
         }
-        let deadline = Date(timeIntervalSinceNow: 15)
-        while !done && Date() < deadline {
-            CFRunLoopRunInMode(.defaultMode, 0.25, true)
+        if !ok {
+            return "reminders access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions"
         }
-        if !granted { return "reminders access denied" }
         return nil
     }
 

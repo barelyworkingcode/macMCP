@@ -4,27 +4,19 @@ import Foundation
 enum CalendarService {
     private static let store = EKEventStore()
 
-    private static func requestAccess() -> Bool {
-        var granted = false
-        var done = false
-
+    /// Read-only check for whether Calendar access is granted. macmcp
+    /// inherits Relay's grant via TCC's responsible-parent attribution at
+    /// runtime, so calling requestFullAccessToEvents from macmcp itself is
+    /// pointless: tccd silently denies the request for any bundle lacking
+    /// com.apple.security.personal-information.calendars, and macmcp doesn't
+    /// carry that entitlement (Relay does). Use Relay > Settings > MCP >
+    /// Reset Permissions to grant via Relay's process.
+    private static func hasAccess() -> Bool {
+        let status = EKEventStore.authorizationStatus(for: .event)
         if #available(macOS 14.0, *) {
-            store.requestFullAccessToEvents { ok, _ in
-                granted = ok
-                done = true
-            }
-        } else {
-            store.requestAccess(to: .event) { ok, _ in
-                granted = ok
-                done = true
-            }
+            return status == .fullAccess
         }
-
-        let deadline = Date(timeIntervalSinceNow: 15)
-        while !done && Date() < deadline {
-            CFRunLoopRunInMode(.defaultMode, 0.25, true)
-        }
-        return granted
+        return status == .authorized
     }
 
     private static let iso8601Formatter: ISO8601DateFormatter = {
@@ -61,8 +53,8 @@ enum CalendarService {
     // MARK: - Tool Handlers
 
     private static func listCalendars(_ args: JSONObject?) -> MCPCallResult {
-        guard requestAccess() else {
-            return errorResult("calendar access denied")
+        guard hasAccess() else {
+            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
         }
 
         let calendars = store.calendars(for: .event)
@@ -77,8 +69,8 @@ enum CalendarService {
     }
 
     private static func listEvents(_ args: JSONObject?) -> MCPCallResult {
-        guard requestAccess() else {
-            return errorResult("calendar access denied")
+        guard hasAccess() else {
+            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
         }
 
         guard let startStr = args?["start_date"]?.stringValue,
@@ -124,8 +116,8 @@ enum CalendarService {
     }
 
     private static func createEvent(_ args: JSONObject?) -> MCPCallResult {
-        guard requestAccess() else {
-            return errorResult("calendar access denied")
+        guard hasAccess() else {
+            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
         }
 
         guard let title = args?["title"]?.stringValue,
