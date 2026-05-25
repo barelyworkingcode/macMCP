@@ -116,6 +116,12 @@ swift build              # debug
 
 `build.sh` installs the binary to `~/.local/bin/macmcp` and registers it with Relay (if installed).
 
+### Code signing
+
+Builds run codesign with hardened runtime. The first `Developer ID Application` cert in your login keychain is picked automatically; if none exists, the build falls back to ad-hoc signing. Pin a specific cert with `RELAY_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh`.
+
+When signed with a stable Developer ID, macOS TCC keys permission grants off the bundle's designated requirement — so Contacts/Calendar/Reminders/Location prompts persist across rebuilds. Ad-hoc builds re-prompt every rebuild because TCC keys off the cdhash, which changes with every compile.
+
 ## Configuration
 
 ### With Relay (recommended)

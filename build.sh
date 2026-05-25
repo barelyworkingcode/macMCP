@@ -18,14 +18,23 @@ mkdir -p "$MACOS_DIR"
 cp "$BIN" "$MACOS_DIR/macmcp"
 cp Sources/macMCP/Info.plist "$CONTENTS/Info.plist"
 
-IDENTITY=$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -o '"[^"]*"' | head -1 | tr -d '"' || true)
+# Code signing -- mirrors relay's pattern so the cdhash stays stable across
+# rebuilds (TCC keys grants off the designated requirement when Developer ID
+# signed, vs cdhash when ad-hoc -- the latter re-prompts every build).
+# RELAY_SIGN_IDENTITY lets you pin a specific cert when multiple are present.
+IDENTITY="${RELAY_SIGN_IDENTITY:-$(security find-identity -v -p codesigning | grep "Developer ID Application" | grep -o '"[^"]*"' | head -1 | tr -d '"' || true)}"
 if [ -n "$IDENTITY" ]; then
     echo "Signing with: $IDENTITY"
-    codesign --force --sign "$IDENTITY" --options runtime "$APP_BUNDLE"
+    SIGN_ARGS=(--force --sign "$IDENTITY" --options runtime --timestamp)
 else
     echo "No Developer ID found, ad-hoc signing"
-    codesign --force --sign - "$APP_BUNDLE"
+    # Ad-hoc can't --timestamp (no cert authority), but runtime stays on for parity.
+    SIGN_ARGS=(--force --sign - --options runtime)
 fi
+# Sign inner binary first, then the bundle (innermost-first is the codesign rule).
+codesign "${SIGN_ARGS[@]}" "$MACOS_DIR/macmcp"
+codesign "${SIGN_ARGS[@]}" "$APP_BUNDLE"
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 echo "Installed: $APP_BUNDLE"
 
