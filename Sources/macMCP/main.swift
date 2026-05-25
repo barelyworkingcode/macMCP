@@ -6,13 +6,20 @@ import Foundation
 // prompts). .prohibited would suppress TCC prompts entirely when spawned as a subprocess.
 NSApplication.shared.setActivationPolicy(.accessory)
 
-// --request-permissions: trigger TCC prompts interactively, then exit.
-// Designed to be run once from a terminal (e.g. during build/install) so that
-// macOS shows the permission dialogs. TCC prompts don't appear when the process
-// is spawned as a stdio subprocess by another app.
-if CommandLine.arguments.contains("--request-permissions") {
-    let result = PermissionsService.requestAll()
-    print(result)
+// --check-permissions: read and print the current TCC authorization status
+// for every service macMCP touches, then exit.
+//
+// This is the status-reporting half of Relay's Reset Permissions flow. The
+// actual prompt-and-grant happens in Relay (which carries the required
+// com.apple.security.personal-information.* entitlements); macmcp inherits
+// those grants via TCC's responsible-parent attribution at runtime, so it
+// has no reason to call any request* API itself.
+//
+// `--request-permissions` is accepted as a deprecated alias for older Relay
+// builds that haven't been updated to the new flag name.
+if CommandLine.arguments.contains("--check-permissions")
+    || CommandLine.arguments.contains("--request-permissions") {
+    print(PermissionsService.checkAll())
     exit(0)
 }
 

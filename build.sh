@@ -58,8 +58,9 @@ if [ -x "$RELAY" ]; then
         --tcc-services calendar,contacts,reminders,microphone,appleevents
     echo ""
     echo "Next: open Relay > Settings > MCP Servers > macMCP > Reset Permissions"
-    echo "      to trigger TCC prompts attributed to macmcp (or to Relay as its"
-    echo "      responsible parent), so they persist across rebuilds."
+    echo "      Relay's own process will fire the TCC prompts (it carries the"
+    echo "      personal-information entitlements); macmcp inherits the grants"
+    echo "      via responsible-parent attribution at runtime."
 else
     echo "Relay not found at $RELAY, skipping registration"
 fi

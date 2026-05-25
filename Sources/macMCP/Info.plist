@@ -24,8 +24,21 @@
 	<string>macMCP needs your location for weather, mapping, and location tools.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>macMCP needs access to Contacts so the LLM can search and read your address book.</string>
+	<!--
+		macOS 14+ requires the new "full access" keys for the EKEventStore
+		requestFullAccessToEvents / requestFullAccessToReminders APIs.
+		Calling those APIs without the matching key results in a silent no-op
+		(no prompt, no state change) -- not an error visible to the app.
+		The legacy NSCalendarsUsageDescription / NSRemindersUsageDescription
+		stay declared for older macOS and to satisfy any tooling that still
+		expects them.
+	-->
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>macMCP needs full access to Calendars so the LLM can read and manage your events.</string>
 	<key>NSCalendarsUsageDescription</key>
 	<string>macMCP needs access to Calendars so the LLM can read and manage your events.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>macMCP needs full access to Reminders so the LLM can read and manage your reminders.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>macMCP needs access to Reminders so the LLM can read and manage your reminders.</string>
 	<key>NSAppleEventsUsageDescription</key>

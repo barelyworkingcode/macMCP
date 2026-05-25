@@ -3,18 +3,33 @@ import CoreLocation
 import EventKit
 import Foundation
 
+/// PermissionsService reports the current TCC authorization status for the
+/// services macMCP touches. It does NOT call requestAccess / requestFullAccess
+/// on any framework, because:
+///
+///   * Under hardened runtime, tccd silently denies request APIs for any
+///     bundle missing the matching com.apple.security.personal-information.*
+///     entitlement -- no prompt is ever shown to the user. macmcp.app
+///     doesn't declare those entitlements (and shouldn't have to).
+///   * The actual prompt-and-grant happens in Relay (which DOES carry the
+///     entitlements). macmcp inherits Relay's grants via TCC's
+///     responsible-parent attribution at runtime, so no API call from
+///     macmcp could ever surface a useful prompt regardless.
+///
+/// The Settings UI's "Reset Permissions" button drives the whole flow from
+/// Relay; this service is just the read-side / status surface.
 enum PermissionsService {
     static func register(_ registry: ToolRegistry) {
         registry.register(
             MCPTool(
                 name: "permissions_check",
-                description: "Check and request macOS permissions for all TCC-protected services (Location, Calendars, Contacts, Reminders). Call after initialization to trigger system permission prompts if needed.",
+                description: "Report current macOS permission status for the TCC-protected services macMCP uses (Location, Calendars, Contacts, Reminders). Read-only; does not trigger system prompts. Use Relay > Settings > MCP > Reset Permissions to grant or re-grant.",
                 inputSchema: emptySchema(),
                 annotations: MCPAnnotations(readOnlyHint: true)
             ),
             category: "System"
         ) { _ in
-            let results = requestPermissions()
+            let results = checkPermissions()
             let denied = results.filter { $0.status != "authorized" }
             if denied.isEmpty {
                 return jsonResult(["permissions": results.map(\.dict), "ok": true])
@@ -22,15 +37,17 @@ enum PermissionsService {
             return jsonResult([
                 "permissions": results.map(\.dict),
                 "ok": false,
-                "message": "Some permissions are not granted. Open System Settings > Privacy & Security to grant access to macmcp.",
+                "message": "Some permissions are not granted. Open Relay > Settings > MCP Servers > macMCP > Reset Permissions, or grant manually in System Settings > Privacy & Security.",
             ])
         }
     }
 
-    /// Request all TCC permissions and return a human-readable summary.
-    /// Called from --request-permissions CLI mode and from the permissions_check tool.
-    static func requestAll() -> String {
-        let results = requestPermissions()
+    /// Read current TCC status for every macmcp-relevant service and return
+    /// a human-readable summary. Called from `--check-permissions` CLI mode
+    /// (which Relay's Reset Permissions flow spawns for status reporting)
+    /// and from the permissions_check MCP tool.
+    static func checkAll() -> String {
+        let results = checkPermissions()
         var lines: [String] = ["macMCP permissions:"]
         for r in results {
             let icon = r.status == "authorized" ? "+" : "-"
@@ -39,7 +56,7 @@ enum PermissionsService {
         let denied = results.filter { $0.status != "authorized" }
         if !denied.isEmpty {
             lines.append("")
-            lines.append("Grant access in System Settings > Privacy & Security for each denied service.")
+            lines.append("Grant via Relay > Settings > MCP > Reset Permissions (or System Settings).")
         }
         return lines.joined(separator: "\n")
     }
@@ -52,71 +69,24 @@ enum PermissionsService {
         var dict: [String: Any] { ["service": service, "status": status] }
     }
 
-    private static func requestPermissions() -> [PermResult] {
-        var pendingManagers: [CLLocationManager] = [] // prevent ARC release
-
-        // -- Location --
-        let locManager = CLLocationManager()
-        let locBefore = locManager.authorizationStatus
-        if locBefore == .notDetermined {
-            locManager.requestWhenInUseAuthorization()
-            pendingManagers.append(locManager)
-        }
-
-        // -- Calendars --
-        let calStore = EKEventStore()
-        let calBefore = EKEventStore.authorizationStatus(for: .event)
-        if calBefore == .notDetermined {
-            if #available(macOS 14.0, *) {
-                calStore.requestFullAccessToEvents { _, _ in }
-            } else {
-                calStore.requestAccess(to: .event) { _, _ in }
-            }
-        }
-
-        // -- Contacts --
-        let contactStore = CNContactStore()
-        let contactsBefore = CNContactStore.authorizationStatus(for: .contacts)
-        if contactsBefore == .notDetermined {
-            contactStore.requestAccess(for: .contacts) { _, _ in }
-        }
-
-        // -- Reminders --
-        let remStore = EKEventStore()
-        let remBefore = EKEventStore.authorizationStatus(for: .reminder)
-        if remBefore == .notDetermined {
-            if #available(macOS 14.0, *) {
-                remStore.requestFullAccessToReminders { _, _ in }
-            } else {
-                remStore.requestAccess(to: .reminder) { _, _ in }
-            }
-        }
-
-        // Pump the RunLoop to allow TCC prompts to appear and be responded to.
-        // 30s is enough for a user to respond to all prompts sequentially.
-        let deadline = Date(timeIntervalSinceNow: 30)
-        while Date() < deadline {
-            let locResolved = locBefore != .notDetermined || locManager.authorizationStatus != .notDetermined
-            let calResolved = calBefore != .notDetermined || EKEventStore.authorizationStatus(for: .event) != .notDetermined
-            let conResolved = contactsBefore != .notDetermined || CNContactStore.authorizationStatus(for: .contacts) != .notDetermined
-            let remResolved = remBefore != .notDetermined || EKEventStore.authorizationStatus(for: .reminder) != .notDetermined
-
-            if locResolved && calResolved && conResolved && remResolved { break }
-            CFRunLoopRunInMode(.defaultMode, 0.25, true)
-        }
-
-        // Keep managers alive through the RunLoop.
-        withExtendedLifetime(pendingManagers) {}
-        withExtendedLifetime(calStore) {}
-        withExtendedLifetime(contactStore) {}
-        withExtendedLifetime(remStore) {}
-
-        // Read final statuses.
+    private static func checkPermissions() -> [PermResult] {
         return [
-            PermResult(service: "location", status: statusName(loc: locManager.authorizationStatus)),
-            PermResult(service: "calendars", status: statusName(ek: EKEventStore.authorizationStatus(for: .event))),
-            PermResult(service: "contacts", status: statusName(cn: CNContactStore.authorizationStatus(for: .contacts))),
-            PermResult(service: "reminders", status: statusName(ek: EKEventStore.authorizationStatus(for: .reminder))),
+            PermResult(
+                service: "location",
+                status: statusName(loc: CLLocationManager().authorizationStatus)
+            ),
+            PermResult(
+                service: "calendars",
+                status: statusName(ek: EKEventStore.authorizationStatus(for: .event))
+            ),
+            PermResult(
+                service: "contacts",
+                status: statusName(cn: CNContactStore.authorizationStatus(for: .contacts))
+            ),
+            PermResult(
+                service: "reminders",
+                status: statusName(ek: EKEventStore.authorizationStatus(for: .reminder))
+            ),
         ]
     }
 
