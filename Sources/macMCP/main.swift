@@ -14,11 +14,7 @@ NSApplication.shared.setActivationPolicy(.accessory)
 // com.apple.security.personal-information.* entitlements); macmcp inherits
 // those grants via TCC's responsible-parent attribution at runtime, so it
 // has no reason to call any request* API itself.
-//
-// `--request-permissions` is accepted as a deprecated alias for older Relay
-// builds that haven't been updated to the new flag name.
-if CommandLine.arguments.contains("--check-permissions")
-    || CommandLine.arguments.contains("--request-permissions") {
+if CommandLine.arguments.contains("--check-permissions") {
     print(PermissionsService.checkAll())
     exit(0)
 }
