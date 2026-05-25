@@ -19,6 +19,8 @@ enum CalendarService {
         return status == .authorized
     }
 
+    private static let accessDeniedMsg = "calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions"
+
     private static let iso8601Formatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -54,7 +56,7 @@ enum CalendarService {
 
     private static func listCalendars(_ args: JSONObject?) -> MCPCallResult {
         guard hasAccess() else {
-            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
+            return errorResult(accessDeniedMsg)
         }
 
         let calendars = store.calendars(for: .event)
@@ -70,7 +72,7 @@ enum CalendarService {
 
     private static func listEvents(_ args: JSONObject?) -> MCPCallResult {
         guard hasAccess() else {
-            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
+            return errorResult(accessDeniedMsg)
         }
 
         guard let startStr = args?["start_date"]?.stringValue,
@@ -117,7 +119,7 @@ enum CalendarService {
 
     private static func createEvent(_ args: JSONObject?) -> MCPCallResult {
         guard hasAccess() else {
-            return errorResult("calendar access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions")
+            return errorResult(accessDeniedMsg)
         }
 
         guard let title = args?["title"]?.stringValue,

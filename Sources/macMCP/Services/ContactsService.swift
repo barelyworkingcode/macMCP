@@ -129,6 +129,8 @@ enum ContactsService {
         return CNContactStore.authorizationStatus(for: .contacts) == .authorized
     }
 
+    private static let accessDeniedMsg = "contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions"
+
     // MARK: - Serialization
 
     private static func contactDict(_ contact: CNContact) -> [String: Any] {
@@ -198,7 +200,7 @@ enum ContactsService {
     // MARK: - Tool Handlers
 
     private static func contactsList(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
 
         let request = CNContactFetchRequest(keysToFetch: fetchKeys)
         if let query = args?["query"]?.stringValue, !query.isEmpty {
@@ -218,7 +220,7 @@ enum ContactsService {
     }
 
     private static func contactsGet(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
         }
@@ -229,7 +231,7 @@ enum ContactsService {
     }
 
     private static func contactsCreate(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let firstName = args?["first_name"]?.stringValue else {
             return errorResult("first_name is required")
         }
@@ -257,7 +259,7 @@ enum ContactsService {
     }
 
     private static func contactsUpdate(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
         }
@@ -287,7 +289,7 @@ enum ContactsService {
     }
 
     private static func contactsDelete(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
         }
@@ -306,7 +308,7 @@ enum ContactsService {
     }
 
     private static func contactsListGroups(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
 
         do {
             let groups = try store.groups(matching: nil)
@@ -318,7 +320,7 @@ enum ContactsService {
     }
 
     private static func contactsCreateGroup(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let name = args?["name"]?.stringValue else {
             return errorResult("name is required")
         }
@@ -337,7 +339,7 @@ enum ContactsService {
     }
 
     private static func contactsAddToGroup(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let contactId = args?["contact_id"]?.stringValue else {
             return errorResult("contact_id is required")
         }
@@ -369,7 +371,7 @@ enum ContactsService {
     }
 
     private static func contactsRemoveFromGroup(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let contactId = args?["contact_id"]?.stringValue else {
             return errorResult("contact_id is required")
         }
@@ -401,7 +403,7 @@ enum ContactsService {
     }
 
     private static func contactsSearchByPhone(_ args: JSONObject?) -> MCPCallResult {
-        guard hasAccess() else { return errorResult("contacts access denied — grant via Relay > Settings > MCP Servers > macMCP > Reset Permissions") }
+        guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let phone = args?["phone"]?.stringValue else {
             return errorResult("phone is required")
         }
