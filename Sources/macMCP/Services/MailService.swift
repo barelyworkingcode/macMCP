@@ -42,91 +42,125 @@ enum MailService {
             .replacingOccurrences(of: "\t", with: "\\t")
     }
 
-    /// JXA snippet that finds a message by ID, searching across all accounts' matching mailboxes
-    /// when no account is specified. Returns `found` (message or null) and `foundAccount` (name string or null).
-    private static func findMessageJXA(account: String?, mailbox: String, messageId: String) -> String {
-        let escapedMailbox = escapeJSString(mailbox)
-        let escapedId = escapeJSString(messageId)
+    /// JXA that builds `var <varName> = [{mbox, acctName, name}]` covering every
+    /// mailbox of the named account (throws if missing), or of all accounts plus
+    /// Mail's app-level local "On My Mac" mailboxes when account is nil.
+    /// Note: Mail returns account.mailboxes() already flattened (nested folders
+    /// included), so no recursion is needed.
+    private static func collectBoxesJXA(account: String?, varName: String) -> String {
         if let account = account {
             let escapedAccount = escapeJSString(account)
             return """
-            var found = null; var foundAccount = '\(escapedAccount)';
-            (function() {
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
-                        foundAccount = accts[i].name();
-                        var mboxes = accts[i].mailboxes();
-                        for (var j = 0; j < mboxes.length; j++) {
-                            if (mboxes[j].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) {
-                                var msgs = mboxes[j].messages();
-                                for (var k = 0; k < msgs.length; k++) {
-                                    if ('' + msgs[k].id() === '\(escapedId)') { found = msgs[k]; return; }
-                                }
-                                return;
-                            }
-                        }
-                        return;
+        var \(varName) = (function() {
+            var sink = [];
+            var accts = mail.accounts();
+            for (var ai = 0; ai < accts.length; ai++) {
+                if (accts[ai].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+                    var acctName = accts[ai].name();
+                    var mboxes = accts[ai].mailboxes();
+                    for (var mj = 0; mj < mboxes.length; mj++) {
+                        sink.push({mbox: mboxes[mj], acctName: acctName, name: '' + mboxes[mj].name()});
                     }
+                    return sink;
                 }
-            })();
-            """
+            }
+            throw new Error('account not found: \(escapedAccount)');
+        })();
+        """
         } else {
             return """
-            var found = null; var foundAccount = null;
-            (function() {
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    var mboxes = accts[i].mailboxes();
-                    for (var j = 0; j < mboxes.length; j++) {
-                        if (mboxes[j].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) {
-                            var msgs = mboxes[j].messages();
-                            for (var k = 0; k < msgs.length; k++) {
-                                if ('' + msgs[k].id() === '\(escapedId)') { found = msgs[k]; foundAccount = accts[i].name(); return; }
-                            }
-                        }
-                    }
+        var \(varName) = (function() {
+            var sink = [];
+            var accts = mail.accounts();
+            for (var ai = 0; ai < accts.length; ai++) {
+                var acctName = accts[ai].name();
+                var mboxes = accts[ai].mailboxes();
+                for (var mj = 0; mj < mboxes.length; mj++) {
+                    sink.push({mbox: mboxes[mj], acctName: acctName, name: '' + mboxes[mj].name()});
                 }
-            })();
-            """
+            }
+            var localBoxes = mail.mailboxes();
+            for (var lj = 0; lj < localBoxes.length; lj++) {
+                sink.push({mbox: localBoxes[lj], acctName: 'On My Mac', name: '' + localBoxes[lj].name()});
+            }
+            return sink;
+        })();
+        """
         }
     }
 
-    /// JXA snippet that resolves a mailbox by enumerating objects instead of byName().
-    /// byName() creates a lazy Apple Event specifier that intermittently fails with -1728.
+    /// JXA that filters allBoxes down to `var allEntries`. mailbox "all" keeps
+    /// everything except junk/trash/drafts/outbox; otherwise matches the mailbox
+    /// name case-insensitively. Throws when nothing matches so callers get an
+    /// error instead of a silently empty scan.
+    private static func collectEntriesJXA(account: String?, mailbox: String) -> String {
+        let boxes = collectBoxesJXA(account: account, varName: "allBoxes")
+        let filter: String
+        if mailbox.lowercased() == "all" {
+            filter = """
+        var SKIP = {'trash':1,'junk':1,'spam':1,'junk email':1,'deleted items':1,'deleted messages':1,'drafts':1,'outbox':1};
+        var allEntries = allBoxes.filter(function(b) { return !SKIP[b.name.toLowerCase()]; });
+        """
+        } else {
+            let escapedMailbox = escapeJSString(mailbox)
+            filter = """
+        var allEntries = allBoxes.filter(function(b) { return b.name.toLowerCase() === '\(escapedMailbox)'.toLowerCase(); });
+        if (allEntries.length === 0) throw new Error('no mailbox named "\(escapedMailbox)" found — use mail_list_mailboxes to see available names, or pass mailbox "all"');
+        """
+        }
+        return boxes + "\n" + filter
+    }
+
+    /// JXA snippet that finds a message by ID. Looks in mailboxes matching the
+    /// requested name first, then falls back to every other mailbox so messages
+    /// surfaced by all-mailbox search can still be fetched by id. Defines
+    /// `found` (message or null), `foundAccount`, and `foundMailbox`.
+    private static func findMessageJXA(account: String?, mailbox: String, messageId: String) -> String {
+        let escapedMailbox = escapeJSString(mailbox)
+        let escapedId = escapeJSString(messageId)
+        return """
+    \(collectBoxesJXA(account: account, varName: "fmBoxes"))
+    var found = null; var foundAccount = null; var foundMailbox = null;
+    (function() {
+        var targetLC = '\(escapedMailbox)'.toLowerCase();
+        function searchIn(subset) {
+            for (var i = 0; i < subset.length; i++) {
+                var ids;
+                try { ids = subset[i].mbox.messages.id(); } catch (e) { continue; }
+                for (var k = 0; k < ids.length; k++) {
+                    if ('' + ids[k] === '\(escapedId)') {
+                        found = subset[i].mbox.messages[k];
+                        foundAccount = subset[i].acctName;
+                        foundMailbox = subset[i].name;
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        var named = []; var rest = [];
+        for (var i = 0; i < fmBoxes.length; i++) {
+            if (fmBoxes[i].name.toLowerCase() === targetLC) named.push(fmBoxes[i]); else rest.push(fmBoxes[i]);
+        }
+        if (!searchIn(named)) searchIn(rest);
+    })();
+    """
+    }
+
+    /// JXA snippet resolving a mailbox by name, case-insensitively across all
+    /// accounts (plus local On-My-Mac boxes) when no account given. Throws when
+    /// not found.
     private static func mailboxJXA(account: String?, mailbox: String, varName: String = "mbox") -> String {
         let escapedMailbox = escapeJSString(mailbox)
-        if let account = account {
-            let escapedAccount = escapeJSString(account)
-            return """
-            var \(varName) = (function() {
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
-                        var mboxes = accts[i].mailboxes();
-                        for (var j = 0; j < mboxes.length; j++) {
-                            if (mboxes[j].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) return mboxes[j];
-                        }
-                        throw new Error('mailbox not found: \(escapedMailbox)');
-                    }
-                }
-                throw new Error('account not found: \(escapedAccount)');
-            })();
-            """
-        } else {
-            return """
-            var \(varName) = (function() {
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    var mboxes = accts[i].mailboxes();
-                    for (var j = 0; j < mboxes.length; j++) {
-                        if (mboxes[j].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) return mboxes[j];
-                    }
-                }
-                throw new Error('mailbox not found: \(escapedMailbox)');
-            })();
-            """
+        return """
+    \(collectBoxesJXA(account: account, varName: "\(varName)Candidates"))
+    var \(varName) = (function() {
+        for (var i = 0; i < \(varName)Candidates.length; i++) {
+            if (\(varName)Candidates[i].name.toLowerCase() === '\(escapedMailbox)'.toLowerCase()) return \(varName)Candidates[i].mbox;
         }
+        throw new Error('mailbox not found: \(escapedMailbox)');
+    })();
+    """
     }
 
     /// Returns JXA snippets to set the sender address. `from` takes precedence over `account` lookup.
@@ -215,53 +249,50 @@ enum MailService {
     private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let limit = args?["limit"]?.intValue ?? 10
-        let escapedMailbox = escapeJSString(mailbox)
         let account = args?["account"]?.stringValue
-
-        let collectMessages: String
-        if let account = account {
-            let escapedAccount = escapeJSString(account)
-            let mailboxAccess = mailboxJXA(account: account, mailbox: mailbox)
-            collectMessages = """
-            \(mailboxAccess)
-            var allEntries = [{mbox: mbox, acctName: '\(escapedAccount)'}];
-            """
-        } else {
-            collectMessages = """
-            var allEntries = [];
-            var accts = mail.accounts();
-            for (var ai = 0; ai < accts.length; ai++) {
-                var mboxes = accts[ai].mailboxes();
-                for (var mj = 0; mj < mboxes.length; mj++) {
-                    if (mboxes[mj].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) {
-                        allEntries.push({mbox: mboxes[mj], acctName: accts[ai].name()});
-                    }
-                }
-            }
-            """
-        }
 
         let script = """
         var mail = Application('Mail');
-        \(collectMessages)
-        var results = [];
-        for (var mi = 0; mi < allEntries.length && results.length < \(limit); mi++) {
+        \(collectEntriesJXA(account: account, mailbox: mailbox))
+        var candidates = [];
+        var scanned = [];
+        var skipped = [];
+        var seen = {};
+        for (var mi = 0; mi < allEntries.length; mi++) {
             var entry = allEntries[mi];
-            var msgs = entry.mbox.messages();
-            var count = Math.min(msgs.length, \(limit) - results.length);
-            for (var i = 0; i < count; i++) {
-                var m = msgs[i];
-                results.push({
-                    id: '' + m.id(),
-                    account: entry.acctName,
-                    subject: m.subject(),
-                    sender: m.sender(),
-                    date_received: '' + m.dateReceived(),
-                    read: m.readStatus()
-                });
+            var boxLabel = entry.acctName + ':' + entry.name;
+            try {
+                var ids = entry.mbox.messages.id();
+                var dates = entry.mbox.messages.dateReceived();
+                for (var i = 0; i < ids.length; i++) {
+                    var id = '' + ids[i];
+                    if (seen[id]) continue;
+                    seen[id] = true;
+                    candidates.push({mi: mi, idx: i, id: id, t: dates[i] ? dates[i].getTime() : 0, d: dates[i] ? '' + dates[i] : ''});
+                }
+                scanned.push(boxLabel);
+            } catch (e) {
+                skipped.push(boxLabel);
             }
         }
-        JSON.stringify(results);
+        candidates.sort(function(a, b) { return b.t - a.t; });
+        var top = candidates.slice(0, \(limit));
+        var results = [];
+        for (var i = 0; i < top.length; i++) {
+            var c = top[i];
+            var entry = allEntries[c.mi];
+            var m = entry.mbox.messages[c.idx];
+            results.push({
+                id: c.id,
+                account: entry.acctName,
+                mailbox: entry.name,
+                subject: m.subject(),
+                sender: m.sender(),
+                date_received: c.d,
+                read: m.readStatus()
+            });
+        }
+        JSON.stringify({messages: results, total_messages: candidates.length, truncated: candidates.length > \(limit), scanned_mailboxes: scanned, skipped_mailboxes: skipped});
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
@@ -286,6 +317,7 @@ enum MailService {
             JSON.stringify({
                 id: '' + found.id(),
                 account: foundAccount,
+                mailbox: foundMailbox,
                 subject: found.subject(),
                 sender: found.sender(),
                 date_received: '' + found.dateReceived(),
@@ -306,60 +338,83 @@ enum MailService {
             return errorResult("query is required")
         }
         let limit = args?["limit"]?.intValue ?? 10
-        let escapedQuery = escapeJSString(query).lowercased()
-
-        let searchMailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let escapedMailbox = escapeJSString(searchMailbox)
+        let escapedQuery = escapeJSString(query)
+        let mailbox = args?["mailbox"]?.stringValue ?? "all"
         let account = args?["account"]?.stringValue
+        let searchRecipients = args?["search_recipients"]?.boolValue ?? false
+        let searchBody = args?["search_body"]?.boolValue ?? false
 
-        let collectMailboxes: String
-        if let account = account {
-            let escapedAccount = escapeJSString(account)
-            let mailboxAccess = mailboxJXA(account: account, mailbox: searchMailbox)
-            collectMailboxes = """
-            \(mailboxAccess)
-            var allEntries = [{mbox: mbox, acctName: '\(escapedAccount)'}];
-            """
-        } else {
-            collectMailboxes = """
-            var allEntries = [];
-            var accts = mail.accounts();
-            for (var ai = 0; ai < accts.length; ai++) {
-                var mboxes = accts[ai].mailboxes();
-                for (var mj = 0; mj < mboxes.length; mj++) {
-                    if (mboxes[mj].name().toLowerCase() === '\(escapedMailbox)'.toLowerCase()) {
-                        allEntries.push({mbox: mboxes[mj], acctName: accts[ai].name()});
-                    }
-                }
-            }
-            """
+        // Mail evaluates `whose` internally; _contains is case-insensitive.
+        var terms = [
+            "{subject: {_contains: '\(escapedQuery)'}}",
+            "{sender: {_contains: '\(escapedQuery)'}}"
+        ]
+        if searchBody {
+            terms.append("{content: {_contains: '\(escapedQuery)'}}")
         }
+        let whoseClause = "{_or: [\(terms.joined(separator: ", "))]}"
+
+        // Recipients are element collections, which `whose` cannot reach — when
+        // requested, bulk-fetch the recipient columns and match in JS.
+        let recipientsPass = !searchRecipients ? "" : """
+    var allIds = entry.mbox.messages.id();
+    var tos = entry.mbox.messages.toRecipients.address();
+    var ccs = entry.mbox.messages.ccRecipients.address();
+    var toNames = entry.mbox.messages.toRecipients.name();
+    var ccNames = entry.mbox.messages.ccRecipients.name();
+    for (var ri = 0; ri < allIds.length; ri++) {
+        var rid = '' + allIds[ri];
+        if (seen[rid]) continue;
+        var hay = ((tos[ri] || []).join(' ') + ' ' + (ccs[ri] || []).join(' ') + ' ' + (toNames[ri] || []).join(' ') + ' ' + (ccNames[ri] || []).join(' ')).toLowerCase();
+        if (hay.indexOf(queryLC) !== -1) {
+            seen[rid] = true;
+            var rm = entry.mbox.messages[ri];
+            var rd = rm.dateReceived();
+            candidates.push({id: rid, account: entry.acctName, mailbox: entry.name, subject: rm.subject(), sender: rm.sender(), t: rd ? rd.getTime() : 0, date_received: rd ? '' + rd : '', read: rm.readStatus()});
+        }
+    }
+    """
 
         let script = """
         var mail = Application('Mail');
-        \(collectMailboxes)
-        var query = '\(escapedQuery)';
-        var results = [];
-        for (var mi = 0; mi < allEntries.length && results.length < \(limit); mi++) {
+        \(collectEntriesJXA(account: account, mailbox: mailbox))
+        var queryLC = '\(escapedQuery)'.toLowerCase();
+        var candidates = [];
+        var scanned = [];
+        var skipped = [];
+        var seen = {};
+        for (var mi = 0; mi < allEntries.length; mi++) {
             var entry = allEntries[mi];
-            var msgs = entry.mbox.messages();
-            for (var i = 0; i < msgs.length && results.length < \(limit); i++) {
-                var m = msgs[i];
-                var subj = (m.subject() || '').toLowerCase();
-                var sender = (m.sender() || '').toLowerCase();
-                if (subj.indexOf(query) !== -1 || sender.indexOf(query) !== -1) {
-                    results.push({
-                        id: '' + m.id(),
-                        account: entry.acctName,
-                        subject: m.subject(),
-                        sender: m.sender(),
-                        date_received: '' + m.dateReceived(),
-                        read: m.readStatus()
-                    });
+            var boxLabel = entry.acctName + ':' + entry.name;
+            try {
+                var matched = entry.mbox.messages.whose(\(whoseClause));
+                var ids = matched.id();
+                if (ids.length > 0) {
+                    var subjects = matched.subject();
+                    var senders = matched.sender();
+                    var dates = matched.dateReceived();
+                    var reads = matched.readStatus();
+                    for (var i = 0; i < ids.length; i++) {
+                        var id = '' + ids[i];
+                        if (seen[id]) continue;
+                        seen[id] = true;
+                        candidates.push({id: id, account: entry.acctName, mailbox: entry.name, subject: subjects[i], sender: senders[i], t: dates[i] ? dates[i].getTime() : 0, date_received: dates[i] ? '' + dates[i] : '', read: reads[i]});
+                    }
                 }
+                \(recipientsPass)
+                scanned.push(boxLabel);
+            } catch (e) {
+                skipped.push(boxLabel);
             }
         }
-        JSON.stringify(results);
+        candidates.sort(function(a, b) { return b.t - a.t; });
+        var top = candidates.slice(0, \(limit));
+        var results = [];
+        for (var i = 0; i < top.length; i++) {
+            var c = top[i];
+            results.push({id: c.id, account: c.account, mailbox: c.mailbox, subject: c.subject, sender: c.sender, date_received: c.date_received, read: c.read});
+        }
+        JSON.stringify({messages: results, total_matches: candidates.length, truncated: candidates.length > \(limit), scanned_mailboxes: scanned, skipped_mailboxes: skipped});
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
@@ -527,11 +582,11 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get emails from a mailbox. Searches all accounts when account omitted. Results include account name",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, scanned/skipped mailboxes)",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)"),
+                        "mailbox": stringProp("Mailbox name, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). Pass 'all' to scan every mailbox except junk/trash/drafts"),
                         "limit": intProp("Maximum number of emails to return (default: 10)")
                     ]
                 ),
@@ -549,7 +604,7 @@ enum MailService {
                     properties: [
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "account": stringProp("Account name from results (optional, speeds up lookup)"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes")
                     ],
                     required: ["message_id"]
                 ),
@@ -562,13 +617,15 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject or sender (case-insensitive). Searches all accounts when account omitted",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, scanned/skipped mailboxes)",
                 inputSchema: schema(
                     properties: [
-                        "query": stringProp("Search query to match against subject and sender"),
+                        "query": stringProp("Search query"),
                         "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name to search in (default: INBOX)"),
-                        "limit": intProp("Maximum number of results (default: 10)")
+                        "mailbox": stringProp("Mailbox name to search (default: 'all' — every mailbox except junk/trash/drafts)"),
+                        "limit": intProp("Maximum number of results, newest first (default: 10)"),
+                        "search_recipients": boolProp("Also match To/CC recipient names and addresses (slower: full scan of each mailbox)"),
+                        "search_body": boolProp("Also match message body text (uses Mail's native filter)")
                     ],
                     required: ["query"]
                 ),
@@ -627,7 +684,7 @@ enum MailService {
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
-                        "source_mailbox": stringProp("Source mailbox name (default: INBOX)"),
+                        "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
                         "target_mailbox": stringProp("Destination mailbox name"),
                         "account": stringProp("Account name")
                     ],
@@ -647,7 +704,7 @@ enum MailService {
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
                         "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox name (default: INBOX)")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes")
                     ],
                     required: ["message_id", "read"]
                 )
