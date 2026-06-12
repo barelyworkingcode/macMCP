@@ -27,18 +27,50 @@ enum CalendarService {
         return f
     }()
 
+    private static let plainISO8601Formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    private static let localDateTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        return f
+    }()
+
+    private static let dateOnlyFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        return f
+    }()
+
     private static let displayFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
         return f
     }()
 
-    private static func parseDate(_ string: String) -> Date? {
+    /// Accepts ISO 8601 with offset, zone-less local datetime, or a bare date.
+    /// Bare dates resolve to local midnight; endOfDay resolves them to 23:59:59.
+    private static func parseDate(_ string: String, endOfDay: Bool = false) -> Date? {
         if let d = iso8601Formatter.date(from: string) { return d }
-        // Retry without fractional seconds
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: string)
+        if let d = plainISO8601Formatter.date(from: string) { return d }
+        if string.count == 19, let d = localDateTimeFormatter.date(from: string) { return d }
+        if string.count == 10, let d = dateOnlyFormatter.date(from: string) {
+            return endOfDay
+                ? Calendar.current.date(byAdding: DateComponents(day: 1, second: -1), to: d)
+                : d
+        }
+        return nil
+    }
+
+    private static func dateFormatError(_ field: String, _ value: String) -> MCPCallResult {
+        errorResult("invalid \(field) \"\(value)\": expected ISO 8601 such as 2026-06-12, 2026-06-12T09:00:00, or 2026-06-12T09:00:00-07:00")
     }
 
     private static func calendarTypeName(_ type: EKCalendarType) -> String {
@@ -81,10 +113,10 @@ enum CalendarService {
         }
 
         guard let startDate = parseDate(startStr) else {
-            return errorResult("invalid start_date format, expected ISO 8601")
+            return dateFormatError("start_date", startStr)
         }
-        guard let endDate = parseDate(endStr) else {
-            return errorResult("invalid end_date format, expected ISO 8601")
+        guard let endDate = parseDate(endStr, endOfDay: true) else {
+            return dateFormatError("end_date", endStr)
         }
 
         var calendars: [EKCalendar]? = nil
@@ -129,10 +161,10 @@ enum CalendarService {
         }
 
         guard let startDate = parseDate(startStr) else {
-            return errorResult("invalid start_date format, expected ISO 8601")
+            return dateFormatError("start_date", startStr)
         }
-        guard let endDate = parseDate(endStr) else {
-            return errorResult("invalid end_date format, expected ISO 8601")
+        guard let endDate = parseDate(endStr, endOfDay: true) else {
+            return dateFormatError("end_date", endStr)
         }
 
         let event = EKEvent(eventStore: store)
@@ -187,8 +219,8 @@ enum CalendarService {
                 description: "List calendar events within a date range",
                 inputSchema: schema(
                     properties: [
-                        "start_date": stringProp("Start date in ISO 8601 format"),
-                        "end_date": stringProp("End date in ISO 8601 format"),
+                        "start_date": stringProp("Start date — ISO 8601: '2026-06-12' (local midnight), '2026-06-12T09:00:00' (local time), or '2026-06-12T09:00:00-07:00'"),
+                        "end_date": stringProp("End date — same formats as start_date; a bare date like '2026-06-12' means end of that day (23:59:59 local)"),
                         "calendar_name": stringProp("Filter to a specific calendar by name")
                     ],
                     required: ["start_date", "end_date"]
@@ -206,8 +238,8 @@ enum CalendarService {
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Event title"),
-                        "start_date": stringProp("Start date in ISO 8601 format"),
-                        "end_date": stringProp("End date in ISO 8601 format"),
+                        "start_date": stringProp("Start date — ISO 8601: '2026-06-12' (local midnight), '2026-06-12T09:00:00' (local time), or '2026-06-12T09:00:00-07:00'"),
+                        "end_date": stringProp("End date — same formats as start_date; a bare date like '2026-06-12' means end of that day (23:59:59 local)"),
                         "calendar_name": stringProp("Calendar to add the event to (uses default if not specified)"),
                         "location": stringProp("Event location"),
                         "notes": stringProp("Event notes")
