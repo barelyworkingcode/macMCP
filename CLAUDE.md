@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools across 11 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 43 tools across 12 services. No external dependencies.
 
 ## Architecture
 
@@ -30,6 +30,7 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 | Shortcuts | 2 | `/usr/bin/shortcuts` CLI |
 | Utilities | 1 | `/usr/bin/afplay` |
 | Weather | 3 | `api.open-meteo.com` (free, no key) |
+| Web | 1 | `URLSession` (http/https GET, 1 MB cap) |
 
 ## Key Patterns
 

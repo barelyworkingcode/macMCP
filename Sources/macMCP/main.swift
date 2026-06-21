@@ -34,6 +34,7 @@ MessagesService.register(registry)
 ShortcutsService.register(registry)
 UtilitiesService.register(registry)
 WeatherService.register(registry)
+WebService.register(registry)
 
 // JSON-RPC 2.0 stdio server
 let decoder = JSONDecoder()
