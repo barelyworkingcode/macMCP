@@ -100,51 +100,76 @@ enum MailService {
             .replacingOccurrences(of: "\t", with: "\\t")
     }
 
-    /// JXA that builds `var <varName> = [{mbox, acctName, name}]` covering every
-    /// mailbox of the named account (throws if missing), or of all accounts plus
-    /// Mail's app-level local "On My Mac" mailboxes when account is nil.
+    /// Which mailboxes a generated collection snippet should gather.
+    private enum BoxScope {
+        /// Every mailbox of the named account. The JXA throws when it is missing.
+        case account(String)
+        /// Mail's app-level "On My Mac" mailboxes only.
+        case local
+        /// Every account's mailboxes plus the local On-My-Mac boxes.
+        case everything
+    }
+
+    /// JXA that builds `var <varName> = [{mbox, acctName, name}]` for `scope`.
     /// Note: Mail returns account.mailboxes() already flattened (nested folders
     /// included), so no recursion is needed.
-    private static func collectBoxesJXA(account: String?, varName: String) -> String {
-        if let account = account {
-            let escapedAccount = escapeJSString(account)
-            return """
-        var \(varName) = (function() {
-            var sink = [];
-            var accts = mail.accounts();
-            for (var ai = 0; ai < accts.length; ai++) {
-                if (accts[ai].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
-                    var acctName = accts[ai].name();
-                    var mboxes = accts[ai].mailboxes();
-                    for (var mj = 0; mj < mboxes.length; mj++) {
-                        sink.push({mbox: mboxes[mj], acctName: acctName, name: '' + mboxes[mj].name()});
-                    }
-                    return sink;
-                }
-            }
-            throw new Error('account not found: \(escapedAccount)');
-        })();
-        """
-        } else {
-            return """
-        var \(varName) = (function() {
-            var sink = [];
-            var accts = mail.accounts();
-            for (var ai = 0; ai < accts.length; ai++) {
+    private static func collectBoxesJXA(_ scope: BoxScope, varName: String) -> String {
+        let pushAccountBoxes = """
                 var acctName = accts[ai].name();
                 var mboxes = accts[ai].mailboxes();
                 for (var mj = 0; mj < mboxes.length; mj++) {
                     sink.push({mbox: mboxes[mj], acctName: acctName, name: '' + mboxes[mj].name()});
                 }
-            }
+        """
+        let pushLocalBoxes = """
             var localBoxes = mail.mailboxes();
             for (var lj = 0; lj < localBoxes.length; lj++) {
                 sink.push({mbox: localBoxes[lj], acctName: 'On My Mac', name: '' + localBoxes[lj].name()});
             }
+        """
+
+        let body: String
+        switch scope {
+        case .account(let account):
+            let escapedAccount = escapeJSString(account)
+            body = """
+            var accts = mail.accounts();
+            for (var ai = 0; ai < accts.length; ai++) {
+                if (accts[ai].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+        \(pushAccountBoxes)
+                    return sink;
+                }
+            }
+            throw new Error('account not found: \(escapedAccount)');
+        """
+        case .local:
+            body = """
+        \(pushLocalBoxes)
             return sink;
-        })();
+        """
+        case .everything:
+            body = """
+            var accts = mail.accounts();
+            for (var ai = 0; ai < accts.length; ai++) {
+        \(pushAccountBoxes)
+            }
+        \(pushLocalBoxes)
+            return sink;
         """
         }
+
+        return """
+        var \(varName) = (function() {
+            var sink = [];
+        \(body)
+        })();
+        """
+    }
+
+    /// Convenience for the by-id helpers, where a nil account means "look
+    /// everywhere" rather than "look at the local boxes".
+    private static func collectBoxesJXA(account: String?, varName: String) -> String {
+        collectBoxesJXA(account.map { BoxScope.account($0) } ?? .everything, varName: varName)
     }
 
     /// Builds the JXA for one bulk mailbox scan, covering a single account
@@ -176,32 +201,17 @@ enum MailService {
         searchRecipients: Bool,
         limit: Int
     ) -> String {
-        let collect: String
-        if let account {
-            let escaped = escapeJSString(account)
-            collect = """
-        var accts = mail.accounts();
-        for (var ai = 0; ai < accts.length; ai++) {
-            if (accts[ai].name().toLowerCase() === '\(escaped)'.toLowerCase()) {
-                var mb = accts[ai].mailboxes();
-                for (var j = 0; j < mb.length; j++) sink.push({mbox: mb[j], acct: accts[ai].name(), name: '' + mb[j].name()});
-                return sink;
-            }
-        }
-        throw new Error('account not found: \(escaped)');
-        """
-        } else {
-            collect = """
-        var lb = mail.mailboxes();
-        for (var j = 0; j < lb.length; j++) sink.push({mbox: lb[j], acct: 'On My Mac', name: '' + lb[j].name()});
-        return sink;
-        """
-        }
+        let collect = collectBoxesJXA(account.map { BoxScope.account($0) } ?? .local, varName: "allBoxes")
 
         let filter: String
         if mailbox.lowercased() == "all" {
+            // Object.create(null) rather than {}: a mailbox named "constructor"
+            // or "toString" would otherwise inherit a truthy Object.prototype
+            // value and be silently dropped from the scan.
             filter = """
-        var SKIP = {'trash':1,'junk':1,'spam':1,'junk email':1,'deleted items':1,'deleted messages':1,'drafts':1,'outbox':1};
+        var SKIP = Object.create(null);
+        ['trash','junk','spam','junk email','deleted items','deleted messages','drafts','outbox']
+            .forEach(function(n) { SKIP[n] = 1; });
         var entries = allBoxes.filter(function(b) { return !SKIP[b.name.toLowerCase()]; });
         """
         } else {
@@ -229,15 +239,16 @@ enum MailService {
         var mail = Application('Mail');
         \(queryLine)
         var LIMIT = \(max(limit, 1));
-        var allBoxes = (function() {
-            var sink = [];
         \(collect)
-        })();
         \(filter)
 
         var rows = [], scanned = [], skipped = [], total = 0, messagesScanned = 0;
+        // Gmail-style accounts file every message in both INBOX and "All Mail",
+        // so ids are deduplicated across this account's mailboxes. Without it
+        // `total` counts each message once per mailbox it appears in.
+        var seen = Object.create(null);
         for (var e = 0; e < entries.length; e++) {
-            var label = entries[e].acct + ':' + entries[e].name;
+            var label = entries[e].acctName + ':' + entries[e].name;
             try {
                 var mb = entries[e].mbox;
                 var ids = mb.messages.id();
@@ -251,14 +262,17 @@ enum MailService {
                     messagesScanned += ids.length;
                     var local = [];
                     for (var i = 0; i < ids.length; i++) {
+                        var id = '' + ids[i];
+                        if (seen[id]) continue;
+                        seen[id] = true;
                         if (QUERY !== null) {
                             var hay = (su[i] == null ? '' : '' + su[i]) + ' ' + (se[i] == null ? '' : '' + se[i]);
         \(recipientMatch)
                             if (hay.toLowerCase().indexOf(QUERY) === -1) continue;
                         }
                         local.push({
-                            id: '' + ids[i],
-                            account: entries[e].acct,
+                            id: id,
+                            account: entries[e].acctName,
                             mailbox: entries[e].name,
                             subject: su[i] == null ? '' : '' + su[i],
                             sender: se[i] == null ? '' : '' + se[i],
@@ -279,6 +293,20 @@ enum MailService {
         }
         JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, matched: entries.length, messages_scanned: messagesScanned});
         """
+    }
+
+    /// Wall-clock allowance per message body. Mail needs ~1.2s to read and
+    /// decode one off disk; the rest is headroom for slow disks and spawn cost.
+    private static let bodyFetchBudget: TimeInterval = 3
+
+    /// Hard ceiling on `body_scan_limit`, so the body pass cannot be talked into
+    /// an arbitrarily long blocking run.
+    private static let maxBodyScanLimit = 200
+
+    /// Identifies one mailbox within one account.
+    private struct MailboxKey: Hashable {
+        let account: String
+        let mailbox: String
     }
 
     /// Result of scanning every account, already merged and sorted newest-first.
@@ -362,24 +390,50 @@ enum MailService {
             outcome.skipped.append(contentsOf: obj["skipped"] as? [String] ?? [])
             if (obj["matched"] as? Int ?? 0) > 0 { outcome.matchedMailbox = true }
         }
-        outcome.rows.sort { ($0["t"] as? Double ?? 0) > ($1["t"] as? Double ?? 0) }
+        sortNewestFirst(&outcome.rows)
         return outcome
+    }
+
+    /// Sorts rows newest-first. `Array.sort` is not stable, so id breaks ties:
+    /// without it the mailbox a duplicated message is attributed to changes
+    /// between otherwise identical calls.
+    private static func sortNewestFirst(_ rows: inout [[String: Any]]) {
+        rows.sort { a, b in
+            let ta = a["t"] as? Double ?? 0
+            let tb = b["t"] as? Double ?? 0
+            if ta != tb { return ta > tb }
+            return (a["id"] as? String ?? "") < (b["id"] as? String ?? "")
+        }
     }
 
     /// Drops the internal sort key, removes ids seen in an earlier mailbox, and
     /// applies the caller's limit. Rows arrive newest-first, so the copy kept is
     /// the newest one.
     private static func presentRows(_ rows: [[String: Any]], limit: Int) -> [[String: Any]] {
+        let cap = max(limit, 0)
         var seen = Set<String>()
         var out: [[String: Any]] = []
-        out.reserveCapacity(min(rows.count, max(limit, 0)))
-        for row in rows where out.count < max(limit, 0) {
+        out.reserveCapacity(min(rows.count, cap))
+        for row in rows {
+            if out.count >= cap { break }
             if let id = row["id"] as? String, !seen.insert(id).inserted { continue }
             var copy = row
             copy.removeValue(forKey: "t")
             out.append(copy)
         }
         return out
+    }
+
+    /// The two error paths every scan-backed handler shares. Returns nil when
+    /// the scan produced something worth reporting.
+    private static func scanFailure(_ outcome: ScanOutcome, targets: [String?], mailbox: String) -> MCPCallResult? {
+        if outcome.failed.count == targets.count {
+            return errorResult("scan failed for every account — \(outcome.failed.joined(separator: "; "))")
+        }
+        if !outcome.matchedMailbox && mailbox.lowercased() != "all" {
+            return errorResult("no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\"")
+        }
+        return nil
     }
 
     /// JXA snippet that finds a message by ID. Looks in mailboxes matching the
@@ -463,18 +517,9 @@ enum MailService {
     // MARK: - Tool Handlers
 
     private static func listAccounts(_ args: JSONObject?) -> MCPCallResult {
-        let script = """
-        var mail = Application('Mail');
-        var accounts = mail.accounts();
-        var names = [];
-        for (var i = 0; i < accounts.length; i++) {
-            names.push(accounts[i].name());
-        }
-        JSON.stringify(names);
-        """
-        let (output, error) = runJXA(script)
+        let (names, error) = accountNames()
         if let error { return errorResult(error) }
-        return textResult(output)
+        return jsonResult(names)
     }
 
     private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
@@ -519,7 +564,7 @@ enum MailService {
 
     private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let limit = args?["limit"]?.intValue ?? 10
+        let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let account = args?["account"]?.stringValue
 
         let (targets, targetError) = resolveTargets(account: account)
@@ -534,12 +579,7 @@ enum MailService {
             timeout: defaultTimeout
         )
 
-        if outcome.failed.count == targets.count {
-            return errorResult("scan failed for every account — \(outcome.failed.joined(separator: "; "))")
-        }
-        if !outcome.matchedMailbox && mailbox.lowercased() != "all" {
-            return errorResult("no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\"")
-        }
+        if let failure = scanFailure(outcome, targets: targets, mailbox: mailbox) { return failure }
 
         var payload: [String: Any] = [
             "messages": presentRows(outcome.rows, limit: limit),
@@ -599,42 +639,51 @@ enum MailService {
     private static func matchBodies(
         candidates: [[String: Any]],
         query: String,
-        timeout: TimeInterval
-    ) -> (matches: [[String: Any]], scanned: Int) {
+        deadline: Date
+    ) -> (matches: [[String: Any]], scanned: Int, complete: Bool) {
         // Group by mailbox so each one costs a single bulk id fetch.
-        var byMailbox: [String: [[String: Any]]] = [:]
+        var byMailbox: [MailboxKey: [[String: Any]]] = [:]
         for row in candidates {
-            let account = row["account"] as? String ?? ""
-            let mailbox = row["mailbox"] as? String ?? ""
-            byMailbox["\(account)\u{0}\(mailbox)", default: []].append(row)
+            let key = MailboxKey(
+                account: row["account"] as? String ?? "",
+                mailbox: row["mailbox"] as? String ?? ""
+            )
+            byMailbox[key, default: []].append(row)
         }
 
         let needle = query.lowercased()
         var matches: [[String: Any]] = []
         var scanned = 0
+        var complete = true
 
         for (key, rows) in byMailbox {
-            let parts = key.components(separatedBy: "\u{0}")
-            guard parts.count == 2 else { continue }
-            let (account, mailbox) = (parts[0], parts[1])
             let wanted = rows.compactMap { $0["id"] as? String }
             guard !wanted.isEmpty else { continue }
 
-            let wantedLiteral = wanted.map { "'\(escapeJSString($0))':1" }.joined(separator: ",")
+            // Budget per mailbox, not per request: the caller's deadline covers
+            // the whole pass, and a group of two must not be given the whole of it.
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { complete = false; break }
+            let budget = min(remaining, Double(rows.count) * bodyFetchBudget + 30)
+
+            let escapedAccount = escapeJSString(key.account)
+            let escapedMailbox = escapeJSString(key.mailbox)
+            let wantedLiteral = wanted.map { "'\(escapeJSString($0))'" }.joined(separator: ",")
             // Locate by id rather than by stored index: messages arriving between
             // the metadata scan and this call would shift positions.
             let script = """
             var mail = Application('Mail');
-            var WANT = {\(wantedLiteral)};
+            var WANT = Object.create(null);
+            [\(wantedLiteral)].forEach(function(k) { WANT[k] = 1; });
             var mb = (function() {
                 var boxes = [];
                 var accts = mail.accounts();
                 for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name() === '\(escapeJSString(account))') { boxes = accts[i].mailboxes(); break; }
+                    if (accts[i].name() === '\(escapedAccount)') { boxes = accts[i].mailboxes(); break; }
                 }
-                if (boxes.length === 0 && '\(escapeJSString(account))' === 'On My Mac') boxes = mail.mailboxes();
+                if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = mail.mailboxes();
                 for (var j = 0; j < boxes.length; j++) {
-                    if ('' + boxes[j].name() === '\(escapeJSString(mailbox))') return boxes[j];
+                    if ('' + boxes[j].name() === '\(escapedMailbox)') return boxes[j];
                 }
                 return null;
             })();
@@ -649,35 +698,45 @@ enum MailService {
             JSON.stringify(out);
             """
 
-            let (output, error) = runJXA(script, retries: 0, timeout: timeout)
-            if error != nil { continue }
+            let (output, error) = runJXA(script, retries: 0, timeout: budget)
+            if error != nil { complete = false; continue }
             guard let data = output.data(using: .utf8),
-                  let fetched = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { continue }
+                  let fetched = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                complete = false
+                continue
+            }
 
-            let bodies = Dictionary(uniqueKeysWithValues: fetched.compactMap { entry -> (String, String)? in
-                guard let id = entry["id"] as? String, let body = entry["body"] as? String else { return nil }
-                return (id, body)
-            })
+            // uniquingKeysWith, not uniqueKeysWithValues: a mailbox holding the
+            // same id twice would trap the server on the latter.
+            let bodies = Dictionary(
+                fetched.compactMap { entry -> (String, String)? in
+                    guard let id = entry["id"] as? String, let body = entry["body"] as? String else { return nil }
+                    return (id, body)
+                },
+                uniquingKeysWith: { first, _ in first }
+            )
             scanned += bodies.count
+            if bodies.count < rows.count { complete = false }
             for row in rows {
                 guard let id = row["id"] as? String, let body = bodies[id] else { continue }
                 if body.lowercased().contains(needle) { matches.append(row) }
             }
         }
-        return (matches, scanned)
+        return (matches, scanned, complete)
     }
 
     private static func searchEmails(_ args: JSONObject?) -> MCPCallResult {
         guard let query = args?["query"]?.stringValue else {
             return errorResult("query is required")
         }
-        let limit = args?["limit"]?.intValue ?? 10
+        let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let mailbox = args?["mailbox"]?.stringValue ?? "all"
         let account = args?["account"]?.stringValue
         let searchRecipients = args?["search_recipients"]?.boolValue ?? false
         let searchBody = args?["search_body"]?.boolValue ?? false
-        // Each body costs ~1.2s, so this stays small by default and is capped hard.
-        let bodyScanLimit = min(args?["body_scan_limit"]?.intValue ?? 25, 200)
+        // Each body costs ~1.2s, so this stays small by default and is clamped at
+        // both ends -- a negative value would trap in `prefix` below.
+        let bodyScanLimit = min(max(args?["body_scan_limit"]?.intValue ?? 25, 0), maxBodyScanLimit)
 
         let (targets, targetError) = resolveTargets(account: account)
         if let targetError { return errorResult(targetError) }
@@ -691,12 +750,7 @@ enum MailService {
             timeout: defaultTimeout
         )
 
-        if outcome.failed.count == targets.count {
-            return errorResult("search failed for every account — \(outcome.failed.joined(separator: "; "))")
-        }
-        if !outcome.matchedMailbox && mailbox.lowercased() != "all" {
-            return errorResult("no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\"")
-        }
+        if let failure = scanFailure(outcome, targets: targets, mailbox: mailbox) { return failure }
 
         var rows = outcome.rows
         var total = outcome.total
@@ -713,25 +767,43 @@ enum MailService {
                 limit: bodyScanLimit,
                 timeout: defaultTimeout
             )
-            let alreadyMatched = Set(rows.compactMap { $0["id"] as? String })
-            let candidates = sweep.rows
-                .filter { !alreadyMatched.contains($0["id"] as? String ?? "") }
-                .prefix(bodyScanLimit)
+            // The sweep re-reads the same messages the metadata pass did, so it
+            // adds nothing to `messages_scanned` -- that field is documented as
+            // scan coverage, not as work performed.
 
-            let (bodyMatches, bodiesRead) = matchBodies(
-                candidates: Array(candidates),
+            // Skip anything the metadata pass already counted. Testing the row's
+            // own subject/sender catches matches that `outcome.total` counted but
+            // that the per-mailbox limit trimmed out of `rows` -- counting those
+            // again here would inflate total_matches.
+            let needle = query.lowercased()
+            let returned = Set(rows.compactMap { $0["id"] as? String })
+            let eligible = sweep.rows.filter { row in
+                guard let id = row["id"] as? String, !returned.contains(id) else { return false }
+                let meta = "\(row["subject"] as? String ?? "") \(row["sender"] as? String ?? "")"
+                return !meta.lowercased().contains(needle)
+            }
+            let candidates = Array(eligible.prefix(bodyScanLimit))
+
+            let (bodyMatches, bodiesRead, bodiesComplete) = matchBodies(
+                candidates: candidates,
                 query: query,
-                // Bodies are ~1.2s each; give the batch room plus overhead.
-                timeout: max(defaultTimeout, Double(bodyScanLimit) * 3 + 30)
+                // One deadline for the whole pass, sized to the candidates we
+                // actually have rather than to the cap the caller asked for.
+                deadline: Date().addingTimeInterval(Double(candidates.count) * bodyFetchBudget + 30)
             )
             rows.append(contentsOf: bodyMatches)
-            rows.sort { ($0["t"] as? Double ?? 0) > ($1["t"] as? Double ?? 0) }
+            sortNewestFirst(&rows)
             total += bodyMatches.count
             bodyInfo = [
                 "bodies_read": bodiesRead,
                 "body_matches": bodyMatches.count,
                 "body_scan_limit": bodyScanLimit,
-                "body_scan_complete": sweep.total <= bodyScanLimit + alreadyMatched.count
+                // Complete only if every body was read AND nothing was dropped
+                // on the way there: not by the candidate cap, and not by the
+                // per-mailbox trim inside the sweep itself.
+                "body_scan_complete": bodiesComplete
+                    && candidates.count == eligible.count
+                    && sweep.rows.count >= sweep.total
             ]
         }
 
