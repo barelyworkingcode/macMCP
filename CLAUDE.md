@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 43 tools across 12 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 44 tools across 12 services. No external dependencies.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 | Location | 3 | CoreLocation (RunLoop-pumped, 15s timeout) |
 | Maps | 3 | `CLGeocoder` + `NSWorkspace` URL schemes |
 | Capture | 2 | `/usr/sbin/screencapture`, `/usr/bin/afrecord` |
-| Mail | 8 | JXA via `/usr/bin/osascript -l JavaScript` |
+| Mail | 9 | JXA via `/usr/bin/osascript -l JavaScript` |
 | Messages | 3 | SQLite3 on `~/Library/Messages/chat.db` (read), AppleScript (send) |
 | Shortcuts | 2 | `/usr/bin/shortcuts` CLI |
 | Utilities | 1 | `/usr/bin/afplay` |
@@ -40,6 +40,12 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 - **No throws across service boundary** -- all errors returned as `MCPCallResult(isError: true)`.
 - **Messages reads require Full Disk Access** (direct SQLite on `chat.db`).
 - **Mail uses JXA** because Mail.app has no public framework API. String escaping is manual.
+- **Mail reads must use bulk column fetches.** `mbox.messages.subject()` costs one Apple Event per column per mailbox regardless of message count (~0.07ms/message; 14k subjects in ~1s). Three things are forbidden in a read path, all measured against a 14,004-message mailbox:
+  - `messages[i].prop()` in a loop — resolving one element is O(mailbox size), ~13ms on a small mailbox and ~150ms on a large one.
+  - specifier `.slice()` — resolves element by element; 200 ids took 22s while all 14,004 took 1s.
+  - `whose()` — an internal linear scan, ~10x slower than fetching the column and filtering in JS. `whose({content: ...})` decodes every body and times out on ~251 messages.
+
+  Message bodies cost ~1.2s each individually *and* in bulk, so body search is a capped second pass (`body_scan_limit`), never a full scan. Scans run one `osascript` per account so a wedged account degrades to a `failed_accounts` entry instead of losing the request; per-mailbox processes would cost more in spawn overhead (~150ms each) than the scan itself.
 
 ## Build
 
