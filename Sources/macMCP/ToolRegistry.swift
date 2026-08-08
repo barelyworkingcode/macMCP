@@ -53,6 +53,25 @@ func boolProp(_ description: String) -> JSONValue {
     .object(["type": .string("boolean"), "description": .string(description)])
 }
 
+func stringArrayProp(_ description: String) -> JSONValue {
+    .object([
+        "type": .string("array"),
+        "items": .object(["type": .string("string")]),
+        "description": .string(description)
+    ])
+}
+
+/// A field that accepts either one string or an array of them. Used for
+/// recipient lists, where a single address is the common case but multiple
+/// addresses must be unambiguous.
+func stringOrStringArrayProp(_ description: String) -> JSONValue {
+    .object([
+        "type": .array([.string("string"), .string("array")]),
+        "items": .object(["type": .string("string")]),
+        "description": .string(description)
+    ])
+}
+
 func enumProp(_ description: String, values: [String]) -> JSONValue {
     .object([
         "type": .string("string"),

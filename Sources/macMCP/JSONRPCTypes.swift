@@ -86,6 +86,18 @@ enum JSONValue: Codable, Equatable {
         return nil
     }
 
+    var arrayValue: [JSONValue]? {
+        if case .array(let a) = self { return a }
+        return nil
+    }
+
+    /// The strings in this value, whether it arrived as one string or an array
+    /// of them. Non-string array entries are dropped.
+    var stringsValue: [String]? {
+        if case .string(let s) = self { return [s] }
+        if case .array(let a) = self { return a.compactMap(\.stringValue) }
+        return nil
+    }
 }
 
 typealias JSONObject = [String: JSONValue]

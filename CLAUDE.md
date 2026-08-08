@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 44 tools across 12 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 46 tools across 12 services. No external dependencies.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 | Location | 3 | CoreLocation (RunLoop-pumped, 15s timeout) |
 | Maps | 3 | `CLGeocoder` + `NSWorkspace` URL schemes |
 | Capture | 2 | `/usr/sbin/screencapture`, `/usr/bin/afrecord` |
-| Mail | 9 | JXA via `/usr/bin/osascript -l JavaScript` |
+| Mail | 11 | JXA via `/usr/bin/osascript -l JavaScript` |
 | Messages | 3 | SQLite3 on `~/Library/Messages/chat.db` (read), AppleScript (send) |
 | Shortcuts | 2 | `/usr/bin/shortcuts` CLI |
 | Utilities | 1 | `/usr/bin/afplay` |
@@ -46,6 +46,14 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
   - `whose()` — an internal linear scan, ~10x slower than fetching the column and filtering in JS. `whose({content: ...})` decodes every body and times out on ~251 messages.
 
   Message bodies cost ~1.2s each individually *and* in bulk, so body search is a capped second pass (`body_scan_limit`), never a full scan. Scans run one `osascript` per account so a wedged account degrades to a `failed_accounts` entry instead of losing the request; per-mailbox processes would cost more in spawn overhead (~150ms each) than the scan itself.
+
+- **Mail composition binds by id, then verifies.** The reference `mail.OutgoingMessage()` returns is not reliably the message `outgoingMessages.push()` added: with other compose messages present it can resolve to one of those instead. This shipped a real send to the recipient of an unrelated open window. Compose therefore re-finds the message by its read-only `id` in the live collection, sends invisibly (`visible: false` — a frontmost compose window is another thing Mail can act on in place of the script's reference), and reads the recipients and subject back off the message immediately before `send`/`save`, aborting on any mismatch. Note `close({saving: 'no'})` does *not* remove an entry from `outgoingMessages`; they accumulate until Mail restarts, which is why binding cannot rely on position or on the collection being empty.
+
+- **Mail escapes every non-ASCII character** as `\uXXXX` when generating JXA. The script reaches osascript as an `-e` argument, decoded using the process locale, and the MCP server's host need not set one — raw UTF-8 em dashes and Hebrew come out mangled. U+2028/U+2029 must go for a second reason: they terminate a JS string literal.
+
+- **Mail's own attachment APIs are unusable.** `save` on a `mail attachment` fails with -10004 for every destination including `~/Downloads` (Mail's sandbox, not Full Disk Access), and the `MIME type` property raises "AppleEvent handler failed" on any message that has an attachment. `source` works, so `mail_save_attachment` fetches raw RFC 822 and decodes it in `MIME.swift`; types are inferred from the filename via `UTType`.
+
+- **HTML bodies use `html content`,** which Mail's dictionary marks hidden and "does nothing at all (deprecated)" but which in fact still renders (verified on Darwin 27 — produces `multipart/alternative` with a Mail-generated plain-text part). It wins over `content` when both are set, so only one is ever sent. Compose checks the rendered body and errors rather than silently shipping an empty message if a future Mail makes good on the deprecation.
 
 ## Build
 

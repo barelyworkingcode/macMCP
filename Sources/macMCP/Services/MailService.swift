@@ -6,16 +6,31 @@ enum MailService {
     /// whole server, so every run gets a deadline and a SIGKILL backstop.
     private static let defaultTimeout: TimeInterval = 120
 
-    /// Runs a JXA script under a hard deadline.
-    ///
-    /// Output goes to temp files rather than pipes: a scan of a large mailbox
-    /// easily exceeds the 64 KB pipe buffer, and reading a pipe only after
-    /// `waitUntilExit()` deadlocks once the child fills it.
+    /// Runs a JXA script under a hard deadline, returning trimmed stdout.
     private static func runJXA(
         _ script: String,
         retries: Int = 2,
         timeout: TimeInterval = defaultTimeout
     ) -> (output: String, error: String?) {
+        let (data, error) = runJXAData(script, retries: retries, timeout: timeout)
+        let output = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (output, error)
+    }
+
+    /// Runs a JXA script under a hard deadline, returning stdout as raw bytes.
+    ///
+    /// Message sources run to megabytes and are handed straight to the MIME
+    /// reader, so they must not be round-tripped through a trimmed `String`.
+    ///
+    /// Output goes to temp files rather than pipes: a scan of a large mailbox
+    /// easily exceeds the 64 KB pipe buffer, and reading a pipe only after
+    /// `waitUntilExit()` deadlocks once the child fills it.
+    private static func runJXAData(
+        _ script: String,
+        retries: Int = 2,
+        timeout: TimeInterval = defaultTimeout
+    ) -> (output: Data, error: String?) {
         for attempt in 0...retries {
             let tmpDir = FileManager.default.temporaryDirectory
             let stem = "macmcp-jxa-\(UUID().uuidString)"
@@ -30,7 +45,7 @@ enum MailService {
             FileManager.default.createFile(atPath: errURL.path, contents: nil)
             guard let outHandle = try? FileHandle(forWritingTo: outURL),
                   let errHandle = try? FileHandle(forWritingTo: errURL) else {
-                return ("", "failed to open temp files for osascript output")
+                return (Data(), "failed to open temp files for osascript output")
             }
 
             let process = Process()
@@ -44,7 +59,7 @@ enum MailService {
             } catch {
                 try? outHandle.close()
                 try? errHandle.close()
-                return ("", "failed to run osascript: \(error.localizedDescription)")
+                return (Data(), "failed to run osascript: \(error.localizedDescription)")
             }
 
             let deadline = Date().addingTimeInterval(timeout)
@@ -66,20 +81,19 @@ enum MailService {
             try? outHandle.close()
             try? errHandle.close()
 
-            let output = (try? String(contentsOf: outURL, encoding: .utf8))?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let output = (try? Data(contentsOf: outURL)) ?? Data()
             let errOutput = (try? String(contentsOf: errURL, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             if timedOut {
-                return ("", "Mail did not respond within \(Int(timeout))s — the request was cancelled. Narrow the scope (a specific account or mailbox, or a smaller limit) and try again.")
+                return (Data(), "Mail did not respond within \(Int(timeout))s — the request was cancelled. Narrow the scope (a specific account or mailbox, or a smaller limit) and try again.")
             }
 
             if process.terminationStatus != 0 {
                 // -1712 is an Apple Event timeout inside Mail itself. Retrying
                 // just spends the same wait again, so surface it instead.
                 if errOutput.contains("-1712") {
-                    return ("", "Mail timed out evaluating the request (-1712). Narrow the scope and try again.")
+                    return (Data(), "Mail timed out evaluating the request (-1712). Narrow the scope and try again.")
                 }
                 if attempt < retries && errOutput.contains("-1728") {
                     Thread.sleep(forTimeInterval: 0.5)
@@ -89,15 +103,34 @@ enum MailService {
             }
             return (output, nil)
         }
-        return ("", "max retries exceeded")
+        return (Data(), "max retries exceeded")
     }
 
+    /// Renders a Swift string as the body of a single-quoted JS string literal.
+    ///
+    /// Everything outside printable ASCII becomes `\uXXXX`. The script reaches
+    /// osascript as an `-e` argument, which is decoded using the process
+    /// locale, and the MCP server is launched by a host that need not set one:
+    /// an em dash or a Hebrew transliteration passed through as raw UTF-8 comes
+    /// out mangled. Escaping keeps the whole script in the ASCII subset every
+    /// locale agrees on. U+2028/U+2029 also have to go — they terminate a JS
+    /// string literal even though they are not newlines to Swift.
     private static func escapeJSString(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "'", with: "\\'")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
-            .replacingOccurrences(of: "\t", with: "\\t")
+        var out = String()
+        out.reserveCapacity(s.utf16.count)
+        for unit in s.utf16 {
+            switch unit {
+            case 0x5C: out += "\\\\"      // backslash
+            case 0x27: out += "\\'"       // single quote
+            case 0x22: out += "\\\""      // double quote, so either literal style is safe
+            case 0x0A: out += "\\n"
+            case 0x0D: out += "\\r"
+            case 0x09: out += "\\t"
+            case 0x20...0x7E: out.append(Character(UnicodeScalar(unit)!))
+            default: out += String(format: "\\u%04X", unit)
+            }
+        }
+        return out
     }
 
     /// Which mailboxes a generated collection snippet should gather.
@@ -440,6 +473,13 @@ enum MailService {
     /// requested name first, then falls back to every other mailbox so messages
     /// surfaced by all-mailbox search can still be fetched by id. Defines
     /// `found` (message or null), `foundAccount`, and `foundMailbox`.
+    ///
+    /// An identifier containing `@` is treated as an RFC 5322 Message-ID and
+    /// matched against the `message id` column instead of Mail's numeric one.
+    /// That matters for drafts on IMAP accounts: saving a draft uploads it, the
+    /// server hands back its own copy, and Mail's numeric id for the local one
+    /// is dead within seconds — while the Message-ID header survives the round
+    /// trip. Angle brackets are optional on either side of the comparison.
     private static func findMessageJXA(account: String?, mailbox: String, messageId: String) -> String {
         let escapedMailbox = escapeJSString(mailbox)
         let escapedId = escapeJSString(messageId)
@@ -448,12 +488,18 @@ enum MailService {
     var found = null; var foundAccount = null; var foundMailbox = null;
     (function() {
         var targetLC = '\(escapedMailbox)'.toLowerCase();
+        var TARGET = '\(escapedId)'.replace(/^</, '').replace(/>$/, '');
+        var BY_RFC = TARGET.indexOf('@') !== -1;
         function searchIn(subset) {
             for (var i = 0; i < subset.length; i++) {
                 var ids;
-                try { ids = subset[i].mbox.messages.id(); } catch (e) { continue; }
+                try {
+                    ids = BY_RFC ? subset[i].mbox.messages.messageId() : subset[i].mbox.messages.id();
+                } catch (e) { continue; }
                 for (var k = 0; k < ids.length; k++) {
-                    if ('' + ids[k] === '\(escapedId)') {
+                    if (ids[k] == null) continue;
+                    var candidate = ('' + ids[k]).replace(/^</, '').replace(/>$/, '');
+                    if (candidate === TARGET) {
                         found = subset[i].mbox.messages[k];
                         foundAccount = subset[i].acctName;
                         foundMailbox = subset[i].name;
@@ -602,29 +648,62 @@ enum MailService {
 
         let escapedId = escapeJSString(messageId)
 
+        // Every property is read behind `safe`: a message carrying attachments
+        // makes several of them raise "AppleEvent handler failed" (Mail's own
+        // bug), and one bad property must not cost the caller the whole
+        // message. `MIME type` on an attachment is not read at all -- it raises
+        // on every message that has one -- so the type is inferred below from
+        // the filename.
         let script = """
         var mail = Application('Mail');
         \(findMessage)
+        function safe(fn, dflt) { try { var v = fn(); return v == null ? dflt : v; } catch (e) { return dflt; } }
         if (!found) {
             JSON.stringify({error: 'message not found with id: \(escapedId)'});
         } else {
+            var atts = safe(function() {
+                return found.mailAttachments().map(function(a) {
+                    return {
+                        name: safe(function() { return '' + a.name(); }, ''),
+                        size: safe(function() { return a.fileSize(); }, 0),
+                        downloaded: safe(function() { return a.downloaded(); }, false),
+                        id: safe(function() { return '' + a.id(); }, '')
+                    };
+                });
+            }, []);
             JSON.stringify({
-                id: '' + found.id(),
+                id: '' + safe(function() { return found.id(); }, ''),
                 account: foundAccount,
                 mailbox: foundMailbox,
-                subject: found.subject(),
-                sender: found.sender(),
-                date_received: '' + found.dateReceived(),
-                read: found.readStatus(),
-                to: found.toRecipients().map(function(r) { return r.address(); }),
-                cc: found.ccRecipients().map(function(r) { return r.address(); }),
-                body: found.content()
+                subject: safe(function() { return found.subject(); }, ''),
+                sender: safe(function() { return found.sender(); }, ''),
+                rfc_message_id: '' + safe(function() { return found.messageId(); }, ''),
+                date_received: '' + safe(function() { return found.dateReceived(); }, ''),
+                date_sent: '' + safe(function() { return found.dateSent(); }, ''),
+                message_size: safe(function() { return found.messageSize(); }, 0),
+                read: safe(function() { return found.readStatus(); }, false),
+                to: safe(function() { return found.toRecipients().map(function(r) { return r.address(); }); }, []),
+                cc: safe(function() { return found.ccRecipients().map(function(r) { return r.address(); }); }, []),
+                attachments: atts,
+                body: safe(function() { return found.content(); }, '')
             });
         }
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
-        return textResult(output)
+        guard let data = output.data(using: .utf8),
+              var payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return textResult(output)
+        }
+        if let message = payload["error"] as? String { return errorResult(message) }
+        if var attachments = payload["attachments"] as? [[String: Any]] {
+            for i in attachments.indices {
+                attachments[i]["mime_type"] = MIME.mimeType(forFilename: attachments[i]["name"] as? String ?? "")
+            }
+            payload["attachments"] = attachments
+            payload["has_attachments"] = !attachments.isEmpty
+        }
+        return jsonResult(payload)
     }
 
     /// Fetches message bodies for a bounded candidate set and returns the ones
@@ -820,72 +899,562 @@ enum MailService {
         return jsonResult(payload)
     }
 
+    // MARK: - Composition
+
+    /// Splits a recipient field into individual addresses.
+    ///
+    /// Accepts an array or a single string. A string is split on commas that
+    /// sit outside quotes and angle brackets, so a display name like
+    /// `"Cross, Susan" <s@example.org>` survives intact — the comma-joined form
+    /// was already the only way to reach more than one recipient, so it keeps
+    /// working, it just is no longer undefined behaviour.
+    private static func recipientList(_ value: JSONValue?) -> [String] {
+        guard let strings = value?.stringsValue else { return [] }
+        return strings.flatMap(splitAddresses)
+    }
+
+    private static func splitAddresses(_ s: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var inQuotes = false
+        var angleDepth = 0
+        for ch in s {
+            switch ch {
+            case "\"":
+                inQuotes.toggle()
+                current.append(ch)
+            case "<" where !inQuotes:
+                angleDepth += 1
+                current.append(ch)
+            case ">" where !inQuotes:
+                angleDepth = max(0, angleDepth - 1)
+                current.append(ch)
+            case "," where !inQuotes && angleDepth == 0:
+                out.append(current)
+                current = ""
+            default:
+                current.append(ch)
+            }
+        }
+        out.append(current)
+        return out.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+
+    /// Splits `Display Name <addr@host>` apart. Mail keeps name and address in
+    /// separate properties; handed the combined form it files the whole string
+    /// as the address.
+    private static func parseAddress(_ s: String) -> (name: String?, address: String) {
+        guard let open = s.lastIndex(of: "<"),
+              let close = s.lastIndex(of: ">"),
+              open < close else {
+            return (nil, s)
+        }
+        let address = String(s[s.index(after: open)..<close]).trimmingCharacters(in: .whitespaces)
+        var name = String(s[s.startIndex..<open]).trimmingCharacters(in: .whitespaces)
+        if name.count >= 2 && name.hasPrefix("\"") && name.hasSuffix("\"") {
+            name = String(name.dropFirst().dropLast())
+        }
+        return (name.isEmpty ? nil : name, address.isEmpty ? s : address)
+    }
+
+    private static func recipientLinesJXA(_ addresses: [String], className: String, collection: String) -> String {
+        addresses.map { entry in
+            let parsed = parseAddress(entry)
+            let nameProp = parsed.name.map { ", name: '\(escapeJSString($0))'" } ?? ""
+            return "msg.\(collection).push(mail.\(className)({address: '\(escapeJSString(parsed.address))'\(nameProp)}));"
+        }.joined(separator: "\n")
+    }
+
+    /// Rough count of the visible characters in an HTML fragment, used only to
+    /// decide whether an empty rendered body means Mail rejected the HTML.
+    private static func visibleTextLength(inHTML html: String) -> Int {
+        var count = 0
+        var inTag = false
+        for ch in html {
+            if ch == "<" { inTag = true; continue }
+            if ch == ">" { inTag = false; continue }
+            if !inTag && !ch.isWhitespace { count += 1 }
+        }
+        return count
+    }
+
+    /// Turns the `attachments` argument into verified absolute paths.
+    private static func attachmentPaths(_ value: JSONValue?) -> (paths: [String], error: String?) {
+        guard let raw = value?.stringsValue, !raw.isEmpty else { return ([], nil) }
+        var paths: [String] = []
+        var missing: [String] = []
+        for entry in raw {
+            let expanded = (entry as NSString).expandingTildeInPath
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory), !isDirectory.boolValue {
+                paths.append(expanded)
+            } else {
+                missing.append(entry)
+            }
+        }
+        if !missing.isEmpty {
+            return ([], "attachment not found: \(missing.joined(separator: ", "))")
+        }
+        return (paths, nil)
+    }
+
+    /// JXA that attaches each file after the body.
+    ///
+    /// `attachments.push` puts the file at the *start* of the message — the
+    /// paperclip lands above the text — so the attachment is made at a position
+    /// after the last paragraph instead, which is the AppleScript idiom. The
+    /// paragraph count is re-read each time because attaching changes it, and
+    /// an empty body has no paragraph to insert after, so that case falls back
+    /// to push. The settle delay before saving or sending is Mail's long-
+    /// standing quirk: a large attachment is still being copied in when the
+    /// save command arrives, and the draft is written without it.
+    private static func attachmentsJXA(_ paths: [String]) -> String {
+        guard !paths.isEmpty else { return "" }
+        let literals = paths.map { "'\(escapeJSString($0))'" }.joined(separator: ", ")
+        var totalBytes = 0
+        for path in paths {
+            totalBytes += (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int)
+                .flatMap { $0 } ?? 0
+        }
+        let settle = min(0.5 + Double(totalBytes) / 5_000_000, 8.0)
+        return """
+        var ATTACHMENTS = [\(literals)];
+        for (var ai = 0; ai < ATTACHMENTS.length; ai++) {
+            var paras = msg.content.paragraphs;
+            var pcount = paras.length;
+            if (pcount > 0) {
+                mail.make({new: 'attachment', at: paras.at(pcount - 1).after, withProperties: {fileName: Path(ATTACHMENTS[ai])}});
+            } else {
+                msg.content.attachments.push(mail.Attachment({fileName: Path(ATTACHMENTS[ai])}));
+            }
+        }
+        $.NSThread.sleepForTimeInterval(\(String(format: "%.2f", settle)));
+        """
+    }
+
+    /// JXA that refuses to hand the message on unless it is addressed to
+    /// exactly who the caller asked for.
+    ///
+    /// This is the last line of defence against sending to the wrong person.
+    /// It has already happened once: with several compose windows open, the
+    /// reference returned by `OutgoingMessage()` bound to a pre-existing window
+    /// instead of the new message, and `send()` delivered that window's
+    /// recipient. `resolveOutgoingJXA` should make that impossible, but the
+    /// cost of being wrong is mail leaving the machine, so what Mail actually
+    /// holds is read back and compared before anything is sent or saved.
+    private static func recipientGuardJXA(to: [String], cc: [String], bcc: [String], subject: String) -> String {
+        let expected = (to + cc + bcc)
+            .map { parseAddress($0).address.lowercased() }
+            .map { "'\(escapeJSString($0))'" }
+            .joined(separator: ", ")
+        return """
+        (function() {
+            function addressesOf(list) {
+                var out = [];
+                for (var i = 0; i < list.length; i++) {
+                    var a = null;
+                    try { a = list[i].address(); } catch (e) {}
+                    if (a) out.push(('' + a).toLowerCase());
+                }
+                return out;
+            }
+            var actual = addressesOf(msg.toRecipients())
+                .concat(addressesOf(msg.ccRecipients()))
+                .concat(addressesOf(msg.bccRecipients()));
+            var expected = [\(expected)];
+            var missing = expected.filter(function(a) { return actual.indexOf(a) === -1; });
+            var extra = actual.filter(function(a) { return expected.indexOf(a) === -1; });
+            var wrongSubject = ('' + msg.subject()) !== '\(escapeJSString(subject))';
+            if (missing.length || extra.length || wrongSubject) {
+                try { msg.close({saving: 'no'}); } catch (e) {}
+                throw new Error('aborted before sending: Mail has this message addressed to ['
+                    + actual.join(', ') + '] with subject "' + msg.subject() + '", not ['
+                    + expected.join(', ') + ']. Nothing was sent or saved.');
+            }
+        })();
+        """
+    }
+
+    /// JXA that pins `msg` to the outgoing message just created.
+    ///
+    /// The reference `OutgoingMessage()` hands back is not reliably the message
+    /// that `push` added — with other compose windows open it can resolve to
+    /// one of those instead, which is how a test send once went to a stranger's
+    /// address that appeared nowhere in the request. `id` is assigned on
+    /// creation and read-only, so re-finding the message by id in the live
+    /// collection gives an unambiguous reference to mutate and send.
+    private static let resolveOutgoingJXA = """
+    var newMessageId = draft.id();
+    var msg = (function() {
+        var open = mail.outgoingMessages();
+        for (var i = 0; i < open.length; i++) {
+            var candidate = null;
+            try { candidate = open[i].id(); } catch (e) { continue; }
+            if (candidate === newMessageId) return open[i];
+        }
+        return null;
+    })();
+    if (!msg) { throw new Error('could not identify the newly created message in Mail; nothing was sent or saved'); }
+    """
+
     /// Shared email composition: validates params, builds JXA, runs it.
-    /// `visible` controls whether a compose window opens. `finalAction` is the JXA after recipients are set.
-    private static func composeEmail(_ args: JSONObject?, visible: Bool, finalAction: String, successMessage: String) -> MCPCallResult {
-        guard let to = args?["to"]?.stringValue else {
+    /// `visible` controls whether a compose window opens. `finalAction` is the
+    /// JXA run once the message is fully built, and must leave a `result`
+    /// object in scope for the caller to return.
+    private static func composeEmail(
+        _ args: JSONObject?,
+        visible: Bool,
+        finalAction: String
+    ) -> MCPCallResult {
+        let to = recipientList(args?["to"])
+        guard !to.isEmpty else {
             return errorResult("to is required")
         }
         guard let subject = args?["subject"]?.stringValue else {
             return errorResult("subject is required")
         }
-        guard let body = args?["body"]?.stringValue else {
-            return errorResult("body is required")
+        let body = args?["body"]?.stringValue
+        let htmlBody = args?["html_body"]?.stringValue
+        guard body != nil || htmlBody != nil else {
+            return errorResult("body or html_body is required")
         }
 
-        let escapedTo = escapeJSString(to)
-        let escapedSubject = escapeJSString(subject)
-        let escapedBody = escapeJSString(body)
+        let (attachments, attachmentError) = attachmentPaths(args?["attachments"])
+        if let attachmentError { return errorResult(attachmentError) }
 
-        var recipientLines = """
-        var toRecip = mail.Recipient({address: '\(escapedTo)'});
-        msg.toRecipients.push(toRecip);
-        """
-
-        if let cc = args?["cc"]?.stringValue {
-            let escapedCc = escapeJSString(cc)
-            recipientLines += """
-
-            var ccRecip = mail.CcRecipient({address: '\(escapedCc)'});
-            msg.ccRecipients.push(ccRecip);
-            """
+        // `html content` and `content` are the same underlying body, and the
+        // HTML wins when both are set, so only one is sent. Mail generates the
+        // plain-text alternative part itself.
+        let contentProp: String
+        if let htmlBody {
+            contentProp = "htmlContent: '\(escapeJSString(htmlBody))'"
+        } else {
+            contentProp = "content: '\(escapeJSString(body ?? ""))'"
         }
 
-        if let bcc = args?["bcc"]?.stringValue {
-            let escapedBcc = escapeJSString(bcc)
-            recipientLines += """
-
-            var bccRecip = mail.BccRecipient({address: '\(escapedBcc)'});
-            msg.bccRecipients.push(bccRecip);
-            """
+        var recipientLines = recipientLinesJXA(to, className: "Recipient", collection: "toRecipients")
+        let cc = recipientList(args?["cc"])
+        if !cc.isEmpty {
+            recipientLines += "\n" + recipientLinesJXA(cc, className: "CcRecipient", collection: "ccRecipients")
+        }
+        let bcc = recipientList(args?["bcc"])
+        if !bcc.isEmpty {
+            recipientLines += "\n" + recipientLinesJXA(bcc, className: "BccRecipient", collection: "bccRecipients")
         }
 
         let senderSnippet = senderJXA(from: args?["from"]?.stringValue, account: args?["account"]?.stringValue)
         let visibleProp = visible ? "" : ",\n    visible: false"
 
+        // `html content` is marked deprecated in Mail's dictionary ("does
+        // nothing at all") but in fact still renders when set at creation. If a
+        // future Mail makes good on the deprecation the body would silently
+        // come out empty, so it is checked rather than assumed.
+        let htmlGuard = htmlBody.map { html in
+            visibleTextLength(inHTML: html) == 0 ? "" : """
+            if (renderedChars === 0) {
+                try { msg.close({saving: 'no'}); } catch (e) {}
+                throw new Error('Mail produced an empty body from html_body — this build of Mail no longer accepts HTML. Resend using body instead.');
+            }
+            """
+        } ?? ""
+
         let script = """
+        ObjC.import('Foundation');
         var mail = Application('Mail');
         \(senderSnippet.lines)
-        var msg = mail.OutgoingMessage({
-            subject: '\(escapedSubject)',
-            content: '\(escapedBody)'\(visibleProp)
+        var draft = mail.OutgoingMessage({
+            subject: '\(escapeJSString(subject))',
+            \(contentProp)\(visibleProp)
         });
-        mail.outgoingMessages.push(msg);
+        mail.outgoingMessages.push(draft);
+        \(resolveOutgoingJXA)
         \(recipientLines)
         \(senderSnippet.prop)
+        \(attachmentsJXA(attachments))
+        var renderedChars = 0;
+        try { renderedChars = ('' + msg.content()).replace(/\\s+/g, '').length; } catch (e) {}
+        \(htmlGuard)
+        \(recipientGuardJXA(to: to, cc: cc, bcc: bcc, subject: subject))
+        var result = {
+            recipients: {to: \(to.count), cc: \(cc.count), bcc: \(bcc.count)},
+            attachments: \(attachments.count),
+            content_type: '\(htmlBody != nil ? "html" : "text")',
+            rendered_chars: renderedChars
+        };
         \(finalAction)
+        JSON.stringify(result);
         """
-        let (output, error) = runJXA(script)
+        let (output, error) = runJXA(script, retries: 0)
         if let error { return errorResult(error) }
-        return textResult(output.isEmpty ? successMessage : output)
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return textResult(output)
+        }
+        return jsonResult(payload)
     }
 
+    /// Composed invisibly on purpose. Composing with `visible: true` puts a real
+    /// window on screen, and a frontmost compose window is something Mail can
+    /// act on in place of the message the script is holding — which is how a
+    /// send once went out to the recipient of an unrelated window the user had
+    /// open, rather than the address that was passed in. Nothing is gained by
+    /// the window: `send` needs no UI.
     private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
-        composeEmail(args, visible: true, finalAction: "msg.send();\n'sent';", successMessage: "email sent")
+        composeEmail(args, visible: false, finalAction: """
+        msg.send();
+        result.status = 'sent';
+        """)
     }
 
+    /// After saving, the draft is looked up and its identifiers returned.
+    ///
+    /// This is what makes a draft verifiable. Mail's numeric id for a freshly
+    /// saved IMAP draft is short-lived — the server takes the upload and hands
+    /// back its own copy, and the local one is gone — so the RFC Message-ID
+    /// goes back too, and `mail_get_email` accepts either.
     private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
-        composeEmail(args, visible: false, finalAction: "mail.save(msg);\n'draft created';", successMessage: "draft created")
+        let account = args?["account"]?.stringValue
+        let from = args?["from"]?.stringValue
+        let subject = args?["subject"]?.stringValue ?? ""
+
+        let acctExpr = account.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
+        let fromExpr = from.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
+
+        let finalAction = """
+        mail.save(msg);
+        result.status = 'draft created';
+        // Let the account file the saved draft before looking for it.
+        $.NSThread.sleepForTimeInterval(1.5);
+        result.draft = (function() {
+            var wantAcct = \(acctExpr);
+            var wantFrom = \(fromExpr);
+            var SUBJECT = '\(escapeJSString(subject))';
+            try {
+                var accts = mail.accounts();
+                for (var i = 0; i < accts.length; i++) {
+                    var name = '' + accts[i].name();
+                    var match = wantAcct !== null && name.toLowerCase() === wantAcct;
+                    if (!match && wantFrom !== null) {
+                        var addrs = accts[i].emailAddresses();
+                        for (var a = 0; a < addrs.length; a++) {
+                            if (('' + addrs[a]).toLowerCase() === wantFrom) { match = true; break; }
+                        }
+                    }
+                    if (!match) continue;
+                    var mbs = accts[i].mailboxes();
+                    for (var j = 0; j < mbs.length; j++) {
+                        if (('' + mbs[j].name()).toLowerCase() !== 'drafts') continue;
+                        var ids = mbs[j].messages.id();
+                        var subs = mbs[j].messages.subject();
+                        var rfcs = mbs[j].messages.messageId();
+                        var best = -1;
+                        for (var k = 0; k < ids.length; k++) {
+                            if (('' + subs[k]) !== SUBJECT) continue;
+                            if (best < 0 || ids[k] > ids[best]) best = k;
+                        }
+                        if (best >= 0) {
+                            return {
+                                account: name,
+                                mailbox: '' + mbs[j].name(),
+                                message_id: '' + ids[best],
+                                rfc_message_id: rfcs[best] == null ? '' : '' + rfcs[best]
+                            };
+                        }
+                    }
+                }
+            } catch (e) { return {lookup_error: '' + e}; }
+            return null;
+        })();
+        """
+        return composeEmail(args, visible: false, finalAction: finalAction)
+    }
+
+    // MARK: - Attachments and raw source
+
+    /// Wall-clock allowance for a `source` fetch. A 5.9 MB message takes a few
+    /// seconds; the ceiling is generous because the alternative to waiting is
+    /// having no way to reach the attachment at all.
+    private static let sourceFetchTimeout: TimeInterval = 180
+
+    /// Fetches one message's raw RFC 822 source.
+    ///
+    /// The source goes to stdout, which `runJXAData` has already pointed at a
+    /// file, so multi-megabyte messages are fine. A miss throws inside the
+    /// script rather than printing a marker, because any marker printed on
+    /// stdout could also be a legitimate first line of a message.
+    private static func fetchSource(
+        account: String?,
+        mailbox: String,
+        messageId: String
+    ) -> (data: Data, error: String?) {
+        let script = """
+        var mail = Application('Mail');
+        \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
+        if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
+        '' + found.source();
+        """
+        let (data, error) = runJXAData(script, retries: 0, timeout: sourceFetchTimeout)
+        if let error {
+            if error.contains("message not found") {
+                return (Data(), "message not found with id: \(messageId)")
+            }
+            return (Data(), error)
+        }
+        return (data, nil)
+    }
+
+    /// Strips anything that could steer a filename out of the destination
+    /// directory. Mail filenames come from the sender and are not trustworthy.
+    private static func safeFilename(_ name: String) -> String {
+        var cleaned = name
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\u{0}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while cleaned.hasPrefix(".") { cleaned.removeFirst() }
+        return cleaned.isEmpty ? "attachment" : cleaned
+    }
+
+    /// Returns a path that does not already exist, by suffixing " (2)", " (3)"…
+    private static func uniquePath(_ url: URL) -> URL {
+        guard FileManager.default.fileExists(atPath: url.path) else { return url }
+        let ext = url.pathExtension
+        let stem = url.deletingPathExtension().lastPathComponent
+        let dir = url.deletingLastPathComponent()
+        var n = 2
+        while n < 1000 {
+            let candidate = dir.appendingPathComponent(
+                ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
+            )
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            n += 1
+        }
+        return url
+    }
+
+    private static func saveAttachment(_ args: JSONObject?) -> MCPCallResult {
+        guard let messageId = args?["message_id"]?.stringValue else {
+            return errorResult("message_id is required")
+        }
+        guard let destinationArg = args?["destination"]?.stringValue else {
+            return errorResult("destination is required")
+        }
+        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let overwrite = args?["overwrite"]?.boolValue ?? false
+
+        let (data, fetchError) = fetchSource(
+            account: args?["account"]?.stringValue,
+            mailbox: mailbox,
+            messageId: messageId
+        )
+        if let fetchError { return errorResult(fetchError) }
+
+        let all = MIME.attachments(of: MIME.parse(data))
+        guard !all.isEmpty else {
+            return errorResult("message \(messageId) has no attachments")
+        }
+
+        var selected = all
+        if let index = args?["index"]?.intValue {
+            guard index >= 0 && index < all.count else {
+                return errorResult("index \(index) out of range — message has \(all.count) attachment(s)")
+            }
+            selected = [all[index]]
+        } else if let wanted = args?["attachment_name"]?.stringValue {
+            let needle = wanted.lowercased()
+            selected = all.filter { $0.name.lowercased() == needle }
+            if selected.isEmpty { selected = all.filter { $0.name.lowercased().contains(needle) } }
+            guard !selected.isEmpty else {
+                return errorResult("no attachment matching \"\(wanted)\" — message has: \(all.map(\.name).joined(separator: ", "))")
+            }
+        }
+
+        // A destination that exists as a directory, or that carries no file
+        // extension, is a folder to drop files into. Anything else is a full
+        // path, which only makes sense for a single attachment.
+        let destination = URL(fileURLWithPath: (destinationArg as NSString).expandingTildeInPath)
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory)
+        let treatAsDirectory = (exists && isDirectory.boolValue)
+            || (!exists && destination.pathExtension.isEmpty)
+        if !treatAsDirectory && selected.count > 1 {
+            return errorResult("destination \"\(destinationArg)\" is a file path but \(selected.count) attachments were selected — pass a directory, or narrow with attachment_name or index")
+        }
+
+        let directory = treatAsDirectory ? destination : destination.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return errorResult("could not create \(directory.path): \(error.localizedDescription)")
+        }
+
+        var saved: [[String: Any]] = []
+        for attachment in selected {
+            var target = treatAsDirectory
+                ? directory.appendingPathComponent(safeFilename(attachment.name))
+                : destination
+            if !overwrite { target = uniquePath(target) }
+            do {
+                try attachment.data.write(to: target)
+            } catch {
+                return errorResult("could not write \(target.path): \(error.localizedDescription)")
+            }
+            saved.append([
+                "name": attachment.name,
+                "path": target.path,
+                "bytes": attachment.data.count,
+                "mime_type": attachment.mimeType,
+                "inline": attachment.inline
+            ])
+        }
+
+        return jsonResult([
+            "saved": saved,
+            "attachments_in_message": all.count,
+            "message_id": messageId
+        ])
+    }
+
+    private static func getSource(_ args: JSONObject?) -> MCPCallResult {
+        guard let messageId = args?["message_id"]?.stringValue else {
+            return errorResult("message_id is required")
+        }
+        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let (data, fetchError) = fetchSource(
+            account: args?["account"]?.stringValue,
+            mailbox: mailbox,
+            messageId: messageId
+        )
+        if let fetchError { return errorResult(fetchError) }
+
+        if let saveTo = args?["save_to"]?.stringValue {
+            let url = URL(fileURLWithPath: (saveTo as NSString).expandingTildeInPath)
+            do {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try data.write(to: url)
+            } catch {
+                return errorResult("could not write \(url.path): \(error.localizedDescription)")
+            }
+            return jsonResult(["path": url.path, "bytes": data.count, "message_id": messageId])
+        }
+
+        // Sources run to megabytes, so an unbounded return would bury the
+        // caller. The cap is on bytes taken from the front, which is where the
+        // headers and the structure are.
+        let maxBytes = min(max(args?["max_bytes"]?.intValue ?? 100_000, 1_000), 2_000_000)
+        let slice = data.prefix(maxBytes)
+        let text = String(data: slice, encoding: .utf8)
+            ?? String(data: slice, encoding: .isoLatin1)
+            ?? ""
+        return jsonResult([
+            "source": text,
+            "bytes_total": data.count,
+            "bytes_returned": slice.count,
+            "truncated": data.count > slice.count,
+            "message_id": messageId
+        ])
     }
 
     private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
@@ -949,6 +1518,25 @@ enum MailService {
 
     // MARK: - Registration
 
+    /// `mail_send` and `mail_create_draft` take the same message, so they take
+    /// the same schema.
+    private static func composeSchema(action: String) -> JSONValue {
+        schema(
+            properties: [
+                "to": stringOrStringArrayProp("Recipient address(es). One string, an array of strings, or a comma-separated list. Display names are allowed: \"Susan Cross\" <s@example.org>"),
+                "subject": stringProp("Email subject"),
+                "body": stringProp("Plain-text email body. Required unless html_body is given"),
+                "html_body": stringProp("HTML email body. Sent as a real text/html message, so tables, headings and links render. Takes precedence over body when both are given (Mail generates its own plain-text alternative)"),
+                "cc": stringOrStringArrayProp("CC recipient address(es), same forms as `to`"),
+                "bcc": stringOrStringArrayProp("BCC recipient address(es), same forms as `to`"),
+                "attachments": stringArrayProp("Absolute POSIX paths of files to attach, e.g. [\"/Users/me/Budget.pdf\"]. Attached after the body so they appear at the end of the message"),
+                "from": stringProp("Sender email address (overrides account lookup)"),
+                "account": stringProp("Account name to \(action) (uses default account if omitted)")
+            ],
+            required: ["to", "subject"]
+        )
+    }
+
     static func register(_ registry: ToolRegistry) {
         let cat = "Mail"
 
@@ -998,10 +1586,10 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get full email by message ID. Searches all accounts when account omitted",
+                description: "Get full email by message ID, including the list of attachments (name, size, mime_type). Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
                         "account": stringProp("Account name from results (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes")
                     ],
@@ -1038,19 +1626,9 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_send",
-                description: "Send an email via Mail.app",
-                inputSchema: schema(
-                    properties: [
-                        "to": stringProp("Recipient email address"),
-                        "subject": stringProp("Email subject"),
-                        "body": stringProp("Email body text"),
-                        "cc": stringProp("CC recipient email address"),
-                        "bcc": stringProp("BCC recipient email address"),
-                        "from": stringProp("Sender email address (overrides account lookup)"),
-                        "account": stringProp("Account name to send from (uses default account if omitted)")
-                    ],
-                    required: ["to", "subject", "body"]
-                )
+                description: "Send an email via Mail.app, optionally as HTML and with file attachments",
+                inputSchema: composeSchema(action: "send from"),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: sendEmail
@@ -1059,22 +1637,53 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder. Does NOT send the email",
-                inputSchema: schema(
-                    properties: [
-                        "to": stringProp("Recipient email address"),
-                        "subject": stringProp("Email subject"),
-                        "body": stringProp("Email body text"),
-                        "cc": stringProp("CC recipient email address"),
-                        "bcc": stringProp("BCC recipient email address"),
-                        "from": stringProp("Sender email address (overrides account lookup)"),
-                        "account": stringProp("Account name to save draft in (uses default account if omitted)")
-                    ],
-                    required: ["to", "subject", "body"]
-                )
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email",
+                inputSchema: composeSchema(action: "save the draft in"),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: createDraft
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_save_attachment",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given",
+                inputSchema: schema(
+                    properties: [
+                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
+                        "destination": stringProp("Absolute POSIX path: a directory to save into (created if missing), or a full file path when saving a single attachment"),
+                        "attachment_name": stringProp("Name of the attachment to save, as reported by mail_get_email (exact match preferred, substring accepted)"),
+                        "index": intProp("Zero-based index of the attachment to save, as an alternative to attachment_name"),
+                        "account": stringProp("Account name (optional, speeds up lookup)"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
+                        "overwrite": boolProp("Overwrite an existing file instead of saving alongside it as \"name (2).ext\" (default: false)")
+                    ],
+                    required: ["message_id", "destination"]
+                )
+            ),
+            category: cat,
+            handler: saveAttachment
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_get_source",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. Use mail_save_attachment instead when the goal is just to extract attachments",
+                inputSchema: schema(
+                    properties: [
+                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
+                        "account": stringProp("Account name (optional, speeds up lookup)"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
+                        "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
+                        "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000)")
+                    ],
+                    required: ["message_id"]
+                ),
+                annotations: MCPAnnotations(readOnlyHint: true)
+            ),
+            category: cat,
+            handler: getSource
         )
 
         registry.register(
