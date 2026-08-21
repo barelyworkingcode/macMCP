@@ -137,6 +137,53 @@ final class MailSourceOnDiskTests: XCTestCase {
         let note = try XCTUnwrap(fidelity["note"] as? String)
         XCTAssertTrue(note.contains("CRLF"), note)
         XCTAssertTrue(note.contains("0x80"), note)
+
+        // 5. The whole message arrived, and Mail's own idea of its size agrees
+        //    with the bytes that were delivered. This is what caught #31: the
+        //    fetch used to return whatever Mail had downloaded so far.
+        XCTAssertEqual(fidelity["complete"] as? Bool, true)
+        XCTAssertEqual(
+            fidelity["message_size"] as? Int,
+            onDisk.bytes.count,
+            "Mail's messageSize disagrees with the bytes that were delivered"
+        )
+    }
+
+    func testAMessageStillArrivingIsWaitedForRatherThanReturnedInPieces() throws {
+        // 300 KB, because the window is proportional to how much there is to
+        // download: `source()` returned 838 bytes of a message this size while
+        // Mail was still fetching it, and reported that as the whole message.
+        // The fetch now compares against Mail's messageSize and waits.
+        let payload = Data((0..<300_000).map { UInt8(($0 * 13 + 7) % 256) })
+            .map { $0 == 0x0A || $0 == 0x0D ? 0x2E : $0 }
+        let subject = "MACMCP-BIG-\(UUID().uuidString.prefix(8))"
+        let message = probeMessage(
+            subject: subject,
+            rfcID: "<\(subject.lowercased())@relaytest.local>",
+            payload: Data(payload)
+        )
+        try deliver(message)
+        _ = try XCTUnwrap(waitForFileOnDisk(containing: subject), "the fixture never took the message")
+
+        try syncMail()
+        let numericID = try XCTUnwrap(waitForMailToSee(subject: subject), "Mail did not show the message")
+        addTeardownBlock { self.discard(messageID: numericID) }
+
+        let result = try callJSON("mail_get_source", [
+            "message_id": .string(numericID),
+            "account": .string(account),
+            "mailbox": .string("INBOX"),
+            "max_bytes": .int(1)
+        ])
+        let fidelity = try XCTUnwrap(result["fidelity"] as? [String: Any])
+        XCTAssertEqual(fidelity["complete"] as? Bool, true, "a fragment was returned as the message")
+        XCTAssertEqual(fidelity["message_size"] as? Int, message.count)
+        // bytes_total is the LF form of the same message, one byte shorter per
+        // line, so it must account for every line that was delivered.
+        XCTAssertEqual(
+            result["bytes_total"] as? Int,
+            message.count - message.filter { $0 == 0x0D }.count
+        )
     }
 
     // MARK: - Building and delivering the probe
