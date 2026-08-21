@@ -105,7 +105,30 @@ enum PermissionsService {
     /// The question is asked about *this* process, which is the same subject
     /// TCC attributes the `osascript` children to via responsible-process
     /// attribution, so the answer describes the calls macMCP actually makes.
-    static func automationStatus(bundleID: String, timeout: TimeInterval = 2) -> AutomationStatus {
+    /// How long the check is given to answer.
+    ///
+    /// Named rather than inlined because it is the bound that keeps a
+    /// consent-blocked TCC probe from adding its own wait -- measured at 12s and
+    /// at 73s -- on top of a mail script's 120s deadline. Two seconds is far
+    /// more than the ~10ms the answer takes when nothing is pending, and far
+    /// less than any of the blocked measurements.
+    static let automationCheckTimeout: TimeInterval = 2
+
+    static func automationStatus(bundleID: String, timeout: TimeInterval = automationCheckTimeout) -> AutomationStatus {
+        boundedStatus(timeout: timeout) { probeAutomation(bundleID: bundleID) }
+    }
+
+    /// Runs `probe` with a deadline, reporting `.checkBlocked` if it overruns.
+    ///
+    /// Split out, and not private, so the bound can be tested with a probe that
+    /// deliberately does not return. The real probe cannot be made to block on
+    /// demand -- it needs an unanswered consent prompt on screen -- and a
+    /// property that only reproduces under a condition a test cannot create is
+    /// exactly the sort that quietly stops holding.
+    static func boundedStatus(
+        timeout: TimeInterval,
+        probe: @escaping @Sendable () -> AutomationStatus
+    ) -> AutomationStatus {
         // A semaphore is safe here, unlike elsewhere in this codebase: the work
         // is one synchronous C call, not a framework callback that would be
         // delivered on the main RunLoop this thread is blocking.
@@ -113,7 +136,7 @@ enum PermissionsService {
         let box = Box()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .userInitiated).async {
-            box.value = probeAutomation(bundleID: bundleID)
+            box.value = probe()
             done.signal()
         }
         guard done.wait(timeout: .now() + timeout) == .success else {

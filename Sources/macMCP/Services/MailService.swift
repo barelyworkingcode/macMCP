@@ -4,10 +4,14 @@ enum MailService {
     /// Wall-clock ceiling for a single osascript invocation. Mail can wedge for
     /// minutes on an expensive Apple Event, and an unbounded wait would hang the
     /// whole server, so every run gets a deadline and a SIGKILL backstop.
-    private static let defaultTimeout: TimeInterval = 120
+    ///
+    /// Not private: it is a default argument of `runJXAData`, which the tests
+    /// drive directly.
+    static let defaultTimeout: TimeInterval = 120
 
-    /// The bundle every mail_* tool sends Apple Events to.
-    private static let mailBundleID = "com.apple.mail"
+    /// The bundle every mail_* tool sends Apple Events to. Not private, for the
+    /// same reason as above.
+    static let mailBundleID = "com.apple.mail"
 
     /// Builds the error returned when a script blows its deadline.
     ///
@@ -78,11 +82,17 @@ enum MailService {
     /// Output goes to temp files rather than pipes: a scan of a large mailbox
     /// easily exceeds the 64 KB pipe buffer, and reading a pipe only after
     /// `waitUntilExit()` deadlocks once the child fills it.
-    private static func runJXAData(
+    ///
+    /// `automationProbe` exists for the tests. When the automation grant is
+    /// taken is the property that keeps a consent-blocked run from hanging, and
+    /// it is not observable from the outside: a test has to be able to see the
+    /// probe fire and to see what the script had done by then.
+    static func runJXAData(
         _ script: String,
         retries: Int = 2,
         timeout: TimeInterval = defaultTimeout,
-        scopable: Bool = true
+        scopable: Bool = true,
+        automationProbe: (() -> AutomationStatus)? = nil
     ) -> (output: Data, error: String?) {
         // Ask TCC where the automation grant stands *before* running anything.
         // Asking afterwards, on the error path, is too late: while a consent
@@ -92,7 +102,7 @@ enum MailService {
         // the user. It costs about 10ms then, against a spawn that costs an
         // order of magnitude more, and it is the difference between reporting
         // "Mail was slow" and reporting the thing that is actually wrong.
-        let automation = PermissionsService.automationStatus(bundleID: mailBundleID)
+        let automation = automationProbe?() ?? PermissionsService.automationStatus(bundleID: mailBundleID)
 
         for attempt in 0...retries {
             let tmpDir = FileManager.default.temporaryDirectory

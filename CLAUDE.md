@@ -66,6 +66,20 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 
 - **A mail timeout is checked against TCC before Mail is blamed.** A consent-blocked `osascript` is indistinguishable from a wedged Apple Event from the outside, and the old message answered both with "narrow the scope" — advice `mail_list_accounts` (empty input schema) cannot act on. `runJXAData` now takes the automation grant with `AEDeterminePermissionToAutomateTarget(..., askUserIfNeeded: false)` **before** running the script, and `scopable` says whether the calling tool has anything to narrow. The order matters: that check answers in ~10ms normally but **blocks while a consent prompt is on screen** (measured 12s and 73s, still blocked 20s after the script had been killed), so it is bounded by a 2s deadline and a blocked check is itself reported as a pending decision rather than as ignorance. `permissions_check` reports `automation (Mail)` for the same reason — it is the one TCC service macMCP hangs on rather than merely being refused by.
 
+- **A revoked Apple Events grant cannot be restored by putting the database back.**
+  Learned during #7, and expensive: after a consent prompt was left to time out,
+  tccd had written a **deny** row (`auth_value=0`, `auth_reason=9`) for the client,
+  and it re-asserted that row over a restored copy of `TCC.db` **twice**. Copying
+  the file back, even with tccd stopped, does not converge — the daemon's own view
+  wins. What worked was raising a **fresh prompt** and approving it (`vmallow`
+  watches for it; the prompt is owned by UserNotificationCenter, not by Mail or by
+  the requesting app). So: never test consent by letting a prompt expire, and if a
+  grant does go missing, re-prompt rather than reach for the database. Note also
+  that ad-hoc signing pins a grant to the cdhash, so rebuilding Relay revokes
+  macMCP's grants and they have to be re-granted through Relay > Settings > MCP
+  Servers > macMCP > Reset Permissions. Verify functionally (`mail_list_accounts`
+  returning accounts), not by reading a status field.
+
 - **Mail escapes every non-ASCII character** as `\uXXXX` when generating JXA. The script reaches osascript as an `-e` argument, decoded using the process locale, and the MCP server's host need not set one — raw UTF-8 em dashes and Hebrew come out mangled. U+2028/U+2029 must go for a second reason: they terminate a JS string literal.
 
 - **Mail's own attachment APIs are unusable.** `save` on a `mail attachment` fails with -10004 for every destination including `~/Downloads` (Mail's sandbox, not Full Disk Access), and the `MIME type` property raises "AppleEvent handler failed" on any message that has an attachment. `source` works, so `mail_save_attachment` fetches raw RFC 822 and decodes it in `MIME.swift` — and `mail_get_email` now takes its `mime_type` from the same place, so the two agree. The filename guess (`UTType`) survives only as a fallback, and `mime_type_source` says which one a caller is looking at: guessing from the extension reported `text/csv` for a part the message declares as `image/png; name="data.csv"`. The source fetch only happens when the message actually has attachments (~0.5s on top of a ~0.5s read), and a failed fetch leaves the guess in place rather than costing the caller the message.
