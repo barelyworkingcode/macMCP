@@ -64,7 +64,13 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
   written later, comes out in the same voice as `{error: ...}` results. Only
   `-2700` is unwrapped -- that is osascript's code for "the script threw", so the
   text is ours; `-1712`, `-1728` and syntax errors keep their raw form because the
-  number is the evidence.
+  number is the evidence. **Which code it is is read at the position osascript
+  writes it** -- the trailing ` (-NNNN)` -- never searched for in the text.
+  Everything before that position is the message, and a message contains whatever
+  the caller passed in: `mail_move` on a mailbox named `Q (-1712) box` reported
+  "Mail timed out evaluating the request (-1712)" while the script had thrown
+  `no mailbox named "Q (-1712) box"`, and `-1728` in a name bought two silent
+  retries.
 
 - **A mail timeout is checked against TCC before Mail is blamed.** A consent-blocked `osascript` is indistinguishable from a wedged Apple Event from the outside, and the old message answered both with "narrow the scope" — advice `mail_list_accounts` (empty input schema) cannot act on. `runJXAData` now takes the automation grant with `AEDeterminePermissionToAutomateTarget(..., askUserIfNeeded: false)` **before** running the script, and `scopable` says whether the calling tool has anything to narrow. The order matters: that check answers in ~10ms normally but **blocks while a consent prompt is on screen** (measured 12s and 73s, still blocked 20s after the script had been killed), so it is bounded by a 2s deadline and a blocked check is itself reported as a pending decision rather than as ignorance. `permissions_check` reports `automation (Mail)` for the same reason — it is the one TCC service macMCP hangs on rather than merely being refused by.
 
