@@ -168,12 +168,22 @@ enum MailService {
             }
 
             if process.terminationStatus != 0 {
+                // Which failure this was is decided by the OSStatus osascript
+                // appends, read at the position osascript writes it. Testing
+                // the whole of stderr for "-1712" let any string a caller
+                // controls impersonate one: a mailbox named `Q (-1712) box`
+                // came back as "Mail timed out evaluating the request (-1712)"
+                // while the script had thrown `no mailbox named "Q (-1712) box"`
+                // -- a -2700 reported as a -1712, with the sentence that said
+                // what was wrong thrown away.
+                let code = osaStatus(errOutput)?.code
+
                 // -1712 is an Apple Event timeout inside Mail itself. Retrying
                 // just spends the same wait again, so surface it instead.
-                if errOutput.contains("-1712") {
+                if code == -1712 {
                     return (Data(), "Mail timed out evaluating the request (-1712). Narrow the scope and try again.")
                 }
-                if attempt < retries && errOutput.contains("-1728") {
+                if attempt < retries && code == -1728 {
                     Thread.sleep(forTimeInterval: 0.5)
                     continue
                 }
@@ -259,16 +269,44 @@ enum MailService {
     /// in the script rather than a message for the caller and the class name is
     /// the useful part of it.
     static func scriptErrorMessage(_ stderr: String) -> String? {
-        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let prefix = "execution error: "
-        let suffix = " (-2700)"
-        guard trimmed.hasPrefix(prefix), trimmed.hasSuffix(suffix) else { return nil }
-        var message = String(trimmed.dropFirst(prefix.count).dropLast(suffix.count))
+        guard let status = osaStatus(stderr), status.code == -2700,
+              status.text.hasPrefix(prefix) else { return nil }
+        var message = String(status.text.dropFirst(prefix.count))
         guard message.hasPrefix("Error: ") else { return nil }
         message = String(message.dropFirst("Error: ".count))
+        // `throw new Error('')` reaches stderr as `execution error: Error: Error
+        // (-2700)` -- the class naming itself with nothing after it. Unwrapping
+        // that hands the caller the word "Error", which says less than the raw
+        // line does, so the raw line is kept.
+        if message == "Error" { return nil }
         if message.hasPrefix("Error: ") { message = String(message.dropFirst("Error: ".count)) }
         message = message.trimmingCharacters(in: .whitespacesAndNewlines)
         return message.isEmpty ? nil : message
+    }
+
+    /// Splits the OSStatus off the end of an osascript error, returning the text
+    /// before it and the code.
+    ///
+    /// osascript puts the code in exactly one place: the end of the error, as
+    /// ` (-NNNN)`. Everything before that is the message, and a message can
+    /// contain anything a caller passed in -- a mailbox name, an account name --
+    /// including something that looks like a code. Matching a code anywhere in
+    /// stderr therefore lets the caller's own text decide how their error is
+    /// reported, which is how `mail_move` on a mailbox named `Q (-1712) box`
+    /// came back as a Mail timeout instead of "no mailbox named …".
+    ///
+    /// Only negative codes are recognised: that is what osascript emits, and it
+    /// keeps an ordinary parenthesised number at the end of a sentence from
+    /// being read as a status.
+    static func osaStatus(_ stderr: String) -> (text: String, code: Int)? {
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasSuffix(")"),
+              let opening = trimmed.range(of: " (-", options: .backwards) else { return nil }
+        let digits = trimmed[opening.upperBound..<trimmed.index(before: trimmed.endIndex)]
+        guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let magnitude = Int(digits) else { return nil }
+        return (String(trimmed[trimmed.startIndex..<opening.lowerBound]), -magnitude)
     }
 
     /// Renders a Swift string as the body of a single-quoted JS string literal.
