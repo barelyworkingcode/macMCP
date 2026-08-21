@@ -958,60 +958,173 @@ enum MailService {
         case .text(let text): return textResult(text)
         case .object(let object): payload = object
         }
-        if let attachments = payload["attachments"] as? [[String: Any]] {
-            payload["attachments"] = typedAttachments(
-                attachments,
-                account: payload["account"] as? String ?? args?["account"]?.stringValue,
-                mailbox: payload["mailbox"] as? String ?? mailbox,
-                messageId: messageId
-            )
-            payload["has_attachments"] = !attachments.isEmpty
-        }
-        return jsonResult(payload)
+        return reconciled(
+            payload,
+            listedByMail: payload["attachments"] as? [[String: Any]] ?? [],
+            account: payload["account"] as? String ?? args?["account"]?.stringValue,
+            mailbox: payload["mailbox"] as? String ?? mailbox,
+            messageId: messageId
+        )
     }
 
-    /// Wall-clock allowance for the source fetch that types a message's
-    /// attachments. Shorter than a plain `mail_get_source`, because this is an
-    /// enrichment of a read that already worked: exceeding it costs the caller a
-    /// less precise `mime_type`, not the message.
-    private static let attachmentTypeFetchTimeout: TimeInterval = 45
-
-    /// Fills in each attachment's `mime_type` from the message's own headers,
-    /// falling back to the filename guess.
+    /// Checks a message read out of Mail against the message itself, and reports
+    /// what could not be checked instead of guessing.
     ///
-    /// Mail's `MIME type` property on `mail attachment` raises "AppleEvent
-    /// handler failed" on every message that has one, so the type used to be
-    /// inferred from the filename. That is a guess presented as a fact, and it
-    /// disagreed with `mail_save_attachment` -- which reads the declared type
-    /// out of the source -- for the same attachment: `text/csv` against
-    /// `image/png` for a part the message declares as `image/png; name="data.csv"`.
+    /// `content()` and `mailAttachments()` answer for what Mail has downloaded,
+    /// and answer without complaint when that is nothing. With the server
+    /// unreachable, a 400 KB message carrying one attachment came back as
+    /// `body: ""`, `has_attachments: false`, `attachments: []` and no error --
+    /// beside a `message_size` of 400595 in the same response. #31 put that
+    /// check on `mail_get_source` and named this tool as a consumer of the same
+    /// bytes; this is that check reaching it.
     ///
-    /// So the type comes from the same place `mail_save_attachment` gets it. The
-    /// source fetch is the expensive part, so it only happens when the message
-    /// actually has attachments, and a failure leaves the filename guess in
-    /// place rather than costing the caller the message. `mime_type_source` says
-    /// which of the two the caller is looking at.
-    private static func typedAttachments(
-        _ attachments: [[String: Any]],
+    /// Two rules, and the second is the one that matters:
+    ///
+    /// * **A negative from an incomplete fetch is not reported at all.** An
+    ///   empty body and an empty attachment list are omitted rather than
+    ///   returned, because "" and `false` are answers a caller acts on. What
+    ///   Mail *does* have -- a partial body, an attachment it has already
+    ///   listed -- is positive evidence and is kept, with `fidelity` saying the
+    ///   message is not all here.
+    /// * **The attachment list is reconciled with the message source**, which is
+    ///   where `mail_save_attachment` reads it from. Mail's own list is not
+    ///   authoritative even after the message arrives: a message first read
+    ///   while it was still downloading kept `has_attachments: false`
+    ///   permanently, while `mail_save_attachment` extracted its attachment
+    ///   byte-exactly. Anything the source declares that Mail does not list is
+    ///   added and flagged, so the two tools stop disagreeing about the same
+    ///   message.
+    ///
+    /// A source fetch that fails leaves the message as Mail reported it, with
+    /// `source_check` saying the check did not happen -- an unreadable source is
+    /// not a reason to cost the caller a message that did read.
+    private static func reconciled(
+        _ message: [String: Any],
+        listedByMail: [[String: Any]],
         account: String?,
         mailbox: String,
         messageId: String
-    ) -> [[String: Any]] {
-        guard !attachments.isEmpty else { return attachments }
+    ) -> MCPCallResult {
+        var payload = message
         let (source, expectedSize, error) = fetchSource(
             account: account,
             mailbox: mailbox,
             messageId: messageId,
             timeout: attachmentTypeFetchTimeout
         )
-        // A fragment of a message Mail is still downloading declares nothing
-        // useful about attachments that are not in it yet, so the filename guess
-        // stays rather than being replaced with a worse answer.
-        guard error == nil, sourceFidelity(source, expectedSize: expectedSize).complete else {
-            return attachments.map(withFilenameGuess)
+        guard error == nil else {
+            payload["attachments"] = listedByMail.map(withFilenameGuess)
+            payload["has_attachments"] = !listedByMail.isEmpty
+            payload["source_check"] = "the message source could not be read (\(error!)), so the body and attachments here are Mail's own answer and nothing confirms the message had finished downloading"
+            return jsonResult(payload)
         }
-        return declaredAttachmentTypes(attachments, source: source)
+
+        return jsonResult(messageChecked(
+            payload,
+            listedByMail: listedByMail,
+            source: source,
+            fidelity: sourceFidelity(source, expectedSize: expectedSize)
+        ))
     }
+
+    /// Applies both rules to a message Mail reported and the source it was
+    /// checked against. Split out from the fetch so the rules can be tested
+    /// without a mailbox.
+    static func messageChecked(
+        _ message: [String: Any],
+        listedByMail: [[String: Any]],
+        source: Data,
+        fidelity: SourceFidelity
+    ) -> [String: Any] {
+        var payload = message
+        payload["fidelity"] = fidelity.dict
+
+        var attachments = fidelity.complete
+            ? declaredAttachmentTypes(listedByMail, source: source)
+            : listedByMail.map(withFilenameGuess)
+        let missed = fidelity.complete ? attachmentsMailDidNotList(listedByMail, source: source) : []
+        attachments += missed
+        if !missed.isEmpty {
+            payload["attachments_note"] = "\(missed.count) attachment(s) here are declared by the message but are not in Mail's own list for it, which is what mail_save_attachment reads and Mail can leave empty for good once a message has been read while it was still downloading. They carry listed_by_mail: false, and size is the decoded size of the part."
+        }
+
+        var omitted: [String] = []
+        if attachments.isEmpty && !fidelity.complete {
+            // "No attachments" measured against a message Mail does not have is
+            // not a finding.
+            payload.removeValue(forKey: "attachments")
+            omitted += ["attachments", "has_attachments"]
+        } else {
+            payload["attachments"] = attachments
+            payload["has_attachments"] = !attachments.isEmpty
+        }
+
+        if (payload["body"] as? String)?.isEmpty != false && !fidelity.complete {
+            payload.removeValue(forKey: "body")
+            omitted.append("body")
+        }
+
+        if !omitted.isEmpty {
+            payload["omitted"] = omitted
+            payload["omitted_reason"] = "Mail has not finished downloading this message (see fidelity), and these fields would have reported empty rather than measured. Ask again once fidelity.complete is true."
+        }
+        return payload
+    }
+
+    /// The attachments a message declares that Mail did not list, matched by
+    /// name so that a message with two parts of the same name still reports both.
+    ///
+    /// Inline parts are left out: Mail deliberately does not list a body image
+    /// as an attachment, and turning `has_attachments` true for every HTML
+    /// message with a logo in it would be a new wrong answer in place of the old
+    /// one.
+    static func attachmentsMailDidNotList(
+        _ listedByMail: [[String: Any]],
+        source: Data
+    ) -> [[String: Any]] {
+        func key(_ name: Any?) -> String { (name as? String ?? "").lowercased() }
+        var listed: [String: Int] = [:]
+        for attachment in listedByMail { listed[key(attachment["name"]), default: 0] += 1 }
+
+        var out: [[String: Any]] = []
+        for part in MIME.attachments(of: MIME.parse(source)) where !part.inline {
+            if let count = listed[part.name.lowercased()], count > 0 {
+                listed[part.name.lowercased()] = count - 1
+                continue
+            }
+            out.append([
+                "name": part.name,
+                // Mail quotes `fileSize` for the parts it lists, which is the
+                // encoded size; this is what the part decodes to, and the note
+                // on the result says so rather than passing one off as the other.
+                "size": part.data.count,
+                "mime_type": part.mimeType,
+                "mime_type_source": "declared",
+                "listed_by_mail": false,
+                "downloaded": true
+            ])
+        }
+        return out
+    }
+
+    /// Wall-clock allowance for the source fetch `mail_get_email` checks itself
+    /// against. Shorter than a plain `mail_get_source`, because it is a check on
+    /// a read that already worked: exceeding it costs the caller a less precise
+    /// answer, not the message.
+    ///
+    /// The fetch used to happen only when Mail had listed at least one
+    /// attachment, which is exactly the case a half-downloaded message does not
+    /// present: it lists none, and the enrichment that would have caught it was
+    /// skipped for want of one. It now happens on every read.
+    ///
+    /// What it buys, beyond completeness: Mail's `MIME type` property on
+    /// `mail attachment` raises "AppleEvent handler failed" on every message
+    /// that has one, so the type used to be inferred from the filename -- a
+    /// guess presented as a fact, which disagreed with `mail_save_attachment`
+    /// for the same attachment (`text/csv` against `image/png` for a part
+    /// declared as `image/png; name="data.csv"`). `mime_type_source` says which
+    /// of the two a caller is looking at.
+    private static let attachmentTypeFetchTimeout: TimeInterval = 45
 
     private static func withFilenameGuess(_ attachment: [String: Any]) -> [String: Any] {
         var out = attachment
@@ -2568,7 +2681,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
+                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. Attachments the message declares but Mail does not list are included with listed_by_mail: false, because Mail's own list can stay empty for good for a message first read while it was still arriving, and mail_save_attachment reads the source rather than that list. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
