@@ -1212,10 +1212,13 @@ enum MailService {
     /// `visible` controls whether a compose window opens. `finalAction` is the
     /// JXA run once the message is fully built, and must leave a `result`
     /// object in scope for the caller to return.
+    /// `postProcess` gets the decoded result payload before it is returned, so
+    /// a caller can add to it something only a read-back can establish.
     private static func composeEmail(
         _ args: JSONObject?,
         visible: Bool,
-        finalAction: String
+        finalAction: String,
+        postProcess: (([String: Any]) -> [String: Any])? = nil
     ) -> MCPCallResult {
         let to = recipientList(args?["to"])
         guard !to.isEmpty else {
@@ -1302,7 +1305,96 @@ enum MailService {
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return textResult(output)
         }
-        return jsonResult(payload)
+        return jsonResult(postProcess?(payload) ?? payload)
+    }
+
+    /// What Mail actually composed, compared with what the caller asked for.
+    struct BodyCheck {
+        /// True when the message's `text/plain` alternative is the body that was
+        /// asked for.
+        let matches: Bool
+        /// Present when it is not, saying how it differs.
+        let detail: String?
+
+        var dict: [String: Any] {
+            var out: [String: Any] = ["plain_text_matches_body": matches]
+            if let detail { out["detail"] = detail }
+            return out
+        }
+    }
+
+    /// Compares the `text/plain` alternative of a composed message against the
+    /// body that was requested.
+    ///
+    /// This exists because Mail rewrites the body of anything composed through
+    /// its scripting interface, and the compose script cannot see it happen:
+    /// `msg.content()` reads back exactly what was set, and the alternatives are
+    /// generated later. So `rendered_chars` reports a plausible number for a
+    /// message whose plain-text part is quoted, or empty.
+    ///
+    /// Reading the saved message is the only way to know, which is why this
+    /// takes raw source rather than anything Mail said.
+    static func checkComposedBody(source: Data, requestedBody: String) -> BodyCheck {
+        func normalise(_ s: String) -> String {
+            s.replacingOccurrences(of: "\r\n", with: "\n")
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard let plainPart = firstPlainTextPart(of: MIME.parse(source)) else {
+            return BodyCheck(
+                matches: false,
+                detail: "the message has no text/plain part — the body exists only as HTML, which a plain-text-preferring client will show as blank"
+            )
+        }
+        let plain = normalise(
+            String(data: plainPart, encoding: .utf8)
+                ?? String(data: plainPart, encoding: .isoLatin1)
+                ?? ""
+        )
+        let wanted = normalise(requestedBody)
+        if plain == wanted { return BodyCheck(matches: true, detail: nil) }
+
+        if plain.isEmpty && !wanted.isEmpty {
+            return BodyCheck(
+                matches: false,
+                detail: "Mail wrote an empty text/plain part; the body survives only in the text/html alternative, so any client that prefers plain text shows this message as blank"
+            )
+        }
+        // Mail derives the plain-text alternative from HTML, and it wraps a
+        // scripted body in <blockquote type="cite">, which comes out as "> " on
+        // every line.
+        let unquoted = normalise(
+            plain.split(separator: "\n", omittingEmptySubsequences: false)
+                .map { $0.hasPrefix("> ") ? String($0.dropFirst(2)) : ($0 == ">" ? "" : String($0)) }
+                .joined(separator: "\n")
+        )
+        if unquoted == wanted {
+            return BodyCheck(
+                matches: false,
+                detail: "Mail quoted the body: every line of the text/plain part is prefixed with \"> \", so the recipient reads it as quoted or forwarded text rather than as the sender's own words"
+            )
+        }
+        return BodyCheck(
+            matches: false,
+            detail: "the text/plain part is not the body that was supplied"
+        )
+    }
+
+    /// The first `text/plain` part that is a body rather than an attachment.
+    private static func firstPlainTextPart(of part: MIME.Part) -> Data? {
+        if part.isMultipart {
+            for child in part.parts {
+                if let hit = firstPlainTextPart(of: child) { return hit }
+            }
+            return nil
+        }
+        guard part.contentType == "text/plain",
+              part.filename == nil,
+              part.disposition != "attachment" else { return nil }
+        return part.decodedBody
     }
 
     /// Composed invisibly on purpose. Composing with `visible: true` puts a real
@@ -1378,7 +1470,38 @@ enum MailService {
             return null;
         })();
         """
-        return composeEmail(args, visible: false, finalAction: finalAction)
+        // Read the saved draft back off the server and compare its text/plain
+        // part with the body that was asked for. Mail rewrites the body of
+        // anything composed through its scripting interface -- a plain body
+        // comes back quoted, and a draft's plain part comes back empty -- and
+        // nothing in the compose script can see it happen, because `content()`
+        // reads back exactly what was set and the alternatives are generated
+        // afterwards. Reporting `rendered_chars` and calling it a success is how
+        // that went unnoticed.
+        //
+        // Only for a plain `body`: the plain-text part of an html_body message
+        // is Mail's own rendering, and there is nothing to compare it against.
+        return composeEmail(args, visible: false, finalAction: finalAction) { payload in
+            guard let body = args?["body"]?.stringValue,
+                  args?["html_body"]?.stringValue == nil,
+                  let draft = payload["draft"] as? [String: Any] else { return payload }
+            let identifier = (draft["rfc_message_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (draft["message_id"] as? String)
+            guard let identifier else { return payload }
+
+            let (source, fetchError) = fetchSource(
+                account: draft["account"] as? String,
+                mailbox: draft["mailbox"] as? String ?? "Drafts",
+                messageId: identifier
+            )
+            var enriched = payload
+            guard fetchError == nil else {
+                enriched["body_check"] = ["plain_text_matches_body": NSNull(), "detail": "could not read the saved draft back: \(fetchError!)"]
+                return enriched
+            }
+            enriched["body_check"] = checkComposedBody(source: source, requestedBody: body).dict
+            return enriched
+        }
     }
 
     // MARK: - Attachments and raw source
@@ -1925,7 +2048,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_send",
-                description: "Send an email via Mail.app, optionally as HTML and with file attachments",
+                description: "Send an email via Mail.app, optionally as HTML and with file attachments. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced",
                 inputSchema: composeSchema(action: "send from"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
@@ -1936,7 +2059,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email",
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML",
                 inputSchema: composeSchema(action: "save the draft in"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
