@@ -253,7 +253,63 @@ final class MailSourceFidelityTests: XCTestCase {
         XCTAssertNil(dict["exact"])
         XCTAssertEqual(
             Set(dict.keys),
-            ["complete", "line_endings", "ambiguous_nul_bytes", "bytes_measured", "message_size"]
+            ["complete", "complete_basis", "line_endings", "ambiguous_nul_bytes", "bytes_measured", "message_size"]
         )
+        // `complete_basis` is not a second summary. It is not a verdict at all:
+        // it names which of the two readings of `messageSize` `complete` rests
+        // on, and each of its values is a fact about the bytes rather than a
+        // judgement that can only come out one way (#53).
+        XCTAssertEqual(dict["complete_basis"] as? String, "bytes")
+    }
+
+    // MARK: - What `complete` rests on (#53)
+
+    /// `messageSize` is quoted in one of two units and Mail does not say which:
+    /// wire units (CRLFs counted) for a message the server holds, and the units
+    /// Mail stores it in for a local draft. Counting every LF as a CRLF is what
+    /// makes the first case come out right, and it is exactly what hands the
+    /// second one slack.
+    func testBytesThatReachTheSizeOnTheirOwnAssumeNothing() {
+        // The local-draft shape, measured on the fixture: bytes_measured 1362
+        // against message_size 1362, matching the Maildir's S= rather than its
+        // W=. This holds whichever unit Mail meant, so there is no slack in it.
+        let draft = Data(String(repeating: "x\n", count: 20).utf8)
+        let fidelity = MailService.sourceFidelity(draft, expectedSize: draft.count)
+        XCTAssertTrue(fidelity.complete)
+        XCTAssertEqual(fidelity.completeBasis, "bytes")
+        XCTAssertEqual(fidelity.slackBytes, 0)
+    }
+
+    func testBytesThatOnlyReachTheSizeAsWireUnitsSayHowMuchSlackThatLeaves() {
+        // The server-side shape, and the ordinary case: 375 bytes with 19 line
+        // breaks against a reported 394. Right under the wire reading -- but if
+        // Mail had meant the other unit, 19 bytes would be missing, and the old
+        // `complete: true` said nothing about which.
+        let body = Data((String(repeating: "x", count: 356) + String(repeating: "\n", count: 19)).utf8)
+        let fidelity = MailService.sourceFidelity(body, expectedSize: 394)
+        XCTAssertEqual(fidelity.byteCount, 375)
+        XCTAssertTrue(fidelity.complete, "this is what a whole server-side message looks like")
+        XCTAssertEqual(fidelity.completeBasis, "wire")
+        XCTAssertEqual(fidelity.slackBytes, 19)
+        let note = fidelity.note ?? ""
+        XCTAssertTrue(note.contains("19 byte(s)"), "the slack is not quantified: \(note)")
+    }
+
+    func testAFragmentShortByMoreThanTheLineBreaksIsStillIncomplete() {
+        // The direction that was never open, and must not close: a real
+        // fragment. Neither reading reaches the size.
+        let fragment = Data((String(repeating: "x", count: 100) + String(repeating: "\n", count: 5)).utf8)
+        let fidelity = MailService.sourceFidelity(fragment, expectedSize: 394)
+        XCTAssertFalse(fidelity.complete)
+        XCTAssertEqual(fidelity.completeBasis, "short")
+        XCTAssertEqual(fidelity.slackBytes, 0)
+    }
+
+    func testTheTwoCasesWithNoSizeToJudgeAgainstAreNamedRatherThanGuessed() {
+        XCTAssertEqual(MailService.sourceFidelity(Data("Subject: x\n".utf8), expectedSize: nil).completeBasis, "unchecked")
+        XCTAssertEqual(MailService.sourceFidelity(Data(), expectedSize: 400).completeBasis, "none")
+        XCTAssertFalse(MailService.sourceFidelity(Data(), expectedSize: 400).complete)
+        XCTAssertTrue(MailService.sourceFidelity(Data("Subject: x\n".utf8), expectedSize: nil).complete,
+                      "an unreadable size is not evidence the download is unfinished")
     }
 }
