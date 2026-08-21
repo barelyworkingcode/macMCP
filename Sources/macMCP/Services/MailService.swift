@@ -1513,18 +1513,87 @@ enum MailService {
         // Sources run to megabytes, so an unbounded return would bury the
         // caller. The cap is on bytes taken from the front, which is where the
         // headers and the structure are.
-        let maxBytes = min(max(args?["max_bytes"]?.intValue ?? 100_000, 1_000), 2_000_000)
-        let slice = data.prefix(maxBytes)
-        let text = String(data: slice, encoding: .utf8)
-            ?? String(data: slice, encoding: .isoLatin1)
-            ?? ""
+        let slice = sourceSlice(data, maxBytes: clampMaxBytes(args?["max_bytes"]?.intValue))
         return jsonResult([
-            "source": text,
+            "source": slice.text,
             "bytes_total": data.count,
-            "bytes_returned": slice.count,
-            "truncated": data.count > slice.count,
+            "bytes_returned": slice.bytesReturned,
+            "source_encoding": slice.encoding,
+            "truncated": data.count > slice.bytesReturned,
             "message_id": messageId
         ])
+    }
+
+    /// Clamps `max_bytes` to the range the schema advertises.
+    ///
+    /// The old lower bound was 1000, so `max_bytes: 10` silently returned a
+    /// kilobyte. Nothing documented a floor, and a caller asking for ten bytes
+    /// has a reason. Only the ceiling and "at least one byte" are enforced.
+    static func clampMaxBytes(_ requested: Int?) -> Int {
+        min(max(requested ?? 100_000, 1), 2_000_000)
+    }
+
+    /// What `mail_get_source` hands back inline, and an honest description of it.
+    struct SourceSlice {
+        let text: String
+        /// How many bytes of the message `text` represents, in the encoding
+        /// named below. Derived from what is returned, never from what was asked
+        /// for.
+        let bytesReturned: Int
+        let encoding: String
+    }
+
+    /// Drops a partial UTF-8 sequence from the end of a truncated slice.
+    ///
+    /// At most three bytes come off: enough to complete the longest sequence,
+    /// and bounded so that data which is not UTF-8 at all is left alone rather
+    /// than eaten a byte at a time.
+    static func trimPartialUTF8(_ data: Data) -> Data {
+        let bytes = [UInt8](data)
+        guard !bytes.isEmpty else { return data }
+        var lead = bytes.count - 1
+        var continuations = 0
+        while lead >= 0 && bytes[lead] & 0xC0 == 0x80 && continuations < 3 {
+            lead -= 1
+            continuations += 1
+        }
+        guard lead >= 0 else { return data }
+
+        let expected: Int
+        switch bytes[lead] {
+        case 0x00...0x7F: expected = 1
+        case 0xC0...0xDF: expected = 2
+        case 0xE0...0xEF: expected = 3
+        case 0xF0...0xF7: expected = 4
+        // Not a lead byte: this is not UTF-8, so there is no boundary to find.
+        default: return data
+        }
+        return bytes.count - lead < expected ? Data(bytes[0..<lead]) : data
+    }
+
+    /// Takes the first `maxBytes` of a source and decodes them for return.
+    ///
+    /// A cut landing inside a multi-byte sequence used to make the `.utf8`
+    /// initialiser fail for the *whole* slice, and the `.isoLatin1` fallback
+    /// then reinterpreted every non-ASCII byte in it -- so one split character
+    /// corrupted the entire response, and `bytes_returned` (which described the
+    /// slice, not the string) stopped matching what was actually returned.
+    ///
+    /// The slice is trimmed back to a character boundary first, so the fallback
+    /// now fires only for a source that genuinely is not UTF-8 -- and when it
+    /// does, the caller is told, because `bytes_returned` can only be read
+    /// correctly alongside the encoding it was measured in.
+    static func sourceSlice(_ data: Data, maxBytes: Int) -> SourceSlice {
+        var slice = Data(data.prefix(maxBytes))
+        if slice.count < data.count { slice = trimPartialUTF8(slice) }
+        if let text = String(data: slice, encoding: .utf8) {
+            return SourceSlice(text: text, bytesReturned: slice.count, encoding: "utf-8")
+        }
+        return SourceSlice(
+            text: String(data: slice, encoding: .isoLatin1) ?? "",
+            bytesReturned: slice.count,
+            encoding: "iso-8859-1"
+        )
     }
 
     /// How long the post-move read-back is allowed to wait for the message to
@@ -1822,14 +1891,14 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
                         "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
-                        "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000)")
+                        "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000). The cut is moved back to the nearest character boundary, so bytes_returned can be up to 3 less than this")
                     ],
                     required: ["message_id"]
                 ),
