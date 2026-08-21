@@ -646,7 +646,11 @@ enum MailService {
     }
 
     /// Result of scanning every account, already merged and sorted newest-first.
-    private struct ScanOutcome {
+    ///
+    /// Not private: what it reports when a mailbox could not be read is a claim
+    /// about the world, and the tests pin it directly rather than through a
+    /// mailbox.
+    struct ScanOutcome {
         var rows: [[String: Any]] = []
         var total = 0
         var messagesScanned = 0
@@ -658,6 +662,34 @@ enum MailService {
         var unstable: [String] = []
         var failed: [String] = []
         var matchedMailbox = false
+
+        /// Whether every mailbox in scope was actually read.
+        ///
+        /// `total_messages` and `total_matches` count what *was* read, so when
+        /// this is false they are a floor rather than a total -- and a caller
+        /// who does not know to look at `unstable_mailboxes`,
+        /// `skipped_mailboxes` and `failed_accounts` reads a short count as a
+        /// complete one. It is reported unconditionally, true or false: a flag
+        /// that only appears when something is wrong is one a caller has to
+        /// already suspect before it helps.
+        var scanComplete: Bool { unstable.isEmpty && skipped.isEmpty && failed.isEmpty }
+
+        /// What was not read, in words, for the same reason.
+        var incompleteNote: String? {
+            guard !scanComplete else { return nil }
+            var parts: [String] = []
+            if !unstable.isEmpty {
+                parts.append("\(unstable.joined(separator: ", ")) kept changing while being read, so no row from there could be trusted to pair the right id with the right subject (transient — try again in a moment)")
+            }
+            if !skipped.isEmpty {
+                parts.append("\(skipped.joined(separator: ", ")) could not be read")
+            }
+            if !failed.isEmpty {
+                parts.append("\(failed.joined(separator: "; "))")
+            }
+            return "Not every mailbox in scope was read, so the counts here are a floor rather than a total: "
+                + parts.joined(separator: "; ") + "."
+        }
     }
 
     /// Fetches the configured account names in one cheap call (~0.2s).
@@ -773,9 +805,25 @@ enum MailService {
 
     /// The two error paths every scan-backed handler shares. Returns nil when
     /// the scan produced something worth reporting.
-    private static func scanFailure(_ outcome: ScanOutcome, targets: [String?], mailbox: String) -> MCPCallResult? {
+    static func scanFailure(_ outcome: ScanOutcome, targets: [String?], mailbox: String) -> MCPCallResult? {
         if outcome.failed.count == targets.count {
             return errorResult("scan failed for every account — \(outcome.failed.joined(separator: "; "))")
+        }
+        // Every mailbox in scope changed under the read, so there is nothing to
+        // report -- and reporting nothing as `total_messages: 0` beside
+        // `isError: false` is an affirmative claim that they are empty. The
+        // mailbox this fired on held thousands of messages. A caller who does
+        // not read `unstable_mailboxes` cannot tell the two apart, and the
+        // answer to "I could not read this" is not "it is empty".
+        if outcome.scanned.isEmpty && !outcome.unstable.isEmpty {
+            let one = outcome.unstable.count == 1
+            return errorResult(
+                "\(outcome.unstable.joined(separator: ", ")) kept changing while being read — "
+                + "every attempt paired one message's id with another message's subject, so no row from "
+                + (one ? "it" : "them") + " could be returned, and "
+                + (one ? "it was" : "they were") + " the whole of the scope. "
+                + "This is transient: try again in a moment, or narrow the scope to a quieter mailbox."
+            )
         }
         if !outcome.matchedMailbox && mailbox.lowercased() != "all" {
             return errorResult("no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\"")
@@ -1149,10 +1197,12 @@ enum MailService {
             "truncated": outcome.total > limit,
             "messages_scanned": outcome.messagesScanned,
             "scanned_mailboxes": outcome.scanned,
-            "skipped_mailboxes": outcome.skipped
+            "skipped_mailboxes": outcome.skipped,
+            "scan_complete": outcome.scanComplete
         ]
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
         if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
+        if let note = outcome.incompleteNote { payload["note"] = note }
         return jsonResult(payload)
     }
 
@@ -1629,11 +1679,13 @@ JSON.stringify(out);
             "truncated": total > limit,
             "messages_scanned": outcome.messagesScanned,
             "scanned_mailboxes": outcome.scanned,
-            "skipped_mailboxes": outcome.skipped
+            "skipped_mailboxes": outcome.skipped,
+            "scan_complete": outcome.scanComplete
         ]
         if let bodyInfo { payload["body_search"] = bodyInfo }
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
         if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
+        if let note = outcome.incompleteNote { payload["note"] = note }
         return jsonResult(payload)
     }
 
@@ -3011,7 +3063,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name"),
@@ -3046,7 +3098,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched",
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),
