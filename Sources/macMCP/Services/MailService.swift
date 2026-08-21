@@ -518,18 +518,53 @@ enum MailService {
     """
     }
 
-    /// JXA snippet resolving a mailbox by name, case-insensitively across all
-    /// accounts (plus local On-My-Mac boxes) when no account given. Throws when
-    /// not found.
-    private static func mailboxJXA(account: String?, mailbox: String, varName: String = "mbox") -> String {
+    /// JXA snippet resolving a mailbox by name *inside one account*, named by a
+    /// JavaScript expression evaluated at run time.
+    ///
+    /// The run-time expression is the whole point. A destination mailbox has to
+    /// be resolved relative to the account the message was actually found in,
+    /// and that is only known once `findMessageJXA` has run — it comes back in
+    /// `foundAccount`. Resolving by name across every account instead picks
+    /// whichever account Mail happens to list first, which is how a message in
+    /// Bob's INBOX ended up in *Alice's* Archive with the source copy gone:
+    /// every account has an `Archive`, a `Sent`, a `Trash` and a `Drafts`, so
+    /// the collision is the normal case rather than an unlucky one.
+    ///
+    /// Sets `<varName>` to the mailbox and `<varName>Account` to the name of the
+    /// account it came from, so the caller can report where the message went.
+    /// Throws when the account has no mailbox of that name — deliberately,
+    /// rather than falling back to another account's copy.
+    private static func mailboxInAccountJXA(
+        mailbox: String,
+        accountExpr: String,
+        varName: String = "mbox"
+    ) -> String {
         let escapedMailbox = escapeJSString(mailbox)
         return """
-    \(collectBoxesJXA(account: account, varName: "\(varName)Candidates"))
+    var \(varName)Account = null;
     var \(varName) = (function() {
-        for (var i = 0; i < \(varName)Candidates.length; i++) {
-            if (\(varName)Candidates[i].name.toLowerCase() === '\(escapedMailbox)'.toLowerCase()) return \(varName)Candidates[i].mbox;
+        var wantName = '\(escapedMailbox)'.toLowerCase();
+        var wantAcct = \(accountExpr);
+        function pick(boxes) {
+            for (var i = 0; i < boxes.length; i++) {
+                if (('' + boxes[i].name()).toLowerCase() === wantName) return boxes[i];
+            }
+            return null;
         }
-        throw new Error('mailbox not found: \(escapedMailbox)');
+        if (wantAcct !== null && ('' + wantAcct).toLowerCase() !== 'on my mac') {
+            var accts = mail.accounts();
+            for (var a = 0; a < accts.length; a++) {
+                if (('' + accts[a].name()).toLowerCase() === ('' + wantAcct).toLowerCase()) {
+                    var hit = pick(accts[a].mailboxes());
+                    if (hit) { \(varName)Account = '' + accts[a].name(); return hit; }
+                    throw new Error('account "' + accts[a].name() + '" has no mailbox named "\(escapedMailbox)"');
+                }
+            }
+            throw new Error('account not found: ' + wantAcct);
+        }
+        var localHit = pick(mail.mailboxes());
+        if (localHit) { \(varName)Account = 'On My Mac'; return localHit; }
+        throw new Error('no mailbox named "\(escapedMailbox)" in On My Mac');
     })();
     """
     }
@@ -1457,6 +1492,91 @@ enum MailService {
         ])
     }
 
+    /// How long the post-move read-back is allowed to wait for the message to
+    /// appear in its destination, and how often it looks.
+    private static let moveVerifyAttempts = 12
+    private static let moveVerifyInterval = 0.25
+
+    /// The move script, minus the `var mail = Application('Mail');` line.
+    ///
+    /// Not private, and split from the handler, so the tests can run it with
+    /// `mail` bound to a stub: the thing worth testing here is which mailbox
+    /// object the generated JavaScript picks, and that is not visible from
+    /// Swift.
+    static func moveScriptJXA(
+        messageId: String,
+        sourceMailbox: String,
+        targetMailbox: String,
+        account: String?,
+        targetAccount: String?
+    ) -> String {
+        let escapedId = escapeJSString(messageId)
+        let targetAccountExpr = targetAccount.map { "'\(escapeJSString($0))'" } ?? "null"
+        // Default the destination account to the one the message was found in.
+        // An explicit `target_account` is the only way to move across an account
+        // boundary, so doing it is a decision the caller made rather than an
+        // artefact of which account Mail lists first.
+        let destination = mailboxInAccountJXA(
+            mailbox: targetMailbox,
+            accountExpr: "(TARGET_ACCOUNT !== null ? TARGET_ACCOUNT : foundAccount)",
+            varName: "destMbox"
+        )
+        return """
+    var TARGET_ACCOUNT = \(targetAccountExpr);
+    \(findMessageJXA(account: account, mailbox: sourceMailbox, messageId: messageId))
+    var moveResult;
+    if (!found) {
+        moveResult = {error: 'message not found with id: \(escapedId)'};
+    } else {
+        var sourceAccount = foundAccount;
+        var sourceMailboxName = foundMailbox;
+        // Read the identifiers before the move: assigning `mailbox` invalidates
+        // the reference, and every property read on it afterwards raises
+        // "Invalid index". The RFC Message-ID is what the read-back matches on,
+        // because an IMAP move re-files the message server-side and Mail's
+        // numeric id for it does not survive.
+        var rfcId = null;
+        try { rfcId = found.messageId(); } catch (e) {}
+        rfcId = (rfcId == null) ? null : ('' + rfcId).replace(/^</, '').replace(/>$/, '');
+        var numericId = null;
+        try { numericId = '' + found.id(); } catch (e) {}
+    \(destination)
+        var destName = '' + destMbox.name();
+        found.mailbox = destMbox;
+        // Read back where the message actually landed. `moved` on its own said
+        // nothing about the destination, which is exactly why a cross-account
+        // move went unnoticed.
+        var verified = false;
+        for (var attempt = 0; attempt < \(moveVerifyAttempts) && !verified; attempt++) {
+            try {
+                if (rfcId !== null) {
+                    var rids = destMbox.messages.messageId();
+                    for (var i = 0; i < rids.length; i++) {
+                        if (rids[i] == null) continue;
+                        if (('' + rids[i]).replace(/^</, '').replace(/>$/, '') === rfcId) { verified = true; break; }
+                    }
+                } else if (numericId !== null) {
+                    var nids = destMbox.messages.id();
+                    for (var j = 0; j < nids.length; j++) {
+                        if (('' + nids[j]) === numericId) { verified = true; break; }
+                    }
+                }
+            } catch (e) {}
+            if (!verified) delay(\(moveVerifyInterval));
+        }
+        moveResult = {
+            status: 'moved',
+            account: destMboxAccount,
+            mailbox: destName,
+            moved_from: {account: sourceAccount, mailbox: sourceMailboxName},
+            cross_account: destMboxAccount !== sourceAccount,
+            verified: verified
+        };
+    }
+    JSON.stringify(moveResult);
+    """
+    }
+
     private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
         guard let messageId = args?["message_id"]?.stringValue else {
             return errorResult("message_id is required")
@@ -1466,26 +1586,24 @@ enum MailService {
         }
         let sourceMailbox = args?["source_mailbox"]?.stringValue ?? "INBOX"
 
-        let escapedId = escapeJSString(messageId)
-        let account = args?["account"]?.stringValue
-        let findMessage = findMessageJXA(account: account, mailbox: sourceMailbox, messageId: messageId)
-        let targetAccess = mailboxJXA(account: account, mailbox: targetMailbox, varName: "destMbox")
-
         let script = """
         var mail = Application('Mail');
-        \(findMessage)
-        \(targetAccess)
-        if (!found) {
-            JSON.stringify({error: 'message not found with id: \(escapedId)'});
-        } else {
-            found.mailbox = destMbox;
-            'moved';
-        }
+        \(moveScriptJXA(
+            messageId: messageId,
+            sourceMailbox: sourceMailbox,
+            targetMailbox: targetMailbox,
+            account: args?["account"]?.stringValue,
+            targetAccount: args?["target_account"]?.stringValue
+        ))
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
         if output.contains("\"error\"") { return errorResult(output) }
-        return textResult(output.isEmpty ? "email moved" : output)
+        guard let data = output.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return textResult(output.isEmpty ? "email moved" : output)
+        }
+        return jsonResult(payload)
     }
 
     private static func markRead(_ args: JSONObject?) -> MCPCallResult {
@@ -1689,13 +1807,14 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_move",
-                description: "Move an email to a different mailbox. Searches all accounts when account omitted",
+                description: "Move an email to a different mailbox of the same account. Searches all accounts when account omitted, and the destination is resolved inside whichever account the message was found in — pass target_account to move it to a different account instead. Returns where the message landed and whether that was confirmed by reading it back",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
-                        "target_mailbox": stringProp("Destination mailbox name"),
-                        "account": stringProp("Account name")
+                        "target_mailbox": stringProp("Destination mailbox name, resolved within the message's own account"),
+                        "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
+                        "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one")
                     ],
                     required: ["message_id", "target_mailbox"]
                 )
