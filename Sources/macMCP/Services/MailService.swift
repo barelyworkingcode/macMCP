@@ -337,6 +337,24 @@ enum MailService {
     }
 
     /// Which mailboxes a generated collection snippet should gather.
+    /// What the scan, `mail_get_emails` and `mail_get_email` all call Mail's
+    /// app-level mailboxes -- the ones that belong to no account.
+    ///
+    /// The scan has always labelled their rows `On My Mac:<mailbox>`, so a
+    /// caller was handed rows from a mailbox that `mail_list_mailboxes` did not
+    /// name and that no `account` argument would reach: `resolveTargets` passed
+    /// the string straight through and the scope lookup threw `account not
+    /// found`. It is now a name every mail tool accepts (#54), which is what
+    /// relay's resource scoping needs -- it cannot scope what the enumeration
+    /// does not name.
+    static let localAccountName = "On My Mac"
+
+    /// Whether an `account` argument names the local boxes rather than an
+    /// account Mail holds. Case-insensitive, like every other account match here.
+    static func isLocalAccount(_ account: String) -> Bool {
+        account.lowercased() == localAccountName.lowercased()
+    }
+
     private enum BoxScope {
         /// Every mailbox of the named account. The JXA throws when it is missing.
         case account(String)
@@ -468,7 +486,8 @@ enum MailService {
     /// Convenience for the by-id helpers, where a nil account means "look
     /// everywhere" rather than "look at the local boxes".
     private static func collectBoxesJXA(account: String?, varName: String) -> String {
-        collectBoxesJXA(account.map { BoxScope.account($0) } ?? .everything, varName: varName)
+        guard let account else { return collectBoxesJXA(.everything, varName: varName) }
+        return collectBoxesJXA(isLocalAccount(account) ? .local : .account(account), varName: varName)
     }
 
     /// Builds the JXA for one bulk mailbox scan, covering a single account
@@ -506,7 +525,13 @@ enum MailService {
         searchRecipients: Bool,
         limit: Int
     ) -> String {
-        let collect = collectBoxesJXA(account.map { BoxScope.account($0) } ?? .local, varName: "allBoxes")
+        // `nil` here means the local boxes, not "everywhere": the caller scans one
+        // account per osascript and passes nil for the local pass. Naming them
+        // explicitly reaches the same place.
+        let collect = collectBoxesJXA(
+            account.map { isLocalAccount($0) ? BoxScope.local : .account($0) } ?? .local,
+            varName: "allBoxes"
+        )
 
         let filter: String
         if mailbox.lowercased() == "all" {
@@ -716,8 +741,12 @@ enum MailService {
     /// Expands the `account` argument into scan targets. A named account scans
     /// only that account; omitting it scans every account plus the local
     /// On-My-Mac mailboxes.
-    private static func resolveTargets(account: String?) -> (targets: [String?], error: String?) {
-        if let account { return ([account], nil) }
+    /// Not private: mapping "On My Mac" onto the local pass is the whole of
+    /// what makes those mailboxes scopable, and it is worth pinning without a
+    /// mailbox.
+    static func resolveTargets(account: String?) -> (targets: [String?], error: String?) {
+        // `nil` is the local pass, so scoping to On My Mac is that pass alone.
+        if let account { return ([isLocalAccount(account) ? nil : account], nil) }
         let (names, error) = accountNames(scopable: true)
         if let error { return ([], error) }
         return (names.map { Optional($0) } + [nil], nil)
@@ -913,8 +942,11 @@ enum MailService {
         // Naming an account that does not exist is a different answer from not
         // finding the message in it. The numeric path no longer walks the
         // accounts to build a search scope, so it has to ask on its own account.
-        let accountCheck = account.map { account in
-            """
+        let accountCheck = account.flatMap { account -> String? in
+            // On My Mac is not in `mail.accounts()` -- it is the absence of one --
+            // but it is a name every other mail tool accepts, so it is not a miss.
+            if isLocalAccount(account) { return nil }
+            return """
             (function() {
                 var known = mail.accounts.name();
                 for (var i = 0; i < known.length; i++) {
@@ -1129,10 +1161,37 @@ enum MailService {
         return jsonResult(names)
     }
 
+    /// Lists every mailbox a scan can reach, which now includes Mail's
+    /// app-level ones (#54).
+    ///
+    /// It used to enumerate `mail.accounts()` and nothing else, while
+    /// `mail.mailboxes()` on the same machine held `Recovered Messages (Alice)`,
+    /// `SendLater`, `Outbox` and `Deleted Messages`. The scan covers those and
+    /// labels their rows `On My Mac:<mailbox>`, so a caller could be handed a
+    /// row from a mailbox the only enumeration tool said did not exist -- and
+    /// could not ask for it by name, because nothing told them the name and no
+    /// `account` value reached it.
+    ///
+    /// The entry is emitted whether or not there are any: "this account holds no
+    /// mailboxes" is an answer, and omitting it puts a caller back to having to
+    /// know the name before they can ask.
     private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
         let account = args?["account"]?.stringValue
+        let localNames = """
+        var localNames = [];
+        (function() {
+            var boxes = mail.mailboxes.name();
+            for (var i = 0; i < boxes.length; i++) localNames.push('' + boxes[i]);
+        })();
+        """
         let script: String
-        if let account {
+        if let account, isLocalAccount(account) {
+            script = """
+            var mail = Application('Mail');
+            \(localNames)
+            JSON.stringify(localNames);
+            """
+        } else if let account {
             let escaped = escapeJSString(account)
             script = """
             var mail = Application('Mail');
@@ -1162,6 +1221,8 @@ enum MailService {
                 }
                 results.push({account: accts[i].name(), mailboxes: names});
             }
+            \(localNames)
+            results.push({account: '\(escapeJSString(localAccountName))', mailboxes: localNames});
             JSON.stringify(results);
             """
         }
@@ -3097,10 +3158,10 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_list_mailboxes",
-                description: "List mailboxes. Groups by account when no account specified",
+                description: "List mailboxes. Groups by account when no account specified. Includes Mail's app-level mailboxes under the account name \"On My Mac\" — those belong to no account, and every mail tool accepts that name wherever an account is taken, so they can be scoped like any other. Nested folders are listed by their leaf name, so one account can show two mailboxes with the same name",
                 inputSchema: schema(
                     properties: [
-                        "account": stringProp("Account name (lists all mailboxes if omitted)")
+                        "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (lists every account if omitted)")
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -3115,7 +3176,7 @@ var savedDraft = (function() {
                 description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
                 inputSchema: schema(
                     properties: [
-                        "account": stringProp("Account name"),
+                        "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (scans every account and the local boxes if omitted)"),
                         "mailbox": stringProp("Mailbox name, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). Pass 'all' to scan every mailbox except junk/trash/drafts"),
                         "limit": intProp("Maximum number of emails to return (default: 10)")
                     ]
@@ -3151,7 +3212,7 @@ var savedDraft = (function() {
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),
-                        "account": stringProp("Account name"),
+                        "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (searches every account and the local boxes if omitted)"),
                         "mailbox": stringProp("Mailbox name to search (default: 'all' — every mailbox except junk/trash/drafts)"),
                         "limit": intProp("Maximum number of results, newest first (default: 10)"),
                         "search_recipients": boolProp("Also match To/CC recipient names and addresses (adds roughly 1s per 1000 messages scanned)"),

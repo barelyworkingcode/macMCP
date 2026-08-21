@@ -57,6 +57,22 @@ final class MailSchemaDocsTests: XCTestCase {
         )
     }
 
+    func testListMailboxesNamesMailsOwnLocalMailboxes() throws {
+        // They are scanned and their rows come back labelled `On My Mac:...`,
+        // so a listing that does not name them hands a caller a mailbox they
+        // cannot ask for -- and relay's resource scoping cannot scope what the
+        // enumeration does not name (#54).
+        let text = try description(of: "mail_list_mailboxes") + property("account", of: "mail_list_mailboxes")
+        assertMentions(text, anyOf: ["On My Mac"], "Mail's local mailboxes")
+        for tool in ["mail_get_emails", "mail_search"] {
+            assertMentions(
+                try property("account", of: tool),
+                anyOf: ["On My Mac"],
+                "\(tool) accepting the local boxes as a scope"
+            )
+        }
+    }
+
     /// `contains("LF")` is true of "CRLF", which is the opposite of the thing
     /// being checked, so the term has to stand on its own.
     private func assertMentionsWord(
