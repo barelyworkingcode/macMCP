@@ -138,12 +138,13 @@ final class MailAutomationCheckTests: XCTestCase {
         XCTAssertEqual(PermissionsService.boundedStatus(timeout: 2) { .targetNotRunning }, .targetNotRunning)
     }
 
-    func testTheDefaultBoundIsTwoSeconds() {
-        // The number itself: ~10ms is the normal answer and 12s/73s are the
-        // blocked measurements, so the bound has to sit between them. It is also
-        // what `runJXAData` relies on by taking the default.
-        XCTAssertEqual(PermissionsService.automationCheckTimeout, 2)
-    }
+    // `testTheDefaultBoundIsTwoSeconds` used to sit here, asserting
+    // `automationCheckTimeout == 2`. It restated the constant it read: the only
+    // change that could break it was a change to that same line, so it caught no
+    // regression and made the number harder to tune (#42). The two tests around
+    // it cover the behaviour — a probe that will not answer is not waited on,
+    // and the real check comes back inside its own bound — which is what the
+    // number is for.
 
     func testTheRealCheckReturnsWithinItsBound() {
         // No Apple Event is sent (`askUserIfNeeded: false`), so this asks TCC

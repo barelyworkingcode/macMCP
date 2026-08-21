@@ -152,19 +152,37 @@ final class MailSourceOnDiskTests: XCTestCase {
         )
     }
 
-    func testAMessageStillArrivingIsWaitedForRatherThanReturnedInPieces() throws {
-        // 300 KB, because the window is proportional to how much there is to
-        // download: `source()` returned 838 bytes of a message this size while
-        // Mail was still fetching it, and reported that as the whole message.
-        // The fetch now compares against Mail's messageSize and waits.
+    /// What this can establish about #31, and what it cannot.
+    ///
+    /// It was called `testAMessageStillArrivingIsWaitedForRatherThanReturnedInPieces`
+    /// and could not fail for that property: setting `sourceCompletionAttempts`
+    /// to 0 — removing the wait entirely — left it passing, because
+    /// `waitForMailToSee` polls `mail_get_emails` for up to two minutes first
+    /// and Mail has finished downloading long before the fetch is made. Over
+    /// loopback the window is sub-second; it can be widened by throttling a
+    /// clone of the fixture's IMAPS proxy and severing it, but a test cannot
+    /// arrange that for itself, and one that pretends to is worse than one that
+    /// says what it covers.
+    ///
+    /// **The wait itself is exercised hermetically** by
+    /// `MailSourceScriptTests.testAMessageStillDownloadingIsWaitedForRatherThanReturnedInPieces`,
+    /// which runs the generated script against a stub whose `source()` grows
+    /// between calls: remove the loop and it fails on both the bytes and the
+    /// read count.
+    ///
+    /// What only a live message can establish is the **premise** that wait rests
+    /// on, which the stub encodes rather than tests: that Mail's `messageSize`
+    /// is the message's *wire* size, so `source.count + LF count == messageSize`
+    /// is an exact comparison rather than a heuristic. If that were ever a
+    /// different quantity — the size of the local partial, say — the check would
+    /// pass on a fragment and nothing else would notice.
+    func testMailsMessageSizeIsTheWireSizeTheCompletenessCheckComparesAgainst() throws {
+        // 300 KB, the size at which the original fragment was measured.
         let payload = Data((0..<300_000).map { UInt8(($0 * 13 + 7) % 256) })
             .map { $0 == 0x0A || $0 == 0x0D ? 0x2E : $0 }
         let subject = "MACMCP-BIG-\(UUID().uuidString.prefix(8))"
-        let message = probeMessage(
-            subject: subject,
-            rfcID: "<\(subject.lowercased())@relaytest.local>",
-            payload: Data(payload)
-        )
+        let rfcID = "<\(subject.lowercased())@relaytest.local>"
+        let message = probeMessage(subject: subject, rfcID: rfcID, payload: Data(payload))
         try deliver(message)
         _ = try XCTUnwrap(waitForFileOnDisk(containing: subject), "the fixture never took the message")
 
@@ -172,21 +190,39 @@ final class MailSourceOnDiskTests: XCTestCase {
         let numericID = try XCTUnwrap(waitForMailToSee(subject: subject), "Mail did not show the message")
         addTeardownBlock { self.discard(messageID: numericID) }
 
+        let saved = scratch.appendingPathComponent("big.eml")
         let result = try callJSON("mail_get_source", [
             "message_id": .string(numericID),
             "account": .string(account),
             "mailbox": .string("INBOX"),
-            "max_bytes": .int(1)
+            "save_to": .string(saved.path)
         ])
-        let fidelity = try XCTUnwrap(result["fidelity"] as? [String: Any])
-        XCTAssertEqual(fidelity["complete"] as? Bool, true, "a fragment was returned as the message")
-        XCTAssertEqual(fidelity["message_size"] as? Int, message.count)
-        // bytes_total is the LF form of the same message, one byte shorter per
-        // line, so it must account for every line that was delivered.
-        XCTAssertEqual(
-            result["bytes_total"] as? Int,
-            message.count - message.filter { $0 == 0x0D }.count
+        let fetched = try Data(contentsOf: saved)
+
+        // The message that was read is the message that was delivered. Every
+        // number below is meaningless if the id resolved to something else, and
+        // a numeric id comes from a separate column fetch than the subject it
+        // was chosen by.
+        XCTAssertTrue(
+            String(decoding: fetched.prefix(2048), as: UTF8.self).contains(rfcID),
+            "mail_get_source returned a different message than the one that was delivered"
         )
+
+        let fidelity = try XCTUnwrap(result["fidelity"] as? [String: Any])
+        XCTAssertEqual(
+            fidelity["message_size"] as? Int,
+            message.count,
+            "Mail's messageSize is not the wire size of the delivered bytes, which is what the completeness check compares against"
+        )
+        // The comparison the fetch makes, done here against the bytes on the
+        // wire: one CR back for every LF.
+        XCTAssertEqual(
+            fetched.count + fetched.filter { $0 == 0x0A }.count,
+            message.count,
+            "the LF-for-CRLF arithmetic does not add up on a real message"
+        )
+        XCTAssertEqual(fidelity["complete"] as? Bool, true, "a message Mail has in full was reported as a fragment")
+        XCTAssertEqual(fidelity["bytes_measured"] as? Int, fetched.count)
     }
 
     // MARK: - Building and delivering the probe
