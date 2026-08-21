@@ -1317,6 +1317,41 @@ enum MailService {
     /// file, so multi-megabyte messages are fine. A miss throws inside the
     /// script rather than printing a marker, because any marker printed on
     /// stdout could also be a legitimate first line of a message.
+    /// Recovers a message's real bytes from what osascript wrote to stdout.
+    ///
+    /// `found.source()` is a JavaScript string, and Mail builds it by decoding
+    /// the message's raw bytes as ISO-8859-1. osascript then writes that string
+    /// out as UTF-8. The bytes that arrive are therefore one encoding layer
+    /// removed from the message: every byte above 0x7F comes through UTF-8
+    /// double-encoded, so `Content-Transfer-Encoding: 8bit` mail arrives as
+    /// mojibake and a non-base64 attachment is written to disk as something
+    /// that is not the attachment. (Base64 is pure ASCII, which is why the
+    /// corruption goes unnoticed in ordinary use.)
+    ///
+    /// The transform is exactly invertible, so undoing it is one step: decode
+    /// the stdout bytes as UTF-8, then re-encode as ISO-8859-1. Both halves are
+    /// guarded. If stdout is not valid UTF-8, or if the string holds a scalar
+    /// above U+00FF -- which is what a future Mail that decoded the source
+    /// correctly would produce -- the bytes are handed back untouched rather
+    /// than mangled a second time.
+    ///
+    /// osascript also appends a newline after the script's result, and that
+    /// newline is not part of the message. It is dropped: exactly one is added,
+    /// unconditionally, whether or not the value already ended in one.
+    ///
+    /// Known limit: a NUL byte in the message does not survive the text channel
+    /// at all -- it reaches stdout as U+0080 -- so a message carrying one
+    /// cannot be recovered byte-for-byte by this or any other decoding here.
+    static func decodeSourceBytes(_ raw: Data) -> Data {
+        var data = raw
+        if data.last == 0x0A { data = data.dropLast() }
+        guard let text = String(data: data, encoding: .utf8),
+              let recovered = text.data(using: .isoLatin1) else {
+            return data
+        }
+        return recovered
+    }
+
     private static func fetchSource(
         account: String?,
         mailbox: String,
@@ -1335,7 +1370,7 @@ enum MailService {
             }
             return (Data(), error)
         }
-        return (data, nil)
+        return (decodeSourceBytes(data), nil)
     }
 
     /// Strips anything that could steer a filename out of the destination
