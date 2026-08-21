@@ -51,6 +51,19 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 
 - **Mail destinations resolve inside one account.** Every account owns an `Archive`, `Drafts`, `Sent`, `Trash` and `Junk`, so resolving a mailbox by name across all accounts returns whichever account Mail lists first — which has nothing to do with the message. `mail_move` therefore resolves `target_mailbox` inside `foundAccount` (where `findMessageJXA` located the message) and refuses rather than borrowing another account's mailbox of the same name; crossing an account boundary requires an explicit `target_account`. It then reads the message back out of the destination by RFC Message-ID, because `moved` on its own says nothing about where it went. Note the reference is dead the instant `msg.mailbox` is assigned — every property read on it afterwards raises "Invalid index" — so identifiers must be captured before the move, and the numeric id does not survive an IMAP re-file.
 
+- **A script that throws is reported as the sentence it threw.** osascript wraps a
+  thrown value in its own text -- `execution error: Error: Error: account "Alice" has
+  no mailbox named "BobOnly" (-2700)`, doubled `Error:` and an OSStatus included --
+  and that reached callers verbatim from every path that refuses by throwing:
+  `mail_move`'s missing destination mailbox, and `account not found` from
+  `mail_move`, `mail_mark_read`, `mail_get_email` and `mail_get_source`.
+  `scriptErrorMessage` unwraps it in `runJXAData`, so scripts stay free to throw
+  (the natural thing from inside an IIFE) and every one of them, including ones
+  written later, comes out in the same voice as `{error: ...}` results. Only
+  `-2700` is unwrapped -- that is osascript's code for "the script threw", so the
+  text is ours; `-1712`, `-1728` and syntax errors keep their raw form because the
+  number is the evidence.
+
 - **A mail timeout is checked against TCC before Mail is blamed.** A consent-blocked `osascript` is indistinguishable from a wedged Apple Event from the outside, and the old message answered both with "narrow the scope" — advice `mail_list_accounts` (empty input schema) cannot act on. `runJXAData` now takes the automation grant with `AEDeterminePermissionToAutomateTarget(..., askUserIfNeeded: false)` **before** running the script, and `scopable` says whether the calling tool has anything to narrow. The order matters: that check answers in ~10ms normally but **blocks while a consent prompt is on screen** (measured 12s and 73s, still blocked 20s after the script had been killed), so it is bounded by a 2s deadline and a blocked check is itself reported as a pending decision rather than as ignorance. `permissions_check` reports `automation (Mail)` for the same reason — it is the one TCC service macMCP hangs on rather than merely being refused by.
 
 - **Mail escapes every non-ASCII character** as `\uXXXX` when generating JXA. The script reaches osascript as an `-e` argument, decoded using the process locale, and the MCP server's host need not set one — raw UTF-8 em dashes and Hebrew come out mangled. U+2028/U+2029 must go for a second reason: they terminate a JS string literal.
