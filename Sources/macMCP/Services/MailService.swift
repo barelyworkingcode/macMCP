@@ -2364,14 +2364,57 @@ var savedDraft = (function() {
         ///   work. `complete` is then "nothing contradicts it" rather than a
         ///   verified match -- `sizeKnown` says which of the two a caller has,
         ///   and the note says so in words.
-        var complete: Bool {
-            if byteCount == 0 { return false }
-            guard let expectedSize else { return true }
-            return wireSize >= expectedSize
+        var complete: Bool { completeBasis != "short" && completeBasis != "none" }
+
+        /// What `complete` rests on, because it is not always the same thing
+        /// and the weaker case has slack in it (#53).
+        ///
+        /// `messageSize` is quoted in one of two units and Mail does not say
+        /// which. A message the server holds is quoted in **wire** units, CRLFs
+        /// counted: a 489-byte message measured 375+19 here and 394 there. A
+        /// **local draft** is quoted in the units Mail stores it in, LF endings
+        /// and all -- measured at `bytes_measured: 1362` against
+        /// `message_size: 1362`, matching the Maildir's `S=1362` rather than its
+        /// `W=1395`.
+        ///
+        /// Counting every LF as a CRLF, which is what makes the server case come
+        /// out right, therefore hands the local case one byte of slack per line
+        /// break: a 1362-byte draft passes at `1362 + 33 >= 1362`, and so would a
+        /// fragment of it 33 bytes short. Hence:
+        ///
+        /// * `"bytes"` -- the bytes reach the size **on their own**, so it holds
+        ///   whichever unit Mail quoted. Nothing is assumed.
+        /// * `"wire"` -- they reach it only once each LF is counted as a CRLF.
+        ///   True for the ordinary server-side message, and the note says how
+        ///   many bytes would be missing if Mail had meant the other unit.
+        /// * `"short"` -- they do not reach it either way. A fragment.
+        /// * `"unchecked"` -- Mail would not report a size.
+        /// * `"none"` -- no bytes at all, which is never a message.
+        ///
+        /// The obvious tightening -- requiring one of the two readings to match
+        /// *exactly*, which both measurements above do -- is deliberately not
+        /// taken. It would close the slack, and it would turn any imprecision in
+        /// `messageSize` into a permanent false `incomplete`, which costs a
+        /// caller `mail_save_attachment` entirely. Reporting the basis costs
+        /// them nothing.
+        var completeBasis: String {
+            if byteCount == 0 { return "none" }
+            guard let expectedSize else { return "unchecked" }
+            if byteCount >= expectedSize { return "bytes" }
+            if wireSize >= expectedSize { return "wire" }
+            return "short"
         }
 
         /// Whether `complete` was checked against a size Mail supplied.
         var sizeKnown: Bool { expectedSize != nil }
+
+        /// How many bytes would be missing if `messageSize` were quoted in the
+        /// units Mail stores the message in rather than in wire units. Zero
+        /// unless `completeBasis` is `"wire"`.
+        var slackBytes: Int {
+            guard completeBasis == "wire", let expectedSize else { return 0 }
+            return expectedSize - byteCount
+        }
 
         var note: String? {
             var sentences: [String] = []
@@ -2381,6 +2424,8 @@ var savedDraft = (function() {
                 sentences.append("Mail had only \(wireSize) of this message's \(expectedSize) bytes when the source was read and did not finish downloading the rest within the wait, so what is here is a fragment rather than the message. Try again in a moment.")
             } else if !sizeKnown {
                 sentences.append("Mail would not report this message's size, so whether it had finished downloading could not be checked: complete is \"nothing contradicts it\" here rather than a verified match.")
+            } else if completeBasis == "wire" {
+                sentences.append("These \(byteCount) bytes reach the \(expectedSize ?? 0) Mail reports only once each LF is counted as the CRLF it stood for on the wire, which is how a server-side message is sized. Mail sizes a local draft in the units it stores it in instead, and read that way \(slackBytes) byte(s) of this message would still be missing — so complete rests on which unit Mail meant here, and complete_basis says so.")
             }
             if lineEndings == "lf" || lineEndings == "mixed" {
                 sentences.append("Mail hands a source back with LF line endings where the message's wire form has CRLF, so a byte comparison against the wire form differs on every line break; a copy stored with LF endings, as a Maildir server holds it, can still match exactly.")
@@ -2394,6 +2439,10 @@ var savedDraft = (function() {
         var dict: [String: Any] {
             var out: [String: Any] = [
                 "complete": complete,
+                // What `complete` rests on: "bytes" when the bytes reach the
+                // size on their own, "wire" when they reach it only once each
+                // LF is counted as a CRLF, "short", "unchecked", or "none".
+                "complete_basis": completeBasis,
                 "line_endings": lineEndings,
                 "ambiguous_nul_bytes": ambiguousNulBytes,
                 // Which bytes the two counts above were measured over, since a
@@ -3163,7 +3212,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message. message_size is Mail's own wire size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message — and complete_basis says what that rests on: \"bytes\" when the bytes reach message_size on their own, \"wire\" when they only reach it once each LF is counted as the CRLF it stood for (right for a server-side message, but a local draft is sized in LF units, so the note then says how many bytes would still be missing under that reading), \"short\" for a fragment, \"unchecked\" when Mail would not report a size, \"none\" for no bytes at all. message_size is Mail's own size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),

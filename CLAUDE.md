@@ -129,6 +129,8 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
   source itself is raw bytes on stdout and a second osascript spawn would cost more
   than the fetch.
 
+  **`messageSize` is quoted in one of two units and Mail does not say which.** A message the server holds is quoted in **wire** units — 375 bytes with 19 line breaks reported as 394. A **local draft** is quoted in the units Mail stores it in: `bytes_measured: 1362` against `message_size: 1362`, matching the Maildir's `S=1362` and not its `W=1395`. Counting every LF as a CRLF is what makes the first case come out right and is exactly what hands the second slack: a 1362-byte draft passes at `1362 + 33 >= 1362`, and so would a fragment of it 33 bytes short. `complete_basis` says which reading `complete` rests on — `bytes` when the bytes reach the size on their own (assuming nothing), `wire` when they only reach it once each LF is counted, plus `short`, `unchecked`, `none` — and the note quantifies the slack in the `wire` case. Requiring an exact match on one of the two readings would close the hole and is deliberately not done: it turns any imprecision in `messageSize` into a permanent false `incomplete`, which costs a caller `mail_save_attachment` entirely (#53).
+
   Two edges of that. **Zero bytes is not a message** — severing the fixture's IMAPS
   proxy mid-fetch produces exactly that, `source()` returning `''` for a message
   Mail sizes at 400595 — so an empty source is never `complete`, is waited for even
