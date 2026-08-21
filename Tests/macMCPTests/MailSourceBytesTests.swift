@@ -116,7 +116,7 @@ final class MailSourceBytesTests: XCTestCase {
 
     // MARK: - The limits, pinned as they actually are
 
-    func testANulInTheMessageComesBackAs0x80AndIsReportedAsAmbiguous() {
+    func testANulInTheMessageComesBackAs0x80AndIsReportedAsAmbiguous() throws {
         // #5 was closed on a byte-identity claim. 253 of the 254 byte values a
         // probe message carried do round-trip; 0x00 does not, and the caller
         // cannot tell which of the 0x80s it got back used to be one. What is
@@ -132,7 +132,7 @@ final class MailSourceBytesTests: XCTestCase {
 
         let fidelity = MailService.sourceFidelity(recovered)
         XCTAssertEqual(fidelity.ambiguousNulBytes, 2, "the real 0x80 is a candidate too, and cannot be excluded")
-        XCTAssertFalse(fidelity.exact)
+        XCTAssertTrue(try XCTUnwrap(fidelity.note).contains("0x80"), fidelity.note ?? "")
     }
 
     func testCrlfComesBackAsLfAndIsReportedAsSuch() {

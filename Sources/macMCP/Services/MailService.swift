@@ -1813,7 +1813,7 @@ enum MailService {
     ///   nothing can tell the two apart. So the count is reported, not a claim.
     /// * **Every CRLF arrives as LF.** A message stored with 21 CRLFs came back
     ///   with 21 LFs and no CR at all, which means a byte comparison against the
-    ///   server's copy differs on every line break.
+    ///   message's wire form differs on every line break.
     ///
     /// A code comment is not an interface, which is the whole point of this
     /// function: a caller checksumming a saved message, or writing an 8bit
@@ -1822,13 +1822,33 @@ enum MailService {
     /// `source_encoding` is not the place for it. That field says how the inline
     /// `source` string was encoded for return; it exists only on the inline path,
     /// and a source can be perfectly valid `utf-8` and still be missing a NUL.
+    ///
+    /// There is deliberately **no summary boolean** here. There used to be:
+    /// `exact`, true when the source was complete, free of `0x80`, and had CRLF
+    /// line endings. Mail strips every CR, so the third condition never held on
+    /// the live pipeline and `exact` was false for every real message --
+    /// including one whose fetched bytes were byte-identical to the copy on
+    /// disk. A field that cannot be true tells a caller nothing, and three tests
+    /// asserted it on a branch only synthetic data could reach. What is left is
+    /// three facts, each of which can go either way, and a note that says what
+    /// they mean.
     struct SourceFidelity {
         /// "crlf", "lf", "mixed", or "none" for a source with no line breaks.
         let lineEndings: String
-        /// How many bytes equal `0x80`. Each one may be a NUL that was lost.
+        /// How many bytes are `0x80` where a NUL could have been lost.
+        ///
+        /// Not every `0x80`. A `0x80` sitting in a well-formed multi-byte UTF-8
+        /// sequence is a continuation byte and cannot be Mail's replacement for
+        /// a NUL, which always lands standalone -- counting those reported
+        /// `ambiguous_nul_bytes: 3` for a body whose only sin was three em
+        /// dashes (`E2 80 94`), on a message containing no NUL and no real
+        /// `0x80` at all.
         let ambiguousNulBytes: Int
         /// The wire size Mail reports for the message, when it could be read.
         let expectedSize: Int?
+        /// How many bytes were measured -- the whole source Mail handed over,
+        /// which is not necessarily the number of bytes a result returns.
+        let byteCount: Int
         /// What the returned bytes would measure on the wire: one CR back for
         /// every LF, since that is the transform they came through.
         let wireSize: Int
@@ -1836,50 +1856,70 @@ enum MailService {
         /// False when Mail was still downloading and handed over a fragment --
         /// 838 bytes of a 300 KB message in one measurement, with nothing in the
         /// old response to distinguish that from a 838-byte message.
+        ///
+        /// Two things it is worth being precise about:
+        ///
+        /// * **Zero bytes is never complete**, whatever Mail says the size is.
+        ///   Every RFC 822 message has a header block, so an empty source is
+        ///   the absence of a message rather than an empty one, and it is the
+        ///   one case that needs no size to judge.
+        /// * **A message whose size Mail would not report is not accused.** An
+        ///   unreadable `messageSize` is not evidence that the download is
+        ///   unfinished, and refusing every such message would cost reads that
+        ///   work. `complete` is then "nothing contradicts it" rather than a
+        ///   verified match -- `sizeKnown` says which of the two a caller has,
+        ///   and the note says so in words.
         var complete: Bool {
+            if byteCount == 0 { return false }
             guard let expectedSize else { return true }
             return wireSize >= expectedSize
         }
 
-        /// True when nothing known to be lossy is visible in these bytes.
-        var exact: Bool {
-            complete && (lineEndings == "crlf" || lineEndings == "none") && ambiguousNulBytes == 0
-        }
+        /// Whether `complete` was checked against a size Mail supplied.
+        var sizeKnown: Bool { expectedSize != nil }
 
         var note: String? {
             var sentences: [String] = []
-            if !complete, let expectedSize {
+            if byteCount == 0 {
+                sentences.append("Mail returned no bytes at all for this message — not even its headers had arrived. An RFC 822 message always has a header block, so this is the absence of a message rather than an empty one. Try again in a moment.")
+            } else if !complete, let expectedSize {
                 sentences.append("Mail had only \(wireSize) of this message's \(expectedSize) bytes when the source was read and did not finish downloading the rest within the wait, so what is here is a fragment rather than the message. Try again in a moment.")
+            } else if !sizeKnown {
+                sentences.append("Mail would not report this message's size, so whether it had finished downloading could not be checked: complete is \"nothing contradicts it\" here rather than a verified match.")
             }
             if lineEndings == "lf" || lineEndings == "mixed" {
-                sentences.append("Mail hands a source back with LF line endings where the message on the server has CRLF, so a byte comparison against the server's copy differs on every line break.")
+                sentences.append("Mail hands a source back with LF line endings where the message's wire form has CRLF, so a byte comparison against the wire form differs on every line break; a copy stored with LF endings, as a Maildir server holds it, can still match exactly.")
             }
             if ambiguousNulBytes > 0 {
-                sentences.append("\(ambiguousNulBytes) byte(s) here are 0x80, and Mail turns a NUL into 0x80 before macMCP sees it, so each one is either a real 0x80 in the message or a NUL that did not survive — the two are indistinguishable. Parts carried as base64 or quoted-printable are unaffected, their encoded form being pure ASCII.")
+                sentences.append("\(ambiguousNulBytes) byte(s) of this source are 0x80 in a position where a NUL could have been lost — counted across all \(byteCount) bytes Mail returned, not only across any slice this result carries. Mail turns a NUL into 0x80 before macMCP sees it, so each one is either a real 0x80 in the message or a NUL that did not survive — the two are indistinguishable. A 0x80 that is part of a valid UTF-8 character is not counted, and parts carried as base64 or quoted-printable are unaffected, their encoded form being pure ASCII.")
             }
             return sentences.isEmpty ? nil : sentences.joined(separator: " ")
         }
 
         var dict: [String: Any] {
             var out: [String: Any] = [
-                "exact": exact,
                 "complete": complete,
                 "line_endings": lineEndings,
-                "ambiguous_nul_bytes": ambiguousNulBytes
+                "ambiguous_nul_bytes": ambiguousNulBytes,
+                // Which bytes the two counts above were measured over, since a
+                // result may return fewer than these.
+                "bytes_measured": byteCount,
+                // null rather than absent: "Mail would not say" is a different
+                // answer from "nobody asked", and it is what makes `complete`
+                // above unverified.
+                "message_size": expectedSize as Any? ?? NSNull()
             ]
-            if let expectedSize { out["message_size"] = expectedSize }
             if let note { out["note"] = note }
             return out
         }
     }
 
     static func sourceFidelity(_ data: Data, expectedSize: Int? = nil) -> SourceFidelity {
-        var crlf = 0, bareLF = 0, bareCR = 0, nulCandidates = 0
+        var crlf = 0, bareLF = 0, bareCR = 0
         var previous: UInt8 = 0
         for byte in data {
             switch byte {
             case 0x0A: if previous == 0x0D { crlf += 1 } else { bareLF += 1 }
-            case 0x80: nulCandidates += 1
             default: break
             }
             if previous == 0x0D && byte != 0x0A { bareCR += 1 }
@@ -1896,12 +1936,71 @@ enum MailService {
         }
         return SourceFidelity(
             lineEndings: endings,
-            ambiguousNulBytes: nulCandidates,
+            ambiguousNulBytes: standaloneHighBytes(data),
             expectedSize: expectedSize,
+            byteCount: data.count,
             // Every LF here stood for a CRLF on the wire, so this is what these
             // bytes weigh in the units `messageSize` is quoted in.
             wireSize: data.count + crlf + bareLF
         )
+    }
+
+    /// Counts `0x80` bytes that are not continuation bytes of a well-formed
+    /// UTF-8 sequence.
+    ///
+    /// Mail's replacement for a NUL is a lone `0x80`. `E2 80 94` — an em dash —
+    /// also contains one, and so does a large share of ordinary mail: a body
+    /// reading `em dash — here — and Hebrew שלום — end` has no NUL and no real
+    /// `0x80` in it, and was reported as carrying three lost NULs. A `0x80` that
+    /// completes a valid multi-byte character cannot be one, so the sequence is
+    /// stepped over whole.
+    ///
+    /// A source is not required to be UTF-8 — it is raw RFC 822 bytes, and a
+    /// binary part can hold anything. Byte values that happen to spell a valid
+    /// sequence are therefore skipped there too, which under-counts rather than
+    /// over-counts. That is the right way round: the count exists to make a real
+    /// loss visible, and a warning that fires on em dashes is one callers learn
+    /// to ignore.
+    static func standaloneHighBytes(_ data: Data) -> Int {
+        let bytes = [UInt8](data)
+        var count = 0
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+            if byte < 0x80 { i += 1; continue }
+            if let length = utf8SequenceLength(bytes, at: i) { i += length; continue }
+            if byte == 0x80 { count += 1 }
+            i += 1
+        }
+        return count
+    }
+
+    /// The length of the well-formed UTF-8 sequence starting at `index`, or nil
+    /// if there is not one. Rejects overlong forms, surrogates and anything
+    /// above U+10FFFF, so their continuation bytes are not skipped over.
+    private static func utf8SequenceLength(_ bytes: [UInt8], at index: Int) -> Int? {
+        func continuation(_ offset: Int, _ range: ClosedRange<UInt8>) -> Bool {
+            index + offset < bytes.count && range.contains(bytes[index + offset])
+        }
+        let lead = bytes[index]
+        switch lead {
+        case 0xC2...0xDF:
+            return continuation(1, 0x80...0xBF) ? 2 : nil
+        case 0xE0:
+            return continuation(1, 0xA0...0xBF) && continuation(2, 0x80...0xBF) ? 3 : nil
+        case 0xE1...0xEC, 0xEE...0xEF:
+            return continuation(1, 0x80...0xBF) && continuation(2, 0x80...0xBF) ? 3 : nil
+        case 0xED:
+            return continuation(1, 0x80...0x9F) && continuation(2, 0x80...0xBF) ? 3 : nil
+        case 0xF0:
+            return continuation(1, 0x90...0xBF) && continuation(2, 0x80...0xBF) && continuation(3, 0x80...0xBF) ? 4 : nil
+        case 0xF1...0xF3:
+            return continuation(1, 0x80...0xBF) && continuation(2, 0x80...0xBF) && continuation(3, 0x80...0xBF) ? 4 : nil
+        case 0xF4:
+            return continuation(1, 0x80...0x8F) && continuation(2, 0x80...0xBF) && continuation(3, 0x80...0xBF) ? 4 : nil
+        default:
+            return nil
+        }
     }
 
     /// How long the source fetch waits for Mail to finish downloading a message
@@ -1930,6 +2029,11 @@ enum MailService {
     /// to add up. `messageSize` is the wire size, and every LF in a returned
     /// source stands for one CRLF on the wire, which makes the check exact
     /// rather than a heuristic.
+    ///
+    /// An **empty** source is waited for whatever the size says, including when
+    /// `messageSize` could not be read at all. That is the one judgement a size
+    /// is not needed for: no RFC 822 message has an empty source, so zero bytes
+    /// is always Mail not having started rather than a message to report.
     static func sourceScriptJXA(
         account: String?,
         mailbox: String,
@@ -1944,7 +2048,8 @@ enum MailService {
         try { expected = found.messageSize(); } catch (e) {}
         function wireLength(s) { return s.length + (s.split('\\n').length - 1); }
         var src = '' + found.source();
-        for (var attempt = 0; attempt < \(attempts) && expected > 0 && wireLength(src) < expected; attempt++) {
+        function short(s) { return s.length === 0 || (expected > 0 && wireLength(s) < expected); }
+        for (var attempt = 0; attempt < \(attempts) && short(src); attempt++) {
             delay(\(interval));
             src = '' + found.source();
         }
@@ -2039,7 +2144,10 @@ enum MailService {
         // saved from a half-downloaded message is silently wrong on disk, which
         // is worse than a failure the caller can retry.
         let fidelity = sourceFidelity(data, expectedSize: expectedSize)
-        if !fidelity.complete, let expectedSize {
+        if !fidelity.complete {
+            guard let expectedSize else {
+                return errorResult("Mail returned none of this message's bytes — not even its headers — so there is nothing to cut an attachment out of. Try again in a moment.")
+            }
             return errorResult("Mail has only \(fidelity.wireSize) of this message's \(expectedSize) bytes and did not finish downloading it — attachments cut from that would be truncated. Try again in a moment.")
         }
 
@@ -2125,6 +2233,19 @@ enum MailService {
         )
         if let fetchError { return errorResult(fetchError) }
         let fidelity = sourceFidelity(data, expectedSize: expectedSize)
+
+        // A fragment is returned, with `fidelity` saying how much of the message
+        // it is: headers alone are worth having, and reporting them honestly is
+        // what this seam is for. Zero bytes is different. There is nothing to
+        // report on, no RFC 822 message has an empty source, and returning
+        // `"source": ""` with `truncated: false` reads as "this message is
+        // empty" to anyone who does not also read `fidelity` — the same
+        // confident wrong answer `mail_save_attachment` already refuses to give.
+        if data.isEmpty {
+            var message = "Mail returned no bytes at all for this message — not even its headers had arrived, so there is no source to return. Try again in a moment."
+            if let expectedSize { message += " Mail reports the message as \(expectedSize) bytes." }
+            return errorResult(message)
+        }
 
         if let saveTo = args?["save_to"]?.stringValue {
             let url = URL(fileURLWithPath: (saveTo as NSString).expandingTildeInPath)
@@ -2509,7 +2630,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -2530,7 +2651,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server: every result reports fidelity, because Mail hands a source over with LF line endings where the message has CRLF, and turns any NUL byte into 0x80 before macMCP sees it (so each 0x80 may be a real 0x80 or a lost NUL). fidelity.complete says whether Mail had finished downloading the message — the fetch waits for it, and reports a fragment as one rather than passing it off as the message. Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message. message_size is Mail's own wire size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
