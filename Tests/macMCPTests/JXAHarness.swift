@@ -82,6 +82,20 @@ enum JXA {
 /// });
 /// ```
 ///
+/// A mailbox takes two optional descriptions of it changing under the script,
+/// both keyed on how many times its `messages` specifier has been read (one
+/// read is one Apple Event):
+///
+/// * `arrival: {after, at, message, repeat}` splices a message in. The
+///   collection gets longer, which a column-count check can see.
+/// * `departure: {after, at, repeat}` takes a message back out. Paired with an
+///   `arrival` it models a change that is over before the scan looks again,
+///   which the id re-read cannot see and only the column lengths can.
+/// * `mutation: {after, removeAt, insertAt, message, repeat}` takes one message
+///   out and puts another in. The collection is the **same length** before and
+///   after, so counting columns cannot see it and only re-reading the id column
+///   can.
+///
 /// Every mutation is recorded on `mail.log` so a test can assert on what the
 /// script did rather than only on what it returned.
 enum MailStubJS {
@@ -176,6 +190,41 @@ enum MailStubJS {
                                 subject: arrival.message.subject,
                                 sender: arrival.message.sender,
                                 date: arrival.message.date
+                            }, box)
+                        );
+                    }
+                    // `departure` takes a message back out. Paired with an
+                    // `arrival` it models the change that is over before the
+                    // scan looks again -- a message spliced in between two
+                    // columns and filed away again before the id column is
+                    // re-read -- which the id re-read cannot see and only the
+                    // column lengths can.
+                    var departure = b.departure;
+                    if (departure && (box._reads === departure.after
+                            || (departure.repeat && box._reads > departure.after))) {
+                        var leftAt = departure.at == null ? 0 : departure.at;
+                        if (leftAt >= 0 && leftAt < box._msgs.length) box._msgs.splice(leftAt, 1);
+                    }
+                    // `mutation` is the change an arrival cannot model: one
+                    // message leaves as another arrives, so the collection is
+                    // the same length before and after. Counting the columns
+                    // cannot see it -- only re-reading the id column can, which
+                    // is the half of the #48 guard that arrivals leave untested.
+                    // {after: n, removeAt: i, insertAt: j, message: {...},
+                    //  repeat: true} applies it once the nth fetch is served.
+                    var mutation = b.mutation;
+                    if (mutation && (box._reads === mutation.after
+                            || (mutation.repeat && box._reads > mutation.after))) {
+                        var goneAt = mutation.removeAt == null ? 0 : mutation.removeAt;
+                        if (goneAt >= 0 && goneAt < box._msgs.length) box._msgs.splice(goneAt, 1);
+                        box._msgs.splice(
+                            mutation.insertAt == null ? 0 : mutation.insertAt,
+                            0,
+                            makeMessage({
+                                id: mutation.message.id + '-' + box._reads,
+                                subject: mutation.message.subject,
+                                sender: mutation.message.sender,
+                                date: mutation.message.date
                             }, box)
                         );
                     }
