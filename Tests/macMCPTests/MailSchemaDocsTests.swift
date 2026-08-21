@@ -34,16 +34,55 @@ final class MailSchemaDocsTests: XCTestCase {
         return text
     }
 
+    /// Asserts the text conveys something, without pinning the sentence it
+    /// currently uses to convey it.
+    ///
+    /// The assertions here used to be `contains("re-send")` and
+    /// `contains("reports 15")`, so a legitimate reword failed a test while
+    /// nothing had got worse (#41). What has to hold is that the interface's own
+    /// names and numbers are there — those are stable, being the thing a caller
+    /// reads — and that each caveat is stated in one of the ways it can be
+    /// stated.
+    private func assertMentions(
+        _ text: String,
+        anyOf alternatives: [String],
+        _ what: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            alternatives.contains { text.range(of: $0, options: .caseInsensitive) != nil },
+            "nothing about \(what) — none of \(alternatives) in: \(text)",
+            file: file, line: line
+        )
+    }
+
+    /// `contains("LF")` is true of "CRLF", which is the opposite of the thing
+    /// being checked, so the term has to stand on its own.
+    private func assertMentionsWord(
+        _ text: String,
+        _ word: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            text.range(of: "\\b\(word)\\b", options: [.regularExpression]) != nil,
+            "\(word) does not appear as a word of its own in: \(text)",
+            file: file, line: line
+        )
+    }
+
     // MARK: - A cross-account move changes the bytes (#21)
 
     func testTargetAccountSaysItIsAReUploadRatherThanAMove() throws {
         let text = try property("target_account", of: "mail_move")
-        XCTAssertTrue(text.contains("re-send"), text)
-        XCTAssertTrue(text.contains("not a server-side move"), text)
+        assertMentions(text, anyOf: ["re-send", "re-upload", "reupload", "upload"], "the message being sent again")
+        assertMentions(text, anyOf: ["server-side", "server side"], "what it is not")
         // The three consequences a caller can be bitten by, each measured
-        // against the fixture's Maildir.
+        // against the fixture's Maildir. These are interface names, not prose:
+        // a caller matches on them.
         XCTAssertTrue(text.contains("Message-Id"), "what survives: \(text)")
-        XCTAssertTrue(text.contains("numeric message_id"), "what does not: \(text)")
+        XCTAssertTrue(text.contains("message_id"), "what does not: \(text)")
         XCTAssertTrue(text.contains("NUL"), "the byte-level caveat: \(text)")
     }
 
@@ -53,24 +92,47 @@ final class MailSchemaDocsTests: XCTestCase {
         for tool in ["mail_send", "mail_create_draft"] {
             let text = try description(of: tool)
             XCTAssertTrue(text.contains("rendered_chars"), tool)
-            XCTAssertTrue(text.contains("whitespace removed"), "\(tool): \(text)")
-            // The example is the part that makes it unmissable: a caller
-            // comparing 15 against body.count needs to see why.
-            XCTAssertTrue(text.contains("reports 15"), "\(tool): \(text)")
+            assertMentions(text, anyOf: ["whitespace"], "what is not counted (\(tool))")
+            // The worked example is what makes it unmissable: both numbers have
+            // to be there, because the point is the gap between them. Which way
+            // round the sentence puts them is not the test's business.
+            for number in ["15", "18"] {
+                XCTAssertTrue(text.contains(number), "the worked example's \(number) (\(tool)): \(text)")
+            }
         }
     }
 
-    // MARK: - A fetched source is not the message (#20)
+    // MARK: - A fetched source is not the message (#20, #38, #39)
 
     func testTheSourceToolsWarnThatTheBytesAreNotTheMessages() throws {
         let source = try description(of: "mail_get_source")
-        XCTAssertTrue(source.contains("NOT byte-identical"), source)
+        assertMentions(source, anyOf: ["NOT byte-identical", "not byte-identical"], "the headline claim")
         XCTAssertTrue(source.contains("fidelity"), source)
-        XCTAssertTrue(source.contains("LF"), source)
+        assertMentionsWord(source, "LF")
+        XCTAssertTrue(source.contains("CRLF"), source)
         XCTAssertTrue(source.contains("0x80"), source)
 
         let save = try description(of: "mail_save_attachment")
         XCTAssertTrue(save.contains("fidelity"), save)
-        XCTAssertTrue(save.contains("base64"), "the case that is unaffected: \(save)")
+        assertMentions(save, anyOf: ["base64"], "the case that is unaffected")
+    }
+
+    func testTheSourceSchemaSaysWhenCompletenessWasNotActuallyChecked() throws {
+        // #39: `complete` is "nothing contradicts it" when Mail would not report
+        // the message's size, and a caller reading it as a verified match has no
+        // way to tell from the field alone.
+        let source = try description(of: "mail_get_source")
+        XCTAssertTrue(source.contains("message_size"), source)
+        assertMentions(source, anyOf: ["null", "not report"], "the unknown-size case")
+    }
+
+    // MARK: - mail_get_email withholds what it could not check (#33)
+
+    func testGetEmailSaysWhichFieldsItWillNotReportOnAnIncompleteMessage() throws {
+        let text = try description(of: "mail_get_email")
+        XCTAssertTrue(text.contains("fidelity"), text)
+        XCTAssertTrue(text.contains("omitted"), text)
+        XCTAssertTrue(text.contains("has_attachments"), text)
+        XCTAssertTrue(text.contains("listed_by_mail"), "the reconciled list: \(text)")
     }
 }
