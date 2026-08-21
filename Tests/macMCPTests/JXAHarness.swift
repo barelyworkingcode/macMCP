@@ -88,6 +88,9 @@ enum JXA {
 ///
 /// * `arrival: {after, at, message, repeat}` splices a message in. The
 ///   collection gets longer, which a column-count check can see.
+/// A mailbox marked `byNameHidden: true` is enumerated and named but cannot be
+/// reached through `byName`, which is what a nested mailbox does in Mail.
+///
 /// * `departure: {after, at, repeat}` takes a message back out. Paired with an
 ///   `arrival` it models a change that is over before the scan looks again,
 ///   which the id re-read cannot see and only the column lengths can.
@@ -96,12 +99,59 @@ enum JXA {
 ///   after, so counting columns cannot see it and only re-reading the id column
 ///   can.
 ///
+/// `mail.takeOut(account, mailbox, index)` removes one message on demand, so a
+/// test can change a mailbox *between* two reads of a specifier a script has
+/// already bound -- which is what tells a binding by id from a binding by
+/// position.
+///
+/// Messages resolve by id across every mailbox (`mail.inbox.messages.byId(n)`,
+/// and the same accessor off any mailbox), because that is what Mail does; the
+/// message's own `mailbox` reports where it really is, and a local On My Mac
+/// mailbox raises on `.account`. Collections are callable and carry `name()`
+/// and `byName()`, as Mail's do. What the stub does **not** model is a mailbox
+/// specifier re-resolving: `byName` hands back the element itself, so only the
+/// message-level binding can be pinned here.
+///
 /// Every mutation is recorded on `mail.log` so a test can assert on what the
 /// script did rather than only on what it returned.
 enum MailStubJS {
     static let source = """
     function makeMail(spec) {
         var log = {moves: [], created: [], sent: [], saved: [], bodies: [], sourceReads: []};
+
+        // Mail's element collections are callable *and* carry `name()` (one
+        // bulk Apple Event for every name) and `byName()`. `Function.name` is
+        // read-only on a plain assignment, hence defineProperty.
+        function collectionOf(itemsFn, nameOf) {
+            var fn = function() { return itemsFn(); };
+            Object.defineProperty(fn, 'name', {
+                value: function() { return itemsFn().map(nameOf); },
+                writable: true, configurable: true
+            });
+            // Mail matches `byName` at the top level only. It flattens an
+            // account's mailbox tree and reports leaf names, so a mailbox it
+            // enumerates and names can still be unreachable by that name --
+            // `byNameHidden` models one.
+            fn.byName = function(n) {
+                var items = itemsFn();
+                for (var i = 0; i < items.length; i++) {
+                    if (items[i]._byNameHidden) continue;
+                    if (nameOf(items[i]) === ('' + n)) return items[i];
+                }
+                return missingElement();
+            };
+            return fn;
+        }
+
+        // What a specifier that resolves to nothing behaves like: `exists()` is
+        // false and every other access raises, rather than the call failing on
+        // the spot.
+        function missingElement() {
+            function raise() { throw new Error("Can't get object."); }
+            var gone = {name: raise, exists: function() { return false; }, mailboxes: raise, account: raise};
+            Object.defineProperty(gone, 'messages', {get: raise});
+            return gone;
+        }
 
         function makeMessage(m, box) {
             var msg = {
@@ -117,6 +167,8 @@ enum MailStubJS {
                 // some messages.
                 _sources: m.sources == null ? [m.source == null ? '' : m.source] : m.sources,
                 _sourceReads: 0,
+                _content: m.content == null ? '' : m.content,
+                content: function() { return this._content; },
                 _sender: m.sender == null ? '' : m.sender,
                 _date: m.date == null ? 0 : m.date,
                 _read: m.read ? true : false,
@@ -230,6 +282,13 @@ enum MailStubJS {
                     }
                     var m = box._msgs;
                     var spec = {
+                        // Mail resolves a message id across *every* mailbox,
+                        // not just the collection the specifier hangs off: an
+                        // id from Bob's INBOX resolves through Alice's, and the
+                        // message's own `mailbox` reports where it really is.
+                        // Measured against Mail 16 on the fixture, and the
+                        // reason the by-id lookup needs no mailbox to search.
+                        byId: function(n) { return byIdSpecifier(n); },
                         id: function() { return m.map(function(x) { return x._id; }); },
                         messageId: function() { return m.map(function(x) { return x._messageId; }); },
                         subject: function() { return m.map(function(x) { return x._subject; }); },
@@ -238,10 +297,21 @@ enum MailStubJS {
                         readStatus: function() { return m.map(function(x) { return x._read; }); },
                         length: m.length
                     };
-                    for (var i = 0; i < m.length; i++) spec[i] = m[i];
+                    for (var i = 0; i < m.length; i++) spec[i] = positionalSpecifier(box, i);
                     return spec;
                 }
             });
+            // A mailbox owned by an account answers `account`; a local
+            // On My Mac mailbox raises, which is how the real thing behaves and
+            // how a by-id lookup tells the two apart.
+            Object.defineProperty(box, 'account', {
+                get: function() {
+                    if (acctName === 'On My Mac') throw new Error("Can't get object.");
+                    return {name: function() { return acctName; }};
+                }
+            });
+            box.exists = function() { return true; };
+            box._byNameHidden = b.byNameHidden ? true : false;
             (b.messages || []).forEach(function(m) { box._msgs.push(makeMessage(m, box)); });
             return box;
         }
@@ -250,16 +320,119 @@ enum MailStubJS {
             var boxes = (a.mailboxes || []).map(function(b) { return makeMailbox(b, a.name); });
             return {
                 name: function() { return a.name; },
+                exists: function() { return true; },
                 emailAddresses: function() { return a.emailAddresses || []; },
-                mailboxes: function() { return boxes; }
+                mailboxes: collectionOf(function() { return boxes; }, function(b) { return '' + b.name(); })
             };
         });
         var localBoxes = (spec.local || []).map(function(b) { return makeMailbox(b, 'On My Mac'); });
 
+        function everyMessage() {
+            var out = [];
+            accounts.forEach(function(a) {
+                a.mailboxes().forEach(function(b) { b._msgs.forEach(function(m) { out.push(m); }); });
+            });
+            localBoxes.forEach(function(b) { b._msgs.forEach(function(m) { out.push(m); }); });
+            return out;
+        }
+        function messageById(id) {
+            var all = everyMessage();
+            for (var i = 0; i < all.length; i++) if (('' + all[i]._id) === ('' + id)) return all[i];
+            return null;
+        }
+
+        // **A specifier is not the object it resolves to.** JXA re-evaluates it
+        // on every property access, so two reads off the same variable can
+        // answer for two different messages. Modelling that is the difference
+        // between a test that can catch #50 and one that cannot: snapshot the
+        // message instead and a positional binding looks as sound as a by-id
+        // one.
+        var FORWARDED = ['id', 'messageId', 'subject', 'sender', 'dateReceived', 'dateSent',
+                         'messageSize', 'source', 'content', 'mailAttachments',
+                         'toRecipients', 'ccRecipients'];
+        function specifier(resolve, present) {
+            function live() {
+                var m = resolve();
+                if (m == null) throw new Error("Can't get object.");
+                return m;
+            }
+            var spec = {exists: present};
+            FORWARDED.forEach(function(k) {
+                spec[k] = function() {
+                    var m = live();
+                    // Mail's own answer for a property it will not produce.
+                    if (typeof m[k] !== 'function') throw new Error('AppleEvent handler failed.');
+                    return m[k]();
+                };
+            });
+            Object.defineProperty(spec, 'mailbox', {
+                get: function() { return live().mailbox; },
+                set: function(dest) { live().mailbox = dest; }
+            });
+            // JXA reaches a property either way round, so `readStatus()` reads
+            // and `readStatus = true` writes, off the same name.
+            Object.defineProperty(spec, 'readStatus', {
+                get: function() { return function() { return live().readStatus(); }; },
+                set: function(v) { live()._read = v ? true : false; }
+            });
+            return spec;
+        }
+
+        // Bound by id: re-resolves to the same message every time, or raises.
+        function byIdSpecifier(id) {
+            return specifier(
+                function() { return messageById(id); },
+                function() { return messageById(id) !== null; }
+            );
+        }
+
+        // Bound by position: re-resolves to whatever is at that index now, which
+        // after a message leaves is a different message -- silently, with no
+        // error. This is what `mb.messages[k]` was.
+        function positionalSpecifier(box, index) {
+            return specifier(
+                function() { return box._msgs[index]; },
+                function() { return box._msgs[index] != null; }
+            );
+        }
+
+        // Mail's unified inbox. Only ever used as somewhere to hang a global
+        // `messages.byId()` off, which is all the real one is used for.
+        var inbox = {name: function() { return 'All Inboxes'; }, exists: function() { return true; }};
+        Object.defineProperty(inbox, 'messages', {
+            get: function() { return {byId: function(n) { return byIdSpecifier(n); }}; }
+        });
+
+        // Changes a mailbox from the test, *between* two reads of a specifier the
+        // script has already bound. That is the condition a loopback fixture
+        // cannot be made to hold still for, and it is the one that tells a
+        // specifier bound by id from one bound by position: after a message
+        // leaves, `messages[k]` is a different message and `messages.byId(n)`
+        // is not. Returns the id removed, or null.
+        function takeOut(acctName, boxName, at) {
+            var boxes = ('' + acctName).toLowerCase() === 'on my mac'
+                ? localBoxes
+                : (function() {
+                    for (var a = 0; a < accounts.length; a++) {
+                        if (('' + accounts[a].name()) === ('' + acctName)) return accounts[a].mailboxes();
+                    }
+                    return [];
+                })();
+            for (var b = 0; b < boxes.length; b++) {
+                if (('' + boxes[b].name()) !== ('' + boxName)) continue;
+                var index = at == null ? 0 : at;
+                if (index < 0 || index >= boxes[b]._msgs.length) return null;
+                return boxes[b]._msgs.splice(index, 1)[0]._id;
+            }
+            return null;
+        }
+
         return {
             log: log,
-            accounts: function() { return accounts; },
-            mailboxes: function() { return localBoxes; }
+            inbox: inbox,
+            takeOut: takeOut,
+            accounts: collectionOf(function() { return accounts; }, function(a) { return '' + a.name(); }),
+            mailboxes: collectionOf(function() { return localBoxes; }, function(b) { return '' + b.name(); })
         };
     }
     """

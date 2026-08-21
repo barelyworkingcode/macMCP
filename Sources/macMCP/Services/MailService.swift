@@ -349,18 +349,80 @@ enum MailService {
     /// JXA that builds `var <varName> = [{mbox, acctName, name}]` for `scope`.
     /// Note: Mail returns account.mailboxes() already flattened (nested folders
     /// included), so no recursion is needed.
+    /// JavaScript that pairs each element of a Mail collection with the name it
+    /// was read under, and binds the element by that name.
+    ///
+    /// Every collection Mail hands back -- accounts, mailboxes, messages -- is
+    /// indexed by **position**, and JXA re-evaluates a specifier on every
+    /// property access rather than snapshotting the object behind it. `boxes[i]`
+    /// therefore means "whatever is at position i right now", so a collection
+    /// that changes between two reads answers the second one about a different
+    /// element, silently and with no error. That is issue #50 at the message
+    /// level; it is the same shape one level up.
+    ///
+    /// The names come from a bulk `collection.name()` -- one Apple Event for all
+    /// of them, the same trick the scan uses for message columns -- so the name
+    /// and the binding are taken from a single read rather than from a walk that
+    /// the collection can change underneath.
+    ///
+    /// **A name that does not identify the element keeps the positional
+    /// specifier**, because half a binding is worse than none. Two cases, both
+    /// measured against the fixture with nested IMAP folders:
+    ///
+    /// * A name that repeats. Mail flattens an account's mailbox tree and
+    ///   reports leaf names, so `Projects/Archive` beside a top-level `Archive`
+    ///   gives an account **two** mailboxes called `Archive`. Binding both by
+    ///   name would collapse them onto whichever one `byName` picks -- a new
+    ///   wrong answer in place of the old one -- and the scan really does read
+    ///   them as two, one holding `NESTED-ARCHIVE` and the other
+    ///   `Decommission plan`.
+    /// * A name that resolves to nothing. `byName` matches at the top level
+    ///   only, so a nested mailbox it enumerates and names cannot be reached by
+    ///   that name at all: `mailboxes.byName('Sub')` for `Projects/Sub` gives a
+    ///   specifier whose `exists()` is false, while position 2 reads fine. The
+    ///   binding is therefore checked before it is used, which is why this is
+    ///   not simply `collection.byName(names[i])`.
+    private static let boundByNameJXA = """
+    function boundByName(collection) {
+        var names = collection.name();
+        var elements = null;
+        function positional(i) {
+            if (elements === null) elements = collection();
+            return i < elements.length ? elements[i] : null;
+        }
+        var out = [];
+        for (var i = 0; i < names.length; i++) {
+            var nm = '' + names[i];
+            var unique = true;
+            for (var q = 0; q < names.length; q++) {
+                if (q !== i && ('' + names[q]) === nm) { unique = false; break; }
+            }
+            var bound = null;
+            if (unique) {
+                var candidate = collection.byName(nm);
+                var resolves = false;
+                try { resolves = candidate.exists(); } catch (e) { resolves = false; }
+                if (resolves) bound = candidate;
+            }
+            if (bound === null) bound = positional(i);
+            if (bound !== null) out.push({element: bound, name: nm});
+        }
+        return out;
+    }
+    """
+
     private static func collectBoxesJXA(_ scope: BoxScope, varName: String) -> String {
         let pushAccountBoxes = """
-                var acctName = accts[ai].name();
-                var mboxes = accts[ai].mailboxes();
+                var acctName = accts[ai].name;
+                var mboxes = boundByName(accts[ai].element.mailboxes);
                 for (var mj = 0; mj < mboxes.length; mj++) {
-                    sink.push({mbox: mboxes[mj], acctName: acctName, name: '' + mboxes[mj].name()});
+                    sink.push({mbox: mboxes[mj].element, acctName: acctName, name: mboxes[mj].name});
                 }
         """
         let pushLocalBoxes = """
-            var localBoxes = mail.mailboxes();
+            var localBoxes = boundByName(mail.mailboxes);
             for (var lj = 0; lj < localBoxes.length; lj++) {
-                sink.push({mbox: localBoxes[lj], acctName: 'On My Mac', name: '' + localBoxes[lj].name()});
+                sink.push({mbox: localBoxes[lj].element, acctName: 'On My Mac', name: localBoxes[lj].name});
             }
         """
 
@@ -369,9 +431,9 @@ enum MailService {
         case .account(let account):
             let escapedAccount = escapeJSString(account)
             body = """
-            var accts = mail.accounts();
+            var accts = boundByName(mail.accounts);
             for (var ai = 0; ai < accts.length; ai++) {
-                if (accts[ai].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+                if (accts[ai].name.toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
         \(pushAccountBoxes)
                     return sink;
                 }
@@ -385,7 +447,7 @@ enum MailService {
         """
         case .everything:
             body = """
-            var accts = mail.accounts();
+            var accts = boundByName(mail.accounts);
             for (var ai = 0; ai < accts.length; ai++) {
         \(pushAccountBoxes)
             }
@@ -395,6 +457,7 @@ enum MailService {
         }
 
         return """
+        \(boundByNameJXA)
         var \(varName) = (function() {
             var sink = [];
         \(body)
@@ -720,42 +783,182 @@ enum MailService {
         return nil
     }
 
-    /// JXA snippet that finds a message by ID. Looks in mailboxes matching the
-    /// requested name first, then falls back to every other mailbox so messages
-    /// surfaced by all-mailbox search can still be fetched by id. Defines
-    /// `found` (message or null), `foundAccount`, and `foundMailbox`.
+    /// How many times a by-Message-ID lookup will re-read a mailbox that changed
+    /// underneath it. The same allowance the scan takes, for the same reason: a
+    /// mailbox changing under a read is a moment, not a state.
+    private static let findAttempts = 3
+
+    /// What a caller's `message_id` can be matched against.
+    enum MessageHandle: Equatable {
+        /// Mail's own numeric message id.
+        case numeric(Int)
+        /// An RFC 5322 Message-ID header value, angle brackets stripped.
+        case rfc(String)
+        /// Neither, so no message can carry it.
+        case unmatchable
+    }
+
+    /// Classifies a `message_id` argument. Not private so the classification can
+    /// be pinned without a mailbox.
     ///
-    /// An identifier containing `@` is treated as an RFC 5322 Message-ID and
-    /// matched against the `message id` column instead of Mail's numeric one.
-    /// That matters for drafts on IMAP accounts: saving a draft uploads it, the
-    /// server hands back its own copy, and Mail's numeric id for the local one
-    /// is dead within seconds — while the Message-ID header survives the round
-    /// trip. Angle brackets are optional on either side of the comparison.
-    private static func findMessageJXA(account: String?, mailbox: String, messageId: String) -> String {
-        let escapedMailbox = escapeJSString(mailbox)
-        let escapedId = escapeJSString(messageId)
-        return """
-    \(collectBoxesJXA(account: account, varName: "fmBoxes"))
+    /// Angle brackets are optional -- `<x@y>` and `x@y` are the same handle. An
+    /// identifier that is neither a plain integer nor something with an `@` in it
+    /// is `unmatchable` rather than "search for it anyway": the old code compared
+    /// such a string against the numeric id column, which could never match, so
+    /// this is the same answer arrived at without the search. The integer has to
+    /// round-trip, so `0123` stays unmatchable exactly as it was before rather
+    /// than quietly becoming 123.
+    static func messageHandle(_ raw: String) -> MessageHandle {
+        var bare = raw
+        if bare.hasPrefix("<") { bare.removeFirst() }
+        if bare.hasSuffix(">") { bare.removeLast() }
+        if let numeric = Int(bare), String(numeric) == bare { return .numeric(numeric) }
+        if bare.contains("@") { return .rfc(bare) }
+        return .unmatchable
+    }
+
+    /// JXA snippet that binds `found` to one message, plus `foundAccount` and
+    /// `foundMailbox` saying where it is. `found` is null when nothing matched.
+    ///
+    /// **`found` is bound by identity, never by position** -- issue #50. This
+    /// used to end with `found = subset[i].mbox.messages[k]`, an index into a
+    /// bulk id column. JXA re-resolves a specifier on *every* property access
+    /// rather than snapshotting the object, so that `found` meant "whatever is
+    /// at position k right now" and each read off it could land on a different
+    /// message than the last one did. Measured on the fixture at ~3,000 messages
+    /// with continuous delivery, `mail_get_email` was wrong in 26 of 60 calls,
+    /// and in 18 of those it returned the right id, the right subject and the
+    /// right `rfc_message_id` beside **another message's body** -- a shape
+    /// nothing in the response lets a caller detect. `mail_move` was worse
+    /// still: it resolves the destination mailbox between reading the id and
+    /// assigning `found.mailbox`, and reported no id at all.
+    ///
+    /// `messages.byId()` is the fix. It re-resolves on every access too, but by
+    /// id, so it answers for the same message every time or raises. Two things
+    /// about it, both measured against Mail 16:
+    ///
+    /// * Resolution is **global**, not scoped to the collection the specifier
+    ///   hangs off: an id from Bob's INBOX resolves through Alice's, and the
+    ///   message's own `mailbox` (and `mailbox.account`) says where it really
+    ///   is. So a numeric lookup needs no mailbox enumeration at all -- it is
+    ///   one Apple Event to resolve and two to locate, against one bulk id
+    ///   column per mailbox before. On a 3,887-message mailbox that is ~11ms
+    ///   against 54ms for the column it replaces.
+    /// * A local On My Mac mailbox raises on `.account`, which is how the two
+    ///   are told apart.
+    ///
+    /// An RFC Message-ID cannot be resolved that way -- Mail indexes messages by
+    /// its own id -- so that path still reads a column to translate the header
+    /// value into a numeric id, then binds by that id and **asks the bound
+    /// message for its own Message-ID**. Whatever the two columns did between
+    /// them, a shifted pairing cannot get past a message answering for itself.
+    ///
+    /// Matching an RFC Message-ID matters for drafts on IMAP accounts: saving a
+    /// draft uploads it, the server hands back its own copy, and Mail's numeric
+    /// id for the local one is dead within seconds -- while the Message-ID header
+    /// survives the round trip.
+    /// Not private: the binding this establishes is the whole of #50, and it
+    /// can only be pinned by running the generated script against a mailbox that
+    /// changes between two reads of the message it bound.
+    static func findMessageJXA(account: String?, mailbox: String, messageId: String) -> String {
+        let accountExpr = account.map { "'\(escapeJSString($0))'" } ?? "null"
+        // Naming an account that does not exist is a different answer from not
+        // finding the message in it. The numeric path no longer walks the
+        // accounts to build a search scope, so it has to ask on its own account.
+        let accountCheck = account.map { account in
+            """
+            (function() {
+                var known = mail.accounts.name();
+                for (var i = 0; i < known.length; i++) {
+                    if (('' + known[i]).toLowerCase() === ('' + FM_ACCOUNT).toLowerCase()) return;
+                }
+                throw new Error('account not found: \(escapeJSString(account))');
+            })();
+            """
+        } ?? ""
+
+        let preamble = """
     var found = null; var foundAccount = null; var foundMailbox = null;
+    var FM_ACCOUNT = \(accountExpr);
+    function fmBare(v) { return v == null ? null : ('' + v).replace(/^</, '').replace(/>$/, ''); }
+    // Where a message actually is, asked of the message rather than of the
+    // collection it was reached through: `byId` resolves across every account,
+    // so the specifier used to reach it says nothing about the answer.
+    function fmLocate(msg) {
+        var box = null;
+        try { box = msg.mailbox; } catch (e) { return null; }
+        var boxName = null;
+        try { boxName = '' + box.name(); } catch (e) { return null; }
+        // A local On My Mac mailbox has no account and raises here.
+        var acctName = 'On My Mac';
+        try { acctName = '' + box.account.name(); } catch (e) { acctName = 'On My Mac'; }
+        return {account: acctName, mailbox: boxName};
+    }
+    function fmInScope(at) {
+        return FM_ACCOUNT === null
+            || ('' + at.account).toLowerCase() === ('' + FM_ACCOUNT).toLowerCase();
+    }
+    function fmBind(msg, at) { found = msg; foundAccount = at.account; foundMailbox = at.mailbox; }
+    \(accountCheck)
+    """
+
+        switch messageHandle(messageId) {
+        case .unmatchable:
+            // Nothing can carry this identifier, so `found` stays null and the
+            // caller reports it not found -- the same answer the search used to
+            // arrive at, without the Apple Events.
+            return preamble
+
+        case .numeric(let id):
+            return """
+    \(preamble)
+    (function() {
+        var byId = mail.inbox.messages.byId(\(id));
+        var here = false;
+        try { here = byId.exists(); } catch (e) { here = false; }
+        if (!here) return;
+        var at = fmLocate(byId);
+        if (at === null || !fmInScope(at)) return;
+        fmBind(byId, at);
+    })();
+    """
+
+        case .rfc(let rfcId):
+            let escapedMailbox = escapeJSString(mailbox)
+            let escapedRfc = escapeJSString(rfcId)
+            return """
+    \(collectBoxesJXA(account: account, varName: "fmBoxes"))
+    \(preamble)
     (function() {
         var targetLC = '\(escapedMailbox)'.toLowerCase();
-        var TARGET = '\(escapedId)'.replace(/^</, '').replace(/>$/, '');
-        var BY_RFC = TARGET.indexOf('@') !== -1;
+        var TARGET = '\(escapedRfc)';
         function searchIn(subset) {
             for (var i = 0; i < subset.length; i++) {
-                var ids;
-                try {
-                    ids = BY_RFC ? subset[i].mbox.messages.messageId() : subset[i].mbox.messages.id();
-                } catch (e) { continue; }
-                for (var k = 0; k < ids.length; k++) {
-                    if (ids[k] == null) continue;
-                    var candidate = ('' + ids[k]).replace(/^</, '').replace(/>$/, '');
-                    if (candidate === TARGET) {
-                        found = subset[i].mbox.messages[k];
-                        foundAccount = subset[i].acctName;
-                        foundMailbox = subset[i].name;
-                        return true;
+                for (var attempt = 0; attempt < \(findAttempts); attempt++) {
+                    var rfcs = null;
+                    try { rfcs = subset[i].mbox.messages.messageId(); } catch (e) { break; }
+                    var k = -1;
+                    for (var r = 0; r < rfcs.length; r++) {
+                        if (fmBare(rfcs[r]) === TARGET) { k = r; break; }
                     }
+                    if (k < 0) break;
+                    var ids = null;
+                    try { ids = subset[i].mbox.messages.id(); } catch (e) { break; }
+                    // Two Apple Events, so the mailbox can have changed between
+                    // them. Nothing below trusts that it did not.
+                    if (ids.length !== rfcs.length || ids[k] == null) continue;
+                    var numeric = parseInt('' + ids[k], 10);
+                    if (!isFinite(numeric)) continue;
+                    var cand = mail.inbox.messages.byId(numeric);
+                    var got = null;
+                    try { got = cand.messageId(); } catch (e) { continue; }
+                    // The message answering for itself. A pairing shifted by an
+                    // arrival between the two columns fails here and is retried.
+                    if (fmBare(got) !== TARGET) continue;
+                    var at = fmLocate(cand);
+                    if (at === null || !fmInScope(at)) continue;
+                    fmBind(cand, at);
+                    return true;
                 }
             }
             return false;
@@ -767,6 +970,7 @@ enum MailService {
         if (!searchIn(named)) searchIn(rest);
     })();
     """
+        }
     }
 
     /// JXA snippet resolving a mailbox by name *inside one account*, named by a
@@ -780,6 +984,11 @@ enum MailService {
     /// Bob's INBOX ended up in *Alice's* Archive with the source copy gone:
     /// every account has an `Archive`, a `Sent`, a `Trash` and a `Drafts`, so
     /// the collision is the normal case rather than an unlucky one.
+    ///
+    /// Both the account and the mailbox are bound by name rather than by
+    /// position (`boundByNameJXA`), because the destination is resolved and then
+    /// held across the assignment that does the move -- the widest window in the
+    /// service, and the same #50 shape one level up from messages.
     ///
     /// Sets `<varName>` to the mailbox and `<varName>Account` to the name of the
     /// account it came from, so the caller can report where the message went.
@@ -795,13 +1004,14 @@ enum MailService {
     ) -> String {
         let escapedMailbox = escapeJSString(mailbox)
         return """
+    \(boundByNameJXA)
     var \(varName)Account = null;
     var \(varName) = (function() {
         var wantName = '\(escapedMailbox)'.toLowerCase();
         var wantAcct = \(accountExpr);
         function pick(boxes) {
             for (var i = 0; i < boxes.length; i++) {
-                if (('' + boxes[i].name()).toLowerCase() === wantName) return boxes[i];
+                if (boxes[i].name.toLowerCase() === wantName) return boxes[i];
             }
             return null;
         }
@@ -811,25 +1021,25 @@ enum MailService {
         // the folder they meant.
         function nameList(boxes) {
             var names = [];
-            for (var n = 0; n < boxes.length && n < 25; n++) names.push('' + boxes[n].name());
+            for (var n = 0; n < boxes.length && n < 25; n++) names.push(boxes[n].name);
             if (boxes.length > names.length) names.push('...');
             return names.join(', ');
         }
         if (wantAcct !== null && ('' + wantAcct).toLowerCase() !== 'on my mac') {
-            var accts = mail.accounts();
+            var accts = boundByName(mail.accounts);
             for (var a = 0; a < accts.length; a++) {
-                if (('' + accts[a].name()).toLowerCase() === ('' + wantAcct).toLowerCase()) {
-                    var boxes = accts[a].mailboxes();
+                if (accts[a].name.toLowerCase() === ('' + wantAcct).toLowerCase()) {
+                    var boxes = boundByName(accts[a].element.mailboxes);
                     var hit = pick(boxes);
-                    if (hit) { \(varName)Account = '' + accts[a].name(); return hit; }
-                    throw new Error('account "' + accts[a].name() + '" has no mailbox named "\(escapedMailbox)"; it has: ' + nameList(boxes));
+                    if (hit) { \(varName)Account = accts[a].name; return hit.element; }
+                    throw new Error('account "' + accts[a].name + '" has no mailbox named "\(escapedMailbox)"; it has: ' + nameList(boxes));
                 }
             }
             throw new Error('account not found: ' + wantAcct);
         }
-        var localBoxes = mail.mailboxes();
+        var localBoxes = boundByName(mail.mailboxes);
         var localHit = pick(localBoxes);
-        if (localHit) { \(varName)Account = 'On My Mac'; return localHit; }
+        if (localHit) { \(varName)Account = 'On My Mac'; return localHit.element; }
         throw new Error('no mailbox named "\(escapedMailbox)" in On My Mac; it has: ' + nameList(localBoxes));
     })();
     """
@@ -1207,6 +1417,59 @@ enum MailService {
         }
     }
 
+    /// The JXA for one body-scan batch: the bodies of a known set of ids in one
+    /// mailbox, minus the `var mail = Application('Mail');` line.
+    ///
+    /// Not private, and split from the caller, because the binding is the whole
+    /// point and only running it against a mailbox that changes can prove it.
+    ///
+    /// Each body is fetched off a specifier bound by the id it is attributed to.
+    /// This used to read the id column and then take `mb.messages[i].content()`
+    /// at the matching index -- its own comment claimed to locate by id and did
+    /// the opposite -- so a message arriving mid-call put one message's body
+    /// under another message's id, and the row returned as a body-search hit was
+    /// not the message whose body matched (#50). Nothing is read by index here,
+    /// and the ids are already known, so no column is fetched at all.
+    ///
+    /// `byId` resolves across every mailbox, so a message that has left this one
+    /// since the metadata scan would still answer. Its mailbox is checked,
+    /// because the row carries the mailbox it was found in and that claim has to
+    /// stay true.
+    static func bodyFetchScriptJXA(account: String, mailbox: String, ids: [String]) -> String {
+        let escapedAccount = escapeJSString(account)
+        let escapedMailbox = escapeJSString(mailbox)
+        let wantedLiteral = ids.map { "'\(escapeJSString($0))'" }.joined(separator: ",")
+        return """
+\(boundByNameJXA)
+var WANT = [\(wantedLiteral)];
+var mb = (function() {
+    var boxes = [];
+    var accts = boundByName(mail.accounts);
+    for (var i = 0; i < accts.length; i++) {
+        if (accts[i].name === '\(escapedAccount)') { boxes = boundByName(accts[i].element.mailboxes); break; }
+    }
+    if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = boundByName(mail.mailboxes);
+    for (var j = 0; j < boxes.length; j++) {
+        if (boxes[j].name === '\(escapedMailbox)') return boxes[j].element;
+    }
+    return null;
+})();
+var out = [];
+if (mb) {
+    for (var i = 0; i < WANT.length; i++) {
+        var numeric = parseInt(WANT[i], 10);
+        if (!isFinite(numeric)) continue;
+        try {
+            var m = mb.messages.byId(numeric);
+            if (('' + m.mailbox.name()) !== '\(escapedMailbox)') continue;
+            out.push({id: WANT[i], body: '' + m.content()});
+        } catch (e) {}
+    }
+}
+JSON.stringify(out);
+"""
+    }
+
     /// Fetches message bodies for a bounded candidate set and returns the ones
     /// matching `query`.
     ///
@@ -1246,36 +1509,9 @@ enum MailService {
             guard remaining > 0 else { complete = false; break }
             let budget = min(remaining, Double(rows.count) * bodyFetchBudget + 30)
 
-            let escapedAccount = escapeJSString(key.account)
-            let escapedMailbox = escapeJSString(key.mailbox)
-            let wantedLiteral = wanted.map { "'\(escapeJSString($0))'" }.joined(separator: ",")
-            // Locate by id rather than by stored index: messages arriving between
-            // the metadata scan and this call would shift positions.
             let script = """
             var mail = Application('Mail');
-            var WANT = Object.create(null);
-            [\(wantedLiteral)].forEach(function(k) { WANT[k] = 1; });
-            var mb = (function() {
-                var boxes = [];
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name() === '\(escapedAccount)') { boxes = accts[i].mailboxes(); break; }
-                }
-                if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = mail.mailboxes();
-                for (var j = 0; j < boxes.length; j++) {
-                    if ('' + boxes[j].name() === '\(escapedMailbox)') return boxes[j];
-                }
-                return null;
-            })();
-            var out = [];
-            if (mb) {
-                var ids = mb.messages.id();
-                for (var i = 0; i < ids.length; i++) {
-                    if (!WANT['' + ids[i]]) continue;
-                    try { out.push({id: '' + ids[i], body: '' + mb.messages[i].content()}); } catch (e) {}
-                }
-            }
-            JSON.stringify(out);
+            \(bodyFetchScriptJXA(account: key.account, mailbox: key.mailbox, ids: wanted))
             """
 
             let (output, error) = runJXA(script, retries: 0, timeout: budget, scopable: true)
@@ -1588,13 +1824,15 @@ enum MailService {
     private static let resolveOutgoingJXA = """
     var newMessageId = draft.id();
     var msg = (function() {
-        var open = mail.outgoingMessages();
-        for (var i = 0; i < open.length; i++) {
-            var candidate = null;
-            try { candidate = open[i].id(); } catch (e) { continue; }
-            if (candidate === newMessageId) return open[i];
-        }
-        return null;
+        // `byId`, not a walk ending in `open[i]`. A positional specifier
+        // re-resolves by position on every access, and this reference is held
+        // across setting the recipients, the body and the attachments, then the
+        // send -- so another compose message appearing in the collection
+        // meanwhile would move it onto a different message (#50).
+        var byId = mail.outgoingMessages.byId(newMessageId);
+        var here = false;
+        try { here = byId.exists(); } catch (e) { here = false; }
+        return here ? byId : null;
     })();
     if (!msg) { throw new Error('could not identify the newly created message in Mail; nothing was sent or saved'); }
     """
@@ -1814,59 +2052,104 @@ enum MailService {
     /// saved IMAP draft is short-lived — the server takes the upload and hands
     /// back its own copy, and the local one is gone — so the RFC Message-ID
     /// goes back too, and `mail_get_email` accepts either.
+    /// JXA that finds the draft just saved and names it, defining `savedDraft`.
+    ///
+    /// Nothing in the compose script can hand the saved message back: `save`
+    /// returns nothing, and the outgoing message it was composed from is not the
+    /// draft the account filed. So the draft is found by subject in the
+    /// account's Drafts mailbox, newest id first.
+    ///
+    /// The id and subject columns are separate Apple Events, so the newest id
+    /// carrying that subject is a **guess** until the message confirms it.
+    /// Binding by that id and reading the subject back off the bound message is
+    /// what turns it into an answer -- and it is the handle `body_check` then
+    /// fetches a source for, so naming the wrong message here would check the
+    /// wrong draft's body (#50). The Message-ID is read off the same bound
+    /// message rather than out of a third column, which is one Apple Event
+    /// fewer and one fewer thing to zip by index.
+    ///
+    /// Not private: this is the fourth place the same positional binding was
+    /// found, and it can only be pinned by running it against a mailbox that
+    /// changes between two column fetches.
+    static func savedDraftLookupJXA(account: String?, from: String?, subject: String) -> String {
+        let acctExpr = account.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
+        let fromExpr = from.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
+        return """
+\(boundByNameJXA)
+var savedDraft = (function() {
+    var wantAcct = \(acctExpr);
+    var wantFrom = \(fromExpr);
+    var SUBJECT = '\(escapeJSString(subject))';
+    try {
+        var accts = boundByName(mail.accounts);
+        for (var i = 0; i < accts.length; i++) {
+            var name = accts[i].name;
+            var match = wantAcct !== null && name.toLowerCase() === wantAcct;
+            if (!match && wantFrom !== null) {
+                var addrs = accts[i].element.emailAddresses();
+                for (var a = 0; a < addrs.length; a++) {
+                    if (('' + addrs[a]).toLowerCase() === wantFrom) { match = true; break; }
+                }
+            }
+            if (!match) continue;
+            var mbs = boundByName(accts[i].element.mailboxes);
+            for (var j = 0; j < mbs.length; j++) {
+                if (mbs[j].name.toLowerCase() !== 'drafts') continue;
+                var drafts = mbs[j].element;
+                // The id and subject columns are separate Apple Events,
+                // so the newest id carrying this subject is a guess
+                // until the message itself confirms it. Binding by that
+                // id and reading the subject back off the bound message
+                // is what turns it into an answer -- and it is the
+                // handle `body_check` then fetches a source for, so
+                // naming the wrong message here would check the wrong
+                // draft's body (#50). The third column this used to
+                // fetch is gone: the Message-ID is read off the message.
+                for (var attempt = 0; attempt < \(findAttempts); attempt++) {
+                    var ids = drafts.messages.id();
+                    var subs = drafts.messages.subject();
+                    if (ids.length !== subs.length) continue;
+                    var best = -1;
+                    for (var k = 0; k < ids.length; k++) {
+                        if (('' + subs[k]) !== SUBJECT) continue;
+                        if (best < 0 || ids[k] > ids[best]) best = k;
+                    }
+                    if (best < 0) break;
+                    var numeric = parseInt('' + ids[best], 10);
+                    if (!isFinite(numeric)) break;
+                    var saved = drafts.messages.byId(numeric);
+                    var gotSubject = null;
+                    try { gotSubject = '' + saved.subject(); } catch (e) { continue; }
+                    if (gotSubject !== SUBJECT) continue;
+                    var rfc = '';
+                    try { var r = saved.messageId(); rfc = r == null ? '' : '' + r; } catch (e) {}
+                    return {
+                        account: name,
+                        mailbox: mbs[j].name,
+                        message_id: '' + ids[best],
+                        rfc_message_id: rfc
+                    };
+                }
+            }
+        }
+    } catch (e) { return {lookup_error: '' + e}; }
+    return null;
+})();
+"""
+    }
+
     private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
         let subject = args?["subject"]?.stringValue ?? ""
-
-        let acctExpr = account.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
-        let fromExpr = from.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
 
         let finalAction = """
         mail.save(msg);
         result.status = 'draft created';
         // Let the account file the saved draft before looking for it.
         $.NSThread.sleepForTimeInterval(1.5);
-        result.draft = (function() {
-            var wantAcct = \(acctExpr);
-            var wantFrom = \(fromExpr);
-            var SUBJECT = '\(escapeJSString(subject))';
-            try {
-                var accts = mail.accounts();
-                for (var i = 0; i < accts.length; i++) {
-                    var name = '' + accts[i].name();
-                    var match = wantAcct !== null && name.toLowerCase() === wantAcct;
-                    if (!match && wantFrom !== null) {
-                        var addrs = accts[i].emailAddresses();
-                        for (var a = 0; a < addrs.length; a++) {
-                            if (('' + addrs[a]).toLowerCase() === wantFrom) { match = true; break; }
-                        }
-                    }
-                    if (!match) continue;
-                    var mbs = accts[i].mailboxes();
-                    for (var j = 0; j < mbs.length; j++) {
-                        if (('' + mbs[j].name()).toLowerCase() !== 'drafts') continue;
-                        var ids = mbs[j].messages.id();
-                        var subs = mbs[j].messages.subject();
-                        var rfcs = mbs[j].messages.messageId();
-                        var best = -1;
-                        for (var k = 0; k < ids.length; k++) {
-                            if (('' + subs[k]) !== SUBJECT) continue;
-                            if (best < 0 || ids[k] > ids[best]) best = k;
-                        }
-                        if (best >= 0) {
-                            return {
-                                account: name,
-                                mailbox: '' + mbs[j].name(),
-                                message_id: '' + ids[best],
-                                rfc_message_id: rfcs[best] == null ? '' : '' + rfcs[best]
-                            };
-                        }
-                    }
-                }
-            } catch (e) { return {lookup_error: '' + e}; }
-            return null;
-        })();
+        \(savedDraftLookupJXA(account: account, from: from, subject: subject))
+        result.draft = savedDraft;
         """
         // Read the saved draft back off the server and compare its text/plain
         // part with the body that was asked for. Mail rewrites the body of
@@ -2553,8 +2836,6 @@ enum MailService {
     if (!found) {
         moveResult = {error: 'message not found with id: \(escapedId)'};
     } else {
-        var sourceAccount = foundAccount;
-        var sourceMailboxName = foundMailbox;
         // Read the identifiers before the move: assigning `mailbox` invalidates
         // the reference, and every property read on it afterwards raises
         // "Invalid index". The RFC Message-ID is what the read-back matches on,
@@ -2567,6 +2848,17 @@ enum MailService {
         try { numericId = '' + found.id(); } catch (e) {}
     \(destination)
         var destName = '' + destMbox.name();
+        // Where the message is *now*. Resolving the destination is dozens of
+        // Apple Events, and `moved_from` claims to describe the move that is
+        // about to happen rather than the state the search left behind. `found`
+        // is bound by id, so this either answers for the same message or says
+        // it has gone -- which is the one case where refusing beats moving.
+        var origin = fmLocate(found);
+        if (origin === null) {
+            moveResult = {error: 'message \(escapedId) is no longer in Mail; nothing was moved'};
+        } else {
+        var sourceAccount = origin.account;
+        var sourceMailboxName = origin.mailbox;
         found.mailbox = destMbox;
         // Read back where the message actually landed. `moved` on its own said
         // nothing about the destination, which is exactly why a cross-account
@@ -2593,10 +2885,18 @@ enum MailService {
             status: 'moved',
             account: destMboxAccount,
             mailbox: destName,
+            // Which message this happened to. The result used to name only the
+            // destination, so a message filed under the wrong id was invisible
+            // in it (#50). The numeric id does not survive an IMAP re-file, so
+            // it identifies what was acted on rather than what to ask for next;
+            // the RFC Message-ID does survive, and is the handle to use.
+            message_id: numericId,
+            rfc_message_id: rfcId,
             moved_from: {account: sourceAccount, mailbox: sourceMailboxName},
             cross_account: destMboxAccount !== sourceAccount,
             verified: verified
         };
+        }
     }
     JSON.stringify(moveResult);
     """
