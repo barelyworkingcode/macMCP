@@ -78,6 +78,85 @@ final class MailSourceFidelityTests: XCTestCase {
         XCTAssertTrue(fidelity.exact)
     }
 
+    // MARK: - A message Mail has not finished downloading (#31)
+
+    func testASourceShorterThanTheMessageIsReportedAsIncomplete() throws {
+        // 838 bytes of a 300 KB message, which is what `source()` returns while
+        // Mail is still fetching. Nothing in the old response distinguished that
+        // from an 838-byte message.
+        let fragment = Data(repeating: 0x41, count: 800) + Data("\n".utf8)
+        let fidelity = MailService.sourceFidelity(fragment, expectedSize: 300_511)
+        XCTAssertFalse(fidelity.complete)
+        XCTAssertFalse(fidelity.exact)
+        let note = try XCTUnwrap(fidelity.note)
+        XCTAssertTrue(note.contains("fragment"), note)
+        XCTAssertTrue(note.contains("300511"), note)
+    }
+
+    func testTheReturnedBytesAreWeighedInTheUnitsMailQuotes() {
+        // messageSize is the wire size, and the bytes here came through a
+        // CRLF->LF transform, so one CR goes back on for each LF before the
+        // comparison. Without that every complete message would look 1 byte per
+        // line short and report itself a fragment.
+        let source = Data("From: a@b.c\nSubject: x\n\nbody\n".utf8)
+        XCTAssertEqual(source.count, 29)
+        let fidelity = MailService.sourceFidelity(source, expectedSize: 33)
+        XCTAssertEqual(fidelity.wireSize, 33, "4 LFs, so 4 CRs come back")
+        XCTAssertTrue(fidelity.complete)
+    }
+
+    func testASourceMailCannotSizeIsNotAccusedOfBeingIncomplete() {
+        // `messageSize` failing is not evidence of anything, and reporting a
+        // guess as a fact is what this whole seam exists to stop.
+        let fidelity = MailService.sourceFidelity(Data("Subject: x\r\n".utf8), expectedSize: nil)
+        XCTAssertTrue(fidelity.complete)
+        XCTAssertTrue(fidelity.exact)
+        XCTAssertNil(fidelity.dict["message_size"])
+    }
+
+    func testCompletenessIsReportedEvenWhenNothingElseIsWrong() {
+        let dict = MailService.sourceFidelity(Data("Subject: x\r\n".utf8), expectedSize: 12).dict
+        XCTAssertEqual(dict["complete"] as? Bool, true)
+        XCTAssertEqual(dict["message_size"] as? Int, 12)
+    }
+
+    // MARK: - The size line the fetch script prints
+
+    func testTheSizeLineIsSplitOffTheFrontOfTheSource() {
+        var raw = Data("MACMCP-SIZE:418\n".utf8)
+        raw.append(Data("Return-Path: <a@b.c>\nSubject: x\n".utf8))
+        let (size, body) = MailService.splitSourceSizeMarker(raw)
+        XCTAssertEqual(size, 418)
+        XCTAssertEqual(body, Data("Return-Path: <a@b.c>\nSubject: x\n".utf8))
+    }
+
+    func testAMessageMailWouldNotSizeComesBackWithNoSizeAndAllItsBytes() {
+        // The script prints -1 when `messageSize` raised. That is "unknown",
+        // not "zero bytes", and the source is untouched either way.
+        var raw = Data("MACMCP-SIZE:-1\n".utf8)
+        raw.append(Data("Subject: x\n".utf8))
+        let (size, body) = MailService.splitSourceSizeMarker(raw)
+        XCTAssertNil(size)
+        XCTAssertEqual(body, Data("Subject: x\n".utf8))
+    }
+
+    func testAFirstLineThatMerelyLooksLikeTheMarkerIsNotEaten() {
+        // A message really can begin with anything, and losing its first line to
+        // a loose prefix match would be a new corruption in the code that exists
+        // to stop corruption going unreported.
+        for impostor in [
+            "MACMCP-SIZE:not-a-number\nSubject: x\n",
+            "MACMCP-SIZE\nSubject: x\n",
+            "X-MACMCP-SIZE:418\nSubject: x\n",
+            "Subject: MACMCP-SIZE:418\n"
+        ] {
+            let raw = Data(impostor.utf8)
+            let (size, body) = MailService.splitSourceSizeMarker(raw)
+            XCTAssertNil(size, impostor)
+            XCTAssertEqual(body, raw, impostor)
+        }
+    }
+
     // MARK: - The shape a caller sees
 
     func testTheReportedObjectCarriesBothCaveatsAtOnce() throws {

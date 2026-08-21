@@ -960,13 +960,18 @@ enum MailService {
         messageId: String
     ) -> [[String: Any]] {
         guard !attachments.isEmpty else { return attachments }
-        let (source, error) = fetchSource(
+        let (source, expectedSize, error) = fetchSource(
             account: account,
             mailbox: mailbox,
             messageId: messageId,
             timeout: attachmentTypeFetchTimeout
         )
-        guard error == nil else { return attachments.map(withFilenameGuess) }
+        // A fragment of a message Mail is still downloading declares nothing
+        // useful about attachments that are not in it yet, so the filename guess
+        // stays rather than being replaced with a worse answer.
+        guard error == nil, sourceFidelity(source, expectedSize: expectedSize).complete else {
+            return attachments.map(withFilenameGuess)
+        }
         return declaredAttachmentTypes(attachments, source: source)
     }
 
@@ -1684,7 +1689,7 @@ enum MailService {
                 ?? (draft["message_id"] as? String)
             guard let identifier else { return payload }
 
-            let (source, fetchError) = fetchSource(
+            let (source, _, fetchError) = fetchSource(
                 account: draft["account"] as? String,
                 mailbox: draft["mailbox"] as? String ?? "Drafts",
                 messageId: identifier
@@ -1784,12 +1789,30 @@ enum MailService {
         let lineEndings: String
         /// How many bytes equal `0x80`. Each one may be a NUL that was lost.
         let ambiguousNulBytes: Int
+        /// The wire size Mail reports for the message, when it could be read.
+        let expectedSize: Int?
+        /// What the returned bytes would measure on the wire: one CR back for
+        /// every LF, since that is the transform they came through.
+        let wireSize: Int
+
+        /// False when Mail was still downloading and handed over a fragment --
+        /// 838 bytes of a 300 KB message in one measurement, with nothing in the
+        /// old response to distinguish that from a 838-byte message.
+        var complete: Bool {
+            guard let expectedSize else { return true }
+            return wireSize >= expectedSize
+        }
 
         /// True when nothing known to be lossy is visible in these bytes.
-        var exact: Bool { (lineEndings == "crlf" || lineEndings == "none") && ambiguousNulBytes == 0 }
+        var exact: Bool {
+            complete && (lineEndings == "crlf" || lineEndings == "none") && ambiguousNulBytes == 0
+        }
 
         var note: String? {
             var sentences: [String] = []
+            if !complete, let expectedSize {
+                sentences.append("Mail had only \(wireSize) of this message's \(expectedSize) bytes when the source was read and did not finish downloading the rest within the wait, so what is here is a fragment rather than the message. Try again in a moment.")
+            }
             if lineEndings == "lf" || lineEndings == "mixed" {
                 sentences.append("Mail hands a source back with LF line endings where the message on the server has CRLF, so a byte comparison against the server's copy differs on every line break.")
             }
@@ -1802,15 +1825,17 @@ enum MailService {
         var dict: [String: Any] {
             var out: [String: Any] = [
                 "exact": exact,
+                "complete": complete,
                 "line_endings": lineEndings,
                 "ambiguous_nul_bytes": ambiguousNulBytes
             ]
+            if let expectedSize { out["message_size"] = expectedSize }
             if let note { out["note"] = note }
             return out
         }
     }
 
-    static func sourceFidelity(_ data: Data) -> SourceFidelity {
+    static func sourceFidelity(_ data: Data, expectedSize: Int? = nil) -> SourceFidelity {
         var crlf = 0, bareLF = 0, bareCR = 0, nulCandidates = 0
         var previous: UInt8 = 0
         for byte in data {
@@ -1831,7 +1856,63 @@ enum MailService {
         case (0, _): endings = bareLF > 0 && bareCR == 0 ? "lf" : "mixed"
         default: endings = "mixed"
         }
-        return SourceFidelity(lineEndings: endings, ambiguousNulBytes: nulCandidates)
+        return SourceFidelity(
+            lineEndings: endings,
+            ambiguousNulBytes: nulCandidates,
+            expectedSize: expectedSize,
+            // Every LF here stood for a CRLF on the wire, so this is what these
+            // bytes weigh in the units `messageSize` is quoted in.
+            wireSize: data.count + crlf + bareLF
+        )
+    }
+
+    /// How long the source fetch waits for Mail to finish downloading a message
+    /// it has only part of, and how often it looks.
+    static let sourceCompletionAttempts = 20
+    static let sourceCompletionInterval = 0.5
+
+    /// Marks the size line the source script prints ahead of the message.
+    ///
+    /// The source itself is raw bytes on stdout, so there is nowhere else to put
+    /// the size without either corrupting it or paying for a second osascript
+    /// spawn. One ASCII line, stripped only when it is exactly this shape.
+    private static let sourceSizeMarker = "MACMCP-SIZE:"
+
+    /// The source fetch, minus the `var mail = Application('Mail');` line.
+    ///
+    /// Not private, and split from the handler, for the same reason the move
+    /// script is: the logic worth testing is in the JavaScript. `attempts` and
+    /// `interval` are parameters so a test can run the wait without spending ten
+    /// seconds on it.
+    ///
+    /// `source()` returns what Mail has downloaded so far, which for a message
+    /// still arriving is the headers and a fragment -- 838 bytes of a 300 KB
+    /// message in one measurement, reported as the whole thing (#31). So the
+    /// script asks Mail how big the message is and waits, bounded, for the bytes
+    /// to add up. `messageSize` is the wire size, and every LF in a returned
+    /// source stands for one CRLF on the wire, which makes the check exact
+    /// rather than a heuristic.
+    static func sourceScriptJXA(
+        account: String?,
+        mailbox: String,
+        messageId: String,
+        attempts: Int = sourceCompletionAttempts,
+        interval: Double = sourceCompletionInterval
+    ) -> String {
+        """
+        \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
+        if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
+        var expected = -1;
+        try { expected = found.messageSize(); } catch (e) {}
+        function wireLength(s) { return s.length + (s.split('\\n').length - 1); }
+        var src = '' + found.source();
+        for (var attempt = 0; attempt < \(attempts) && expected > 0 && wireLength(src) < expected; attempt++) {
+            delay(\(interval));
+            src = '' + found.source();
+        }
+        var sourceResult = '\(sourceSizeMarker)' + expected + '\\n' + src;
+        sourceResult;
+        """
     }
 
     private static func fetchSource(
@@ -1839,21 +1920,36 @@ enum MailService {
         mailbox: String,
         messageId: String,
         timeout: TimeInterval = sourceFetchTimeout
-    ) -> (data: Data, error: String?) {
+    ) -> (data: Data, expectedSize: Int?, error: String?) {
         let script = """
         var mail = Application('Mail');
-        \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
-        if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
-        '' + found.source();
+        \(sourceScriptJXA(account: account, mailbox: mailbox, messageId: messageId))
         """
         let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true)
         if let error {
             if error.contains("message not found") {
-                return (Data(), "message not found with id: \(messageId)")
+                return (Data(), nil, "message not found with id: \(messageId)")
             }
-            return (Data(), error)
+            return (Data(), nil, error)
         }
-        return (decodeSourceBytes(data), nil)
+        let (size, body) = splitSourceSizeMarker(data)
+        return (decodeSourceBytes(body), size, nil)
+    }
+
+    /// Splits the size line off the front of the script's output.
+    ///
+    /// Not private, and separate from the fetch, because a first line that only
+    /// *looks* like the marker must not cost the caller a line of their message.
+    /// Anything that is not exactly `MACMCP-SIZE:<digits>\n` is left alone.
+    static func splitSourceSizeMarker(_ raw: Data) -> (size: Int?, body: Data) {
+        let marker = Data(sourceSizeMarker.utf8)
+        guard raw.starts(with: marker),
+              let newline = raw.firstIndex(of: 0x0A) else { return (nil, raw) }
+        let digits = raw[(raw.startIndex + marker.count)..<newline]
+        guard !digits.isEmpty,
+              digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 || $0 == 0x2D }),
+              let size = Int(String(decoding: digits, as: UTF8.self)) else { return (nil, raw) }
+        return (size > 0 ? size : nil, Data(raw[(newline + 1)...]))
     }
 
     /// Strips anything that could steer a filename out of the destination
@@ -1894,12 +1990,20 @@ enum MailService {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let overwrite = args?["overwrite"]?.boolValue ?? false
 
-        let (data, fetchError) = fetchSource(
+        let (data, expectedSize, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId
         )
         if let fetchError { return errorResult(fetchError) }
+
+        // Refuse rather than write a file cut out of a fragment. An attachment
+        // saved from a half-downloaded message is silently wrong on disk, which
+        // is worse than a failure the caller can retry.
+        let fidelity = sourceFidelity(data, expectedSize: expectedSize)
+        if !fidelity.complete, let expectedSize {
+            return errorResult("Mail has only \(fidelity.wireSize) of this message's \(expectedSize) bytes and did not finish downloading it — attachments cut from that would be truncated. Try again in a moment.")
+        }
 
         let all = MIME.attachments(of: MIME.parse(data))
         guard !all.isEmpty else {
@@ -1966,7 +2070,7 @@ enum MailService {
             // Of the source the attachments were cut out of. What is written to
             // disk is only as faithful as what Mail handed over, and a caller
             // saving an 8bit part has no other way to learn that.
-            "fidelity": sourceFidelity(data).dict,
+            "fidelity": fidelity.dict,
             "message_id": messageId
         ])
     }
@@ -1976,12 +2080,13 @@ enum MailService {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let (data, fetchError) = fetchSource(
+        let (data, expectedSize, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId
         )
         if let fetchError { return errorResult(fetchError) }
+        let fidelity = sourceFidelity(data, expectedSize: expectedSize)
 
         if let saveTo = args?["save_to"]?.stringValue {
             let url = URL(fileURLWithPath: (saveTo as NSString).expandingTildeInPath)
@@ -1998,7 +2103,7 @@ enum MailService {
                 "path": url.path,
                 "bytes": data.count,
                 "message_id": messageId,
-                "fidelity": sourceFidelity(data).dict
+                "fidelity": fidelity.dict
             ])
         }
 
@@ -2016,7 +2121,7 @@ enum MailService {
             // caveats are properties of how Mail handed the message over, and a
             // caller asking for the first kilobyte still needs to know that the
             // rest of it is subject to them.
-            "fidelity": sourceFidelity(data).dict,
+            "fidelity": fidelity.dict,
             "message_id": messageId
         ])
     }
@@ -2366,7 +2471,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -2387,7 +2492,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server: every result reports fidelity, because Mail hands a source over with LF line endings where the message has CRLF, and turns any NUL byte into 0x80 before macMCP sees it (so each 0x80 may be a real 0x80 or a lost NUL). Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server: every result reports fidelity, because Mail hands a source over with LF line endings where the message has CRLF, and turns any NUL byte into 0x80 before macMCP sees it (so each 0x80 may be a real 0x80 or a lost NUL). fidelity.complete says whether Mail had finished downloading the message — the fetch waits for it, and reports a fragment as one rather than passing it off as the message. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),

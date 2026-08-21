@@ -87,7 +87,7 @@ enum JXA {
 enum MailStubJS {
     static let source = """
     function makeMail(spec) {
-        var log = {moves: [], created: [], sent: [], saved: [], bodies: []};
+        var log = {moves: [], created: [], sent: [], saved: [], bodies: [], sourceReads: []};
 
         function makeMessage(m, box) {
             var msg = {
@@ -95,9 +95,27 @@ enum MailStubJS {
                 _messageId: m.messageId == null ? null : m.messageId,
                 _subject: m.subject == null ? '' : m.subject,
                 _box: box,
+                // `sources` models a message arriving: each call to source()
+                // returns the next entry, and the last one repeats. One entry is
+                // a message Mail already has in full. `size` is Mail's
+                // messageSize -- the wire size, CRLFs included -- and is left
+                // undefined to model the property raising, which it does for
+                // some messages.
+                _sources: m.sources == null ? [m.source == null ? '' : m.source] : m.sources,
+                _sourceReads: 0,
                 id: function() { return this._id; },
                 messageId: function() { return this._messageId; },
-                subject: function() { return this._subject; }
+                subject: function() { return this._subject; },
+                source: function() {
+                    var at = Math.min(this._sourceReads, this._sources.length - 1);
+                    this._sourceReads++;
+                    log.sourceReads.push({id: this._id, index: at});
+                    return this._sources[at];
+                },
+                messageSize: function() {
+                    if (m.size == null) throw new Error('AppleEvent handler failed.');
+                    return m.size;
+                }
             };
             // `found.mailbox = destMbox` is a property assignment in JXA, so the
             // stub records it through a setter rather than a method. The message
