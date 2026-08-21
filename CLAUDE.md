@@ -64,6 +64,34 @@ swift build              # debug
 
 Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3, AppKit. The binary embeds an `Info.plist` via `-sectcreate` for macOS permission prompts (Location Services).
 
+## Tests
+
+```bash
+swift test
+```
+
+`Tests/macMCPTests` tests the executable target directly (`@testable import macmcp`),
+so anything under test has to be at least `internal` — several Mail helpers are
+deliberately not `private` for that reason, and say so at their declaration.
+
+The suite must stay hermetic: **no test may talk to Mail.app, the network, or the
+user's own data.** Two patterns make that possible for a service that is mostly
+generated JavaScript:
+
+- **`JXA.run`** executes a script through `osascript -l JavaScript` with `mail`
+  bound to `MailStubJS`'s fake object graph instead of `Application('Mail')`.
+  Nothing calls `Application(...)`, so no Apple Event is sent and no TCC prompt
+  can appear — osascript is just a JavaScript engine. This is how the generated
+  scripts themselves (which is where the real logic lives) get tested.
+- **Pure seams.** Byte-level behaviour that used to be inline in a handler —
+  source decoding, truncation, attachment typing, the timeout message — is
+  factored into small `static` functions that take data and return data, so the
+  regression can be pinned without a mailbox.
+
+End-to-end checks against the local `testMail` fixture live outside this repo
+(`~/source/barelyworkingcode/testMail`); the ground truth for anything mail-shaped
+is the Maildir on disk, never a tool's own success return.
+
 ## Adding a Service
 
 1. Create `Sources/macMCP/Services/FooService.swift`

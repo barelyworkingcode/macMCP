@@ -111,6 +111,7 @@ Grant these in System Settings > Privacy & Security as needed:
 
 ```bash
 swift build              # debug
+swift test               # unit tests (hermetic: no Mail.app, no network)
 ./build.sh               # release, codesigned, installs to ~/.local/bin, registers with Relay
 ```
 

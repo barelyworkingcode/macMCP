@@ -22,6 +22,11 @@ let package = Package(
                     "-Xlinker", "Sources/macMCP/Info.plist",
                 ]),
             ]
+        ),
+        .testTarget(
+            name: "macMCPTests",
+            dependencies: ["macmcp"],
+            path: "Tests/macMCPTests"
         )
     ]
 )
