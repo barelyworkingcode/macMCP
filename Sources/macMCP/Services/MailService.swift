@@ -807,14 +807,89 @@ enum MailService {
             return textResult(output)
         }
         if let message = payload["error"] as? String { return errorResult(message) }
-        if var attachments = payload["attachments"] as? [[String: Any]] {
-            for i in attachments.indices {
-                attachments[i]["mime_type"] = MIME.mimeType(forFilename: attachments[i]["name"] as? String ?? "")
-            }
-            payload["attachments"] = attachments
+        if let attachments = payload["attachments"] as? [[String: Any]] {
+            payload["attachments"] = typedAttachments(
+                attachments,
+                account: payload["account"] as? String ?? args?["account"]?.stringValue,
+                mailbox: payload["mailbox"] as? String ?? mailbox,
+                messageId: messageId
+            )
             payload["has_attachments"] = !attachments.isEmpty
         }
         return jsonResult(payload)
+    }
+
+    /// Wall-clock allowance for the source fetch that types a message's
+    /// attachments. Shorter than a plain `mail_get_source`, because this is an
+    /// enrichment of a read that already worked: exceeding it costs the caller a
+    /// less precise `mime_type`, not the message.
+    private static let attachmentTypeFetchTimeout: TimeInterval = 45
+
+    /// Fills in each attachment's `mime_type` from the message's own headers,
+    /// falling back to the filename guess.
+    ///
+    /// Mail's `MIME type` property on `mail attachment` raises "AppleEvent
+    /// handler failed" on every message that has one, so the type used to be
+    /// inferred from the filename. That is a guess presented as a fact, and it
+    /// disagreed with `mail_save_attachment` -- which reads the declared type
+    /// out of the source -- for the same attachment: `text/csv` against
+    /// `image/png` for a part the message declares as `image/png; name="data.csv"`.
+    ///
+    /// So the type comes from the same place `mail_save_attachment` gets it. The
+    /// source fetch is the expensive part, so it only happens when the message
+    /// actually has attachments, and a failure leaves the filename guess in
+    /// place rather than costing the caller the message. `mime_type_source` says
+    /// which of the two the caller is looking at.
+    private static func typedAttachments(
+        _ attachments: [[String: Any]],
+        account: String?,
+        mailbox: String,
+        messageId: String
+    ) -> [[String: Any]] {
+        guard !attachments.isEmpty else { return attachments }
+        let (source, error) = fetchSource(
+            account: account,
+            mailbox: mailbox,
+            messageId: messageId,
+            timeout: attachmentTypeFetchTimeout
+        )
+        guard error == nil else { return attachments.map(withFilenameGuess) }
+        return declaredAttachmentTypes(attachments, source: source)
+    }
+
+    private static func withFilenameGuess(_ attachment: [String: Any]) -> [String: Any] {
+        var out = attachment
+        out["mime_type"] = MIME.mimeType(forFilename: attachment["name"] as? String ?? "")
+        out["mime_type_source"] = "filename"
+        return out
+    }
+
+    /// Matches Mail's attachment list against the parts in the raw source and
+    /// takes each type from the message.
+    ///
+    /// Matching is by name, consuming each declared part once so that two
+    /// attachments sharing a filename still get their own types in order. An
+    /// attachment with no counterpart in the source keeps the filename guess and
+    /// says so, rather than borrowing the type of an unrelated part.
+    static func declaredAttachmentTypes(
+        _ attachments: [[String: Any]],
+        source: Data
+    ) -> [[String: Any]] {
+        var declared: [String: [String]] = [:]
+        for part in MIME.attachments(of: MIME.parse(source)) {
+            declared[part.name.lowercased(), default: []].append(part.mimeType)
+        }
+        return attachments.map { attachment in
+            let key = (attachment["name"] as? String ?? "").lowercased()
+            guard var queue = declared[key], !queue.isEmpty else {
+                return withFilenameGuess(attachment)
+            }
+            var out = attachment
+            out["mime_type"] = queue.removeFirst()
+            out["mime_type_source"] = "declared"
+            declared[key] = queue
+            return out
+        }
     }
 
     /// Fetches message bodies for a bounded candidate set and returns the ones
@@ -1555,7 +1630,8 @@ enum MailService {
     private static func fetchSource(
         account: String?,
         mailbox: String,
-        messageId: String
+        messageId: String,
+        timeout: TimeInterval = sourceFetchTimeout
     ) -> (data: Data, error: String?) {
         let script = """
         var mail = Application('Mail');
@@ -1563,7 +1639,7 @@ enum MailService {
         if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
         '' + found.source();
         """
-        let (data, error) = runJXAData(script, retries: 0, timeout: sourceFetchTimeout, scopable: true)
+        let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true)
         if let error {
             if error.contains("message not found") {
                 return (Data(), "message not found with id: \(messageId)")
@@ -2008,7 +2084,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get full email by message ID, including the list of attachments (name, size, mime_type). Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
+                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
