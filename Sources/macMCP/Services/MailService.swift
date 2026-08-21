@@ -430,7 +430,13 @@ enum MailService {
     /// arrays that have already been fetched. The `slice` below is `Array.slice`
     /// on those results, not a specifier slice -- cheap, and not to be confused
     /// with the case above.
-    private static func scanScriptJXA(
+    /// The mailbox scan, minus the `var mail = Application('Mail');` line.
+    ///
+    /// Not private, and split from the handler, for the same reason the source
+    /// and move scripts are: the logic worth testing is in the JavaScript, and
+    /// a test has to be able to run it against a stub whose mailbox changes
+    /// underneath it.
+    static func scanScriptJXA(
         account: String?,
         mailbox: String,
         query: String?,
@@ -472,29 +478,60 @@ enum MailService {
         """
 
         return """
-        var mail = Application('Mail');
         \(queryLine)
         var LIMIT = \(max(limit, 1));
         \(collect)
         \(filter)
 
-        var rows = [], scanned = [], skipped = [], total = 0, messagesScanned = 0;
+        var rows = [], scanned = [], skipped = [], unstable = [], total = 0, messagesScanned = 0;
         // Gmail-style accounts file every message in both INBOX and "All Mail",
         // so ids are deduplicated across this account's mailboxes. Without it
         // `total` counts each message once per mailbox it appears in.
         var seen = Object.create(null);
+
+        // Each column below is its own Apple Event, and they are read in
+        // lockstep by index. A mailbox that changes between two of them pairs
+        // one message's id with another message's subject -- and the id is the
+        // handle mail_move, mail_mark_read and mail_get_email act on. So the id
+        // column is read again at the end and has to come back the same.
+        function unchanged(before, after) {
+            if (before.length !== after.length) return false;
+            for (var i = 0; i < before.length; i++) {
+                if ('' + before[i] !== '' + after[i]) return false;
+            }
+            return true;
+        }
+        function sameLength(ids, columns) {
+            for (var c = 0; c < columns.length; c++) {
+                if (columns[c] !== null && columns[c].length !== ids.length) return false;
+            }
+            return true;
+        }
+
         for (var e = 0; e < entries.length; e++) {
             var label = entries[e].acctName + ':' + entries[e].name;
             try {
                 var mb = entries[e].mbox;
-                var ids = mb.messages.id();
-                if (ids.length > 0) {
-                    var su = mb.messages.subject();
-                    var se = mb.messages.sender();
-                    var dt = mb.messages.dateReceived();
-                    var rd = mb.messages.readStatus();
-                    var tos = null, ccs = null, tns = null, cns = null;
+                var ids = null, su = null, se = null, dt = null, rd = null;
+                var tos = null, ccs = null, tns = null, cns = null;
+                var aligned = false;
+                // Three tries: a message arriving mid-scan is a moment, not a
+                // state, so the next read almost always lands cleanly.
+                for (var attempt = 0; attempt < 3 && !aligned; attempt++) {
+                    ids = mb.messages.id();
+                    if (ids.length === 0) { aligned = true; break; }
+                    su = mb.messages.subject();
+                    se = mb.messages.sender();
+                    dt = mb.messages.dateReceived();
+                    rd = mb.messages.readStatus();
         \(recipientFetch)
+                    aligned = sameLength(ids, [su, se, dt, rd, tos, ccs, tns, cns])
+                        && unchanged(ids, mb.messages.id());
+                }
+                // Reporting a mailbox as unread is a smaller wrong than
+                // reporting a message under another message's id.
+                if (!aligned) { unstable.push(label); continue; }
+                if (ids.length > 0) {
                     messagesScanned += ids.length;
                     var local = [];
                     for (var i = 0; i < ids.length; i++) {
@@ -527,7 +564,7 @@ enum MailService {
                 skipped.push(label);
             }
         }
-        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, matched: entries.length, messages_scanned: messagesScanned});
+        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, unstable: unstable, matched: entries.length, messages_scanned: messagesScanned});
         """
     }
 
@@ -552,6 +589,10 @@ enum MailService {
         var messagesScanned = 0
         var scanned: [String] = []
         var skipped: [String] = []
+        /// Mailboxes that changed while their columns were being read, so no
+        /// row from them could be trusted to pair the right id with the right
+        /// subject. Reported rather than silently dropped.
+        var unstable: [String] = []
         var failed: [String] = []
         var matchedMailbox = false
     }
@@ -605,13 +646,16 @@ enum MailService {
         // A `nil` target is Mail's local On-My-Mac mailboxes.
         for account in targets {
             let label = account ?? "On My Mac"
-            let script = scanScriptJXA(
+            let script = """
+            var mail = Application('Mail');
+            \(scanScriptJXA(
                 account: account,
                 mailbox: mailbox,
                 query: query,
                 searchRecipients: searchRecipients,
                 limit: limit
-            )
+            ))
+            """
             let (output, error) = runJXA(script, timeout: timeout, scopable: true)
             if let error {
                 outcome.failed.append("\(label): \(error)")
@@ -627,6 +671,7 @@ enum MailService {
             outcome.messagesScanned += obj["messages_scanned"] as? Int ?? 0
             outcome.scanned.append(contentsOf: obj["scanned"] as? [String] ?? [])
             outcome.skipped.append(contentsOf: obj["skipped"] as? [String] ?? [])
+            outcome.unstable.append(contentsOf: obj["unstable"] as? [String] ?? [])
             if (obj["matched"] as? Int ?? 0) > 0 { outcome.matchedMailbox = true }
         }
         sortNewestFirst(&outcome.rows)
@@ -897,6 +942,7 @@ enum MailService {
             "skipped_mailboxes": outcome.skipped
         ]
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
+        if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
         return jsonResult(payload)
     }
 
@@ -1351,6 +1397,7 @@ enum MailService {
         ]
         if let bodyInfo { payload["body_search"] = bodyInfo }
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
+        if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
         return jsonResult(payload)
     }
 
@@ -2664,7 +2711,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes)",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name"),
@@ -2699,7 +2746,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes)",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject",
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),

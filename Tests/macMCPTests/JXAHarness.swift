@@ -103,9 +103,15 @@ enum MailStubJS {
                 // some messages.
                 _sources: m.sources == null ? [m.source == null ? '' : m.source] : m.sources,
                 _sourceReads: 0,
+                _sender: m.sender == null ? '' : m.sender,
+                _date: m.date == null ? 0 : m.date,
+                _read: m.read ? true : false,
                 id: function() { return this._id; },
                 messageId: function() { return this._messageId; },
                 subject: function() { return this._subject; },
+                sender: function() { return this._sender; },
+                dateReceived: function() { return new Date(this._date); },
+                readStatus: function() { return this._read; },
                 source: function() {
                     var at = Math.min(this._sourceReads, this._sources.length - 1);
                     this._sourceReads++;
@@ -142,6 +148,7 @@ enum MailStubJS {
             var box = {
                 acctName: acctName,
                 _msgs: [],
+                _reads: 0,
                 name: function() { return b.name; }
             };
             // `mb.messages.id()` is a bulk column fetch; `mb.messages[k]` is an
@@ -150,11 +157,36 @@ enum MailStubJS {
             // rather than snapshotting once.
             Object.defineProperty(box, 'messages', {
                 get: function() {
+                    // Every access to this specifier is one bulk column fetch,
+                    // which is one Apple Event. `arrivals` models a mailbox
+                    // that changes between two of them: {after: n, at: i,
+                    // message: {...}, repeat: true} splices a message in once
+                    // the nth fetch has been served, at index i -- which is
+                    // where Mail puts an arriving message, since the collection
+                    // is ordered by date received rather than appended to.
+                    box._reads++;
+                    var arrival = b.arrival;
+                    if (arrival && (box._reads === arrival.after
+                            || (arrival.repeat && box._reads > arrival.after))) {
+                        box._msgs.splice(
+                            arrival.at == null ? 0 : arrival.at,
+                            0,
+                            makeMessage({
+                                id: arrival.message.id + '-' + box._reads,
+                                subject: arrival.message.subject,
+                                sender: arrival.message.sender,
+                                date: arrival.message.date
+                            }, box)
+                        );
+                    }
                     var m = box._msgs;
                     var spec = {
                         id: function() { return m.map(function(x) { return x._id; }); },
                         messageId: function() { return m.map(function(x) { return x._messageId; }); },
                         subject: function() { return m.map(function(x) { return x._subject; }); },
+                        sender: function() { return m.map(function(x) { return x._sender; }); },
+                        dateReceived: function() { return m.map(function(x) { return new Date(x._date); }); },
+                        readStatus: function() { return m.map(function(x) { return x._read; }); },
                         length: m.length
                     };
                     for (var i = 0; i < m.length; i++) spec[i] = m[i];
