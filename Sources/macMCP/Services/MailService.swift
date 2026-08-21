@@ -1473,6 +1473,13 @@ enum MailService {
         \(recipientLines)
         \(senderSnippet.prop)
         \(attachmentsJXA(attachments))
+        // Whitespace is stripped before counting, so this is not the body's
+        // length -- 'just one line here' reports 15, not 18. It is deliberate:
+        // the question it answers is "did Mail render anything visible", and
+        // that is better served by ignoring whitespace than by counting it. Both
+        // compose schemas say so, because a caller comparing this against
+        // body.count otherwise sees a mismatch on every message with a space in
+        // it and has nothing to explain it.
         var renderedChars = 0;
         try { renderedChars = ('' + msg.content()).replace(/\\s+/g, '').length; } catch (e) {}
         \(htmlGuard)
@@ -2337,7 +2344,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_send",
-                description: "Send an email via Mail.app, optionally as HTML and with file attachments. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced",
+                description: "Send an email via Mail.app, optionally as HTML and with file attachments. The result reports rendered_chars: the length of the body Mail composed with all whitespace removed, so an 18-character body of \"just one line here\" reports 15. It exists to catch a body Mail rendered as empty, not to match the length of what was sent. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced",
                 inputSchema: composeSchema(action: "send from"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
@@ -2348,7 +2355,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML",
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML",
                 inputSchema: composeSchema(action: "save the draft in"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
@@ -2407,7 +2414,7 @@ enum MailService {
                         "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
                         "target_mailbox": stringProp("Destination mailbox name, resolved within the message's own account"),
                         "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
-                        "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one")
+                        "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one. That upload is a re-send of Mail's own copy, not a server-side move, so the bytes change: headers, content and RFC Message-Id survive, but the numeric message_id does not, line endings arrive as LF, and any NUL byte is lost — the same caveats mail_get_source reports as fidelity. Mail does fetch a message it holds only partially before uploading it, so nothing is truncated")
                     ],
                     required: ["message_id", "target_mailbox"]
                 )
