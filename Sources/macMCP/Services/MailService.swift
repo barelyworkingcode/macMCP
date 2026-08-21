@@ -167,6 +167,10 @@ enum MailService {
                     Thread.sleep(forTimeInterval: 0.5)
                     continue
                 }
+                // A script that threw is reporting something the caller can act
+                // on, in a sentence the script chose. Hand back that sentence
+                // rather than osascript's wrapper around it.
+                if let thrown = scriptErrorMessage(errOutput) { return (output, thrown) }
                 return (output, errOutput.isEmpty ? "osascript exited with status \(process.terminationStatus)" : errOutput)
             }
             return (output, nil)
@@ -213,6 +217,48 @@ enum MailService {
         }
         if let message = object["error"] as? String { return .failure(message) }
         return .object(object)
+    }
+
+    /// Recovers the sentence a script threw from what osascript wrote to stderr,
+    /// or nil when stderr is not a thrown script error.
+    ///
+    /// A generated script has two ways to report a failure. Returning
+    /// `{error: '...'}` goes through `scriptPayload` and reaches the caller as
+    /// prose. Throwing does not: osascript exits non-zero, and the message came
+    /// back wrapped in its own error text --
+    ///
+    ///     execution error: Error: account "Alice" has no mailbox named "Receipts" (-2700)
+    ///
+    /// -- doubled `Error:` and an OSStatus included. That is the shape #10 was
+    /// filed about, and it survived in every path that refuses by throwing:
+    /// `mail_move`'s missing destination mailbox (added by the fix for #4), and
+    /// `account not found` from `mail_move`, `mail_mark_read`, `mail_get_email`
+    /// and `mail_get_source`. Unwrapping here rather than in each script fixes
+    /// the ones that exist and the ones written later, and leaves the scripts
+    /// free to throw, which is the natural thing to do from inside an IIFE.
+    ///
+    /// Only `-2700` is unwrapped: that is the code osascript uses for "the
+    /// script threw", so the text after it is the script's own. Every other
+    /// code -- `-1712` from Mail, `-1728` for an unresolvable reference, a
+    /// syntax error's `0:7: syntax error:` -- is macMCP's problem or Mail's,
+    /// and the raw text with its number is the evidence for whoever debugs it.
+    ///
+    /// The `Error:` that osascript prefixes is always dropped. A second one,
+    /// which is the JavaScript `Error` class naming itself, is dropped too;
+    /// `TypeError:` and friends are kept, because a thrown `TypeError` is a bug
+    /// in the script rather than a message for the caller and the class name is
+    /// the useful part of it.
+    static func scriptErrorMessage(_ stderr: String) -> String? {
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = "execution error: "
+        let suffix = " (-2700)"
+        guard trimmed.hasPrefix(prefix), trimmed.hasSuffix(suffix) else { return nil }
+        var message = String(trimmed.dropFirst(prefix.count).dropLast(suffix.count))
+        guard message.hasPrefix("Error: ") else { return nil }
+        message = String(message.dropFirst("Error: ".count))
+        if message.hasPrefix("Error: ") { message = String(message.dropFirst("Error: ".count)) }
+        message = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? nil : message
     }
 
     /// Renders a Swift string as the body of a single-quoted JS string literal.
@@ -645,7 +691,10 @@ enum MailService {
     /// Sets `<varName>` to the mailbox and `<varName>Account` to the name of the
     /// account it came from, so the caller can report where the message went.
     /// Throws when the account has no mailbox of that name — deliberately,
-    /// rather than falling back to another account's copy.
+    /// rather than falling back to another account's copy. The throw reaches
+    /// the caller as prose because `runJXAData` unwraps osascript's wrapper
+    /// (`scriptErrorMessage`); it used to arrive as
+    /// `execution error: Error: Error: … (-2700)`.
     private static func mailboxInAccountJXA(
         mailbox: String,
         accountExpr: String,
@@ -663,20 +712,32 @@ enum MailService {
             }
             return null;
         }
+        // Name what the account does have. The mailboxes are already fetched by
+        // then, so it costs nothing, and "no mailbox named X" on its own leaves
+        // a caller guessing at spelling, localisation and which account owns
+        // the folder they meant.
+        function nameList(boxes) {
+            var names = [];
+            for (var n = 0; n < boxes.length && n < 25; n++) names.push('' + boxes[n].name());
+            if (boxes.length > names.length) names.push('...');
+            return names.join(', ');
+        }
         if (wantAcct !== null && ('' + wantAcct).toLowerCase() !== 'on my mac') {
             var accts = mail.accounts();
             for (var a = 0; a < accts.length; a++) {
                 if (('' + accts[a].name()).toLowerCase() === ('' + wantAcct).toLowerCase()) {
-                    var hit = pick(accts[a].mailboxes());
+                    var boxes = accts[a].mailboxes();
+                    var hit = pick(boxes);
                     if (hit) { \(varName)Account = '' + accts[a].name(); return hit; }
-                    throw new Error('account "' + accts[a].name() + '" has no mailbox named "\(escapedMailbox)"');
+                    throw new Error('account "' + accts[a].name() + '" has no mailbox named "\(escapedMailbox)"; it has: ' + nameList(boxes));
                 }
             }
             throw new Error('account not found: ' + wantAcct);
         }
-        var localHit = pick(mail.mailboxes());
+        var localBoxes = mail.mailboxes();
+        var localHit = pick(localBoxes);
         if (localHit) { \(varName)Account = 'On My Mac'; return localHit; }
-        throw new Error('no mailbox named "\(escapedMailbox)" in On My Mac');
+        throw new Error('no mailbox named "\(escapedMailbox)" in On My Mac; it has: ' + nameList(localBoxes));
     })();
     """
     }
