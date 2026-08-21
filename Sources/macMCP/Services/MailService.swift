@@ -6,13 +6,65 @@ enum MailService {
     /// whole server, so every run gets a deadline and a SIGKILL backstop.
     private static let defaultTimeout: TimeInterval = 120
 
+    /// The bundle every mail_* tool sends Apple Events to.
+    private static let mailBundleID = "com.apple.mail"
+
+    /// Builds the error returned when a script blows its deadline.
+    ///
+    /// Every overrun used to be attributed to Mail being slow and answered with
+    /// the same "narrow the scope" advice. Two things were wrong with that. A
+    /// blocked-on-consent `osascript` looks identical to a wedged Apple Event
+    /// from the outside, and the one action that fixes it -- answer the prompt
+    /// -- went unmentioned. And the advice is not expressible in every tool's
+    /// schema: `mail_list_accounts` takes no arguments at all, so a caller
+    /// following it has nothing to change and will retry forever.
+    ///
+    /// So the automation grant is checked before blaming Mail, and the scope
+    /// advice is only offered to tools that actually have scope. Whatever
+    /// `osascript` wrote to stderr is kept either way -- it is the only other
+    /// evidence there is, and the timeout path used to discard it.
+    static func jxaTimeoutMessage(
+        timeout: TimeInterval,
+        automation: AutomationStatus,
+        scopable: Bool,
+        stderr: String
+    ) -> String {
+        let seconds = Int(timeout)
+        var message: String
+        switch automation {
+        case .pendingConsent:
+            message = "Mail was never asked: macOS is waiting for permission to send Apple Events to Mail, and the request sat behind that prompt until it was cancelled after \(seconds)s. Approve the prompt on screen, or grant automation of Mail in System Settings > Privacy & Security > Automation, then try again."
+        case .denied:
+            message = "Mail was never asked: permission to send Apple Events to Mail is denied, so the request could not leave this process. Re-grant it in System Settings > Privacy & Security > Automation — in Relay, Settings > MCP Servers > macMCP > Reset Permissions — then try again."
+        case .checkBlocked:
+            message = "Mail did not respond within \(seconds)s, and macOS would not say whether this process may control Mail either — that check only blocks while a consent prompt is waiting to be answered. Look for a permission prompt on screen and approve it; if there is none, grant automation of Mail in System Settings > Privacy & Security > Automation. Then try again."
+        case .targetNotRunning:
+            message = "Mail did not respond within \(seconds)s and is not running, so the request was most likely waiting for it to launch, or for permission to control it. Start Mail, approve any permission prompt on screen, then try again."
+        case .granted, .unknown:
+            message = "Mail did not respond within \(seconds)s — the request was cancelled."
+            message += scopable
+                ? " Narrow the scope (a specific account or mailbox, or a smaller limit) and try again."
+                : " This tool takes no scope arguments, so there is nothing to narrow: check that Mail is running and responsive, then try again."
+        }
+        if !stderr.isEmpty {
+            message += " osascript wrote: \(stderr)"
+        }
+        return message
+    }
+
     /// Runs a JXA script under a hard deadline, returning trimmed stdout.
+    ///
+    /// `scopable` says whether the calling tool has an argument the caller could
+    /// narrow — an account, a mailbox, a limit. It is only used to decide what
+    /// to suggest on a timeout, and it is false for the tools whose schemas
+    /// offer nothing to narrow.
     private static func runJXA(
         _ script: String,
         retries: Int = 2,
-        timeout: TimeInterval = defaultTimeout
+        timeout: TimeInterval = defaultTimeout,
+        scopable: Bool = true
     ) -> (output: String, error: String?) {
-        let (data, error) = runJXAData(script, retries: retries, timeout: timeout)
+        let (data, error) = runJXAData(script, retries: retries, timeout: timeout, scopable: scopable)
         let output = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return (output, error)
@@ -29,8 +81,19 @@ enum MailService {
     private static func runJXAData(
         _ script: String,
         retries: Int = 2,
-        timeout: TimeInterval = defaultTimeout
+        timeout: TimeInterval = defaultTimeout,
+        scopable: Bool = true
     ) -> (output: Data, error: String?) {
+        // Ask TCC where the automation grant stands *before* running anything.
+        // Asking afterwards, on the error path, is too late: while a consent
+        // prompt is on screen the check itself blocks -- 12s in one measurement,
+        // and still blocked 20s after the script that raised the prompt had been
+        // killed -- so the answer has to be taken while nothing is waiting on
+        // the user. It costs about 10ms then, against a spawn that costs an
+        // order of magnitude more, and it is the difference between reporting
+        // "Mail was slow" and reporting the thing that is actually wrong.
+        let automation = PermissionsService.automationStatus(bundleID: mailBundleID)
+
         for attempt in 0...retries {
             let tmpDir = FileManager.default.temporaryDirectory
             let stem = "macmcp-jxa-\(UUID().uuidString)"
@@ -86,7 +149,12 @@ enum MailService {
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             if timedOut {
-                return (Data(), "Mail did not respond within \(Int(timeout))s — the request was cancelled. Narrow the scope (a specific account or mailbox, or a smaller limit) and try again.")
+                return (Data(), jxaTimeoutMessage(
+                    timeout: timeout,
+                    automation: automation,
+                    scopable: scopable,
+                    stderr: errOutput
+                ))
             }
 
             if process.terminationStatus != 0 {
@@ -354,7 +422,10 @@ enum MailService {
     }
 
     /// Fetches the configured account names in one cheap call (~0.2s).
-    private static func accountNames() -> (names: [String], error: String?) {
+    /// `scopable` is passed straight through to the timeout message. Listing
+    /// accounts has nothing to narrow when it is the whole request; when it is
+    /// the first step of a scan, passing an `account` would skip it entirely.
+    private static func accountNames(scopable: Bool) -> (names: [String], error: String?) {
         let script = """
         var mail = Application('Mail');
         var a = mail.accounts();
@@ -362,7 +433,7 @@ enum MailService {
         for (var i = 0; i < a.length; i++) out.push('' + a[i].name());
         JSON.stringify(out);
         """
-        let (output, error) = runJXA(script, timeout: 30)
+        let (output, error) = runJXA(script, timeout: 30, scopable: scopable)
         if let error { return ([], error) }
         guard let data = output.data(using: .utf8),
               let names = try? JSONSerialization.jsonObject(with: data) as? [String] else {
@@ -376,7 +447,7 @@ enum MailService {
     /// On-My-Mac mailboxes.
     private static func resolveTargets(account: String?) -> (targets: [String?], error: String?) {
         if let account { return ([account], nil) }
-        let (names, error) = accountNames()
+        let (names, error) = accountNames(scopable: true)
         if let error { return ([], error) }
         return (names.map { Optional($0) } + [nil], nil)
     }
@@ -406,7 +477,7 @@ enum MailService {
                 searchRecipients: searchRecipients,
                 limit: limit
             )
-            let (output, error) = runJXA(script, timeout: timeout)
+            let (output, error) = runJXA(script, timeout: timeout, scopable: true)
             if let error {
                 outcome.failed.append("\(label): \(error)")
                 continue
@@ -598,14 +669,17 @@ enum MailService {
     // MARK: - Tool Handlers
 
     private static func listAccounts(_ args: JSONObject?) -> MCPCallResult {
-        let (names, error) = accountNames()
+        // Empty input schema: there is no account, no mailbox and no limit to
+        // pass, so "narrow the scope" would be advice the caller cannot follow.
+        let (names, error) = accountNames(scopable: false)
         if let error { return errorResult(error) }
         return jsonResult(names)
     }
 
     private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
+        let account = args?["account"]?.stringValue
         let script: String
-        if let account = args?["account"]?.stringValue {
+        if let account {
             let escaped = escapeJSString(account)
             script = """
             var mail = Application('Mail');
@@ -638,7 +712,9 @@ enum MailService {
             JSON.stringify(results);
             """
         }
-        let (output, error) = runJXA(script)
+        // Naming an account is the only narrowing this tool offers, so once one
+        // has been given there is nothing left to suggest.
+        let (output, error) = runJXA(script, scopable: account == nil)
         if let error { return errorResult(error) }
         return textResult(output)
     }
@@ -812,7 +888,7 @@ enum MailService {
             JSON.stringify(out);
             """
 
-            let (output, error) = runJXA(script, retries: 0, timeout: budget)
+            let (output, error) = runJXA(script, retries: 0, timeout: budget, scopable: true)
             if error != nil { complete = false; continue }
             guard let data = output.data(using: .utf8),
                   let fetched = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
@@ -1219,7 +1295,8 @@ enum MailService {
         \(finalAction)
         JSON.stringify(result);
         """
-        let (output, error) = runJXA(script, retries: 0)
+        // Composing has no scope: the message is the message.
+        let (output, error) = runJXA(script, retries: 0, scopable: false)
         if let error { return errorResult(error) }
         guard let data = output.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -1363,7 +1440,7 @@ enum MailService {
         if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
         '' + found.source();
         """
-        let (data, error) = runJXAData(script, retries: 0, timeout: sourceFetchTimeout)
+        let (data, error) = runJXAData(script, retries: 0, timeout: sourceFetchTimeout, scopable: true)
         if let error {
             if error.contains("message not found") {
                 return (Data(), "message not found with id: \(messageId)")
