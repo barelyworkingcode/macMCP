@@ -128,12 +128,15 @@ final class MailSourceOnDiskTests: XCTestCase {
 
         // 4. The caller is told, in the response rather than in a code comment.
         let fidelity = try XCTUnwrap(result["fidelity"] as? [String: Any])
-        XCTAssertEqual(fidelity["exact"] as? Bool, false)
         XCTAssertEqual(fidelity["line_endings"] as? String, "lf")
-        XCTAssertEqual(
-            fidelity["ambiguous_nul_bytes"] as? Int,
-            fetched.filter { $0 == 0x80 }.count
-        )
+        XCTAssertEqual(fidelity["bytes_measured"] as? Int, fetched.count)
+        // Two: the probe's own 0x80, and the NUL that became one. Both stand
+        // alone -- the payload runs 0x00 to 0xFF in order, so neither sits in a
+        // UTF-8 continuation position -- which is what makes them candidates.
+        // Counting *every* 0x80 would agree here by luck and disagree on any
+        // message containing an em dash.
+        XCTAssertEqual(fidelity["ambiguous_nul_bytes"] as? Int, 2)
+        XCTAssertEqual(fetched.filter { $0 == 0x80 }.count, 2, "the bytes the count is about")
         let note = try XCTUnwrap(fidelity["note"] as? String)
         XCTAssertTrue(note.contains("CRLF"), note)
         XCTAssertTrue(note.contains("0x80"), note)
