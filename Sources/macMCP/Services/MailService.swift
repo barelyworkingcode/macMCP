@@ -1717,9 +1717,19 @@ enum MailService {
     /// newline is not part of the message. It is dropped: exactly one is added,
     /// unconditionally, whether or not the value already ended in one.
     ///
-    /// Known limit: a NUL byte in the message does not survive the text channel
-    /// at all -- it reaches stdout as U+0080 -- so a message carrying one
-    /// cannot be recovered byte-for-byte by this or any other decoding here.
+    /// Known limits, neither of them recoverable here, both measured against
+    /// the testMail fixture's Maildir and reported by `sourceFidelity`:
+    ///
+    /// * A NUL in the message comes back as `0x80`.
+    /// * Every CRLF comes back as LF.
+    ///
+    /// Both happen **inside Mail**, before macMCP is involved. The text channel
+    /// is not at fault, though this comment used to say it was: plain JXA emits
+    /// both fine (`'a' + String.fromCharCode(0)` reaches stdout as `61 00`, and
+    /// `'a\r\nb'` as `61 0d 0a 62`), Swift's UTF-8/Latin-1 round trip preserves
+    /// `0d 0a`, and Mail's own `.emlx` copy of a message written to disk with 21
+    /// CRLFs and one NUL holds 0 CRs and 0 NULs. Nothing downstream can undo
+    /// that, so it is reported rather than papered over.
     static func decodeSourceBytes(_ raw: Data) -> Data {
         var data = raw
         if data.last == 0x0A { data = data.dropLast() }
@@ -1728,6 +1738,83 @@ enum MailService {
             return data
         }
         return recovered
+    }
+
+    /// How faithfully a fetched source matches the message the server holds.
+    ///
+    /// #5 was closed on the claim that a fetched source is byte-identical to the
+    /// message. Measured against the fixture's Maildir it is not, in two ways,
+    /// and both are Mail's doing rather than anything macMCP can undo:
+    ///
+    /// * **A NUL arrives as `0x80`.** 253 of the 254 byte values a probe message
+    ///   carried round-tripped exactly; `0x00` did not. Worse than losing it, it
+    ///   is now *ambiguous*: a `0x80` in a returned source is either a real
+    ///   `0x80` in the message or a NUL that did not survive, and after the fact
+    ///   nothing can tell the two apart. So the count is reported, not a claim.
+    /// * **Every CRLF arrives as LF.** A message stored with 21 CRLFs came back
+    ///   with 21 LFs and no CR at all, which means a byte comparison against the
+    ///   server's copy differs on every line break.
+    ///
+    /// A code comment is not an interface, which is the whole point of this
+    /// function: a caller checksumming a saved message, or writing an 8bit
+    /// attachment to disk, has to be able to see this in the response.
+    ///
+    /// `source_encoding` is not the place for it. That field says how the inline
+    /// `source` string was encoded for return; it exists only on the inline path,
+    /// and a source can be perfectly valid `utf-8` and still be missing a NUL.
+    struct SourceFidelity {
+        /// "crlf", "lf", "mixed", or "none" for a source with no line breaks.
+        let lineEndings: String
+        /// How many bytes equal `0x80`. Each one may be a NUL that was lost.
+        let ambiguousNulBytes: Int
+
+        /// True when nothing known to be lossy is visible in these bytes.
+        var exact: Bool { (lineEndings == "crlf" || lineEndings == "none") && ambiguousNulBytes == 0 }
+
+        var note: String? {
+            var sentences: [String] = []
+            if lineEndings == "lf" || lineEndings == "mixed" {
+                sentences.append("Mail hands a source back with LF line endings where the message on the server has CRLF, so a byte comparison against the server's copy differs on every line break.")
+            }
+            if ambiguousNulBytes > 0 {
+                sentences.append("\(ambiguousNulBytes) byte(s) here are 0x80, and Mail turns a NUL into 0x80 before macMCP sees it, so each one is either a real 0x80 in the message or a NUL that did not survive — the two are indistinguishable. Parts carried as base64 or quoted-printable are unaffected, their encoded form being pure ASCII.")
+            }
+            return sentences.isEmpty ? nil : sentences.joined(separator: " ")
+        }
+
+        var dict: [String: Any] {
+            var out: [String: Any] = [
+                "exact": exact,
+                "line_endings": lineEndings,
+                "ambiguous_nul_bytes": ambiguousNulBytes
+            ]
+            if let note { out["note"] = note }
+            return out
+        }
+    }
+
+    static func sourceFidelity(_ data: Data) -> SourceFidelity {
+        var crlf = 0, bareLF = 0, bareCR = 0, nulCandidates = 0
+        var previous: UInt8 = 0
+        for byte in data {
+            switch byte {
+            case 0x0A: if previous == 0x0D { crlf += 1 } else { bareLF += 1 }
+            case 0x80: nulCandidates += 1
+            default: break
+            }
+            if previous == 0x0D && byte != 0x0A { bareCR += 1 }
+            previous = byte
+        }
+        if previous == 0x0D { bareCR += 1 }
+
+        let endings: String
+        switch (crlf, bareLF + bareCR) {
+        case (0, 0): endings = "none"
+        case (_, 0): endings = "crlf"
+        case (0, _): endings = bareLF > 0 && bareCR == 0 ? "lf" : "mixed"
+        default: endings = "mixed"
+        }
+        return SourceFidelity(lineEndings: endings, ambiguousNulBytes: nulCandidates)
     }
 
     private static func fetchSource(
@@ -1859,6 +1946,10 @@ enum MailService {
         return jsonResult([
             "saved": saved,
             "attachments_in_message": all.count,
+            // Of the source the attachments were cut out of. What is written to
+            // disk is only as faithful as what Mail handed over, and a caller
+            // saving an 8bit part has no other way to learn that.
+            "fidelity": sourceFidelity(data).dict,
             "message_id": messageId
         ])
     }
@@ -1886,7 +1977,12 @@ enum MailService {
             } catch {
                 return errorResult("could not write \(url.path): \(error.localizedDescription)")
             }
-            return jsonResult(["path": url.path, "bytes": data.count, "message_id": messageId])
+            return jsonResult([
+                "path": url.path,
+                "bytes": data.count,
+                "message_id": messageId,
+                "fidelity": sourceFidelity(data).dict
+            ])
         }
 
         // Sources run to megabytes, so an unbounded return would bury the
@@ -1899,6 +1995,11 @@ enum MailService {
             "bytes_returned": slice.bytesReturned,
             "source_encoding": slice.encoding,
             "truncated": data.count > slice.bytesReturned,
+            // Measured over the whole source, not the returned slice: the
+            // caveats are properties of how Mail handed the message over, and a
+            // caller asking for the first kilobyte still needs to know that the
+            // rest of it is subject to them.
+            "fidelity": sourceFidelity(data).dict,
             "message_id": messageId
         ])
     }
@@ -2248,7 +2349,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -2269,7 +2370,7 @@ enum MailService {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server: every result reports fidelity, because Mail hands a source over with LF line endings where the message has CRLF, and turns any NUL byte into 0x80 before macMCP sees it (so each 0x80 may be a real 0x80 or a lost NUL). Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),

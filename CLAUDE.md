@@ -70,7 +70,9 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 
 - **Mail's own attachment APIs are unusable.** `save` on a `mail attachment` fails with -10004 for every destination including `~/Downloads` (Mail's sandbox, not Full Disk Access), and the `MIME type` property raises "AppleEvent handler failed" on any message that has an attachment. `source` works, so `mail_save_attachment` fetches raw RFC 822 and decodes it in `MIME.swift` — and `mail_get_email` now takes its `mime_type` from the same place, so the two agree. The filename guess (`UTType`) survives only as a fallback, and `mime_type_source` says which one a caller is looking at: guessing from the extension reported `text/csv` for a part the message declares as `image/png; name="data.csv"`. The source fetch only happens when the message actually has attachments (~0.5s on top of a ~0.5s read), and a failed fetch leaves the guess in place rather than costing the caller the message.
 
-- **`source()` arrives one encoding layer removed.** Mail builds the string for `found.source()` by decoding the message's raw bytes as **ISO-8859-1**, and osascript writes that string to stdout as UTF-8, so every byte above 0x7F comes back UTF-8 double-encoded. `decodeSourceBytes` undoes it (UTF-8 in, Latin-1 out) and also drops the single newline osascript appends after any result. Both halves are guarded: invalid UTF-8, or a scalar above U+00FF (what a Mail that decoded the source *correctly* would emit), returns the bytes untouched rather than mangling them again. A NUL byte does not survive the text channel at all — it reaches stdout as U+0080 — and is not recoverable. Base64 attachments hid this for a long time because base64 is pure ASCII; the bug only shows on `Content-Transfer-Encoding: 8bit`.
+- **`source()` arrives one encoding layer removed.** Mail builds the string for `found.source()` by decoding the message's raw bytes as **ISO-8859-1**, and osascript writes that string to stdout as UTF-8, so every byte above 0x7F comes back UTF-8 double-encoded. `decodeSourceBytes` undoes it (UTF-8 in, Latin-1 out) and also drops the single newline osascript appends after any result. Both halves are guarded: invalid UTF-8, or a scalar above U+00FF (what a Mail that decoded the source *correctly* would emit), returns the bytes untouched rather than mangling them again. Base64 attachments hid this for a long time because base64 is pure ASCII; the bug only shows on `Content-Transfer-Encoding: 8bit`.
+
+- **A fetched source is still not byte-identical to the message, and says so.** Measured against the fixture's Maildir with a message carrying every byte value except CR/LF: 253 of 254 round-trip, but **a NUL comes back as `0x80`** and **every CRLF comes back as LF** (890 bytes on disk, 869 returned, 21 CRs gone, one `0x00` arriving as `0x80`). Both happen inside Mail — plain JXA emits NUL and CR fine, Swift's UTF-8/Latin-1 round trip preserves them, and Mail's own `.emlx` copy already holds 0 CRs and 0 NULs — so nothing here can undo them. `sourceFidelity` reports them instead, as a `fidelity` object on `mail_get_source` (both the inline and `save_to` paths) and on `mail_save_attachment`. The NUL case is *ambiguous*, not merely lossy: a returned `0x80` is either a real `0x80` or a lost NUL, so the count of candidates is reported rather than a claim about which. `source_encoding` is not the place for this — it describes how the inline string was encoded for return, exists only on that path, and a source can be valid `utf-8` and still be missing a NUL.
 
 - **Mail rewrites any body set through its scripting interface, and there is no way around it.** Whatever is given as `content` (or `html content`) arrives inside `<blockquote type="cite">` under Mail's `Apple-Mail-URLShareWrapperClass` scaffolding: a sent message's `text/plain` alternative gets `> ` on every line, and a saved draft's `text/plain` part comes out **empty**. Ruled out on Darwin 27 / Mail 16.0 (3864.500.181), each verified against the fixture's Maildir: setting the body at creation, setting it after `resolveOutgoingJXA`, `visible: true`, `html content`, injecting closing tags to escape the blockquote (WebKit rebalances them), `SendFormat = Plain` with a Mail restart, and textbook AppleScript `make new outgoing message with properties {content:…}` — which reproduces it exactly, so this is not something macMCP's compose path chose. A message **typed by hand** in Mail comes out as a clean single-part `text/plain`, so it is specific to the scripting path. `mailto:` compose windows never appear in `outgoing messages`, so that route cannot be driven; `content.paragraphs.push(…)` **kills osascript** (SIGKILL, no output). What is left is not to lie about it: `mail_create_draft` re-reads the saved draft and reports `body_check`, because `rendered_chars` is measured off `msg.content()` before Mail generates the alternatives and will happily report a plausible number for a message whose plain part is empty.
 
@@ -109,7 +111,23 @@ generated JavaScript:
   factored into small `static` functions that take data and return data, so the
   regression can be pinned without a mailbox.
 
-End-to-end checks against the local `testMail` fixture live outside this repo
+The one exception is `MailSourceOnDiskTests`, which is in the suite and has to
+be: byte-identity claims cannot be substantiated by a test that synthesises its
+own input with the transform under test, which is how two real deviations went
+unnoticed for a release. It skips with instructions unless pointed at the
+fixture, and needs Mail.app and an Automation grant:
+
+```bash
+cd ~/source/barelyworkingcode/testMail && ./testmail.sh start
+MACMCP_MAIL_FIXTURE=$HOME/source/barelyworkingcode/testMail \
+    swift test --filter MailSourceOnDiskTests
+```
+
+It delivers a message carrying every byte value except CR/LF straight into the
+Maildir, fetches it back through `mail_get_source`, compares the bytes with the
+file on disk, and moves the probe to Trash afterwards. ~5s.
+
+Other end-to-end checks against the fixture live outside this repo
 (`~/source/barelyworkingcode/testMail`); the ground truth for anything mail-shaped
 is the Maildir on disk, never a tool's own success return.
 

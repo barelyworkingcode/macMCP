@@ -23,6 +23,18 @@ enum JXA {
     }
 
     static func run(_ script: String) throws -> String {
+        let stdout = String(data: try runRaw(script), encoding: .utf8) ?? ""
+        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Runs `script` and returns stdout exactly as osascript wrote it: nothing
+    /// trimmed, nothing decoded.
+    ///
+    /// The byte-level tests need this. `run` hands back a trimmed `String`,
+    /// which is fine for JSON but destroys the two things those tests are about
+    /// -- the trailing newline osascript appends, and any byte that is not
+    /// valid UTF-8 on its own.
+    static func runRaw(_ script: String) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-l", "JavaScript", "-e", script]
@@ -36,14 +48,13 @@ enum JXA {
         let outData = out.fileHandleForReading.readDataToEndOfFile()
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
         guard process.terminationStatus == 0 else {
             throw Failure(
                 status: process.terminationStatus,
                 stderr: String(data: errData, encoding: .utf8) ?? ""
             )
         }
-        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return outData
     }
 
     /// Runs `script` and decodes its stdout as a JSON object.
