@@ -174,6 +174,47 @@ enum MailService {
         return (Data(), "max retries exceeded")
     }
 
+    /// How a handler script's stdout was understood.
+    enum ScriptPayload: Equatable {
+        /// A JSON object the handler can read fields out of.
+        case object([String: Any])
+        /// The script reported a failure. The associated value is the message,
+        /// already unwrapped, so it reads like every other mail tool's error
+        /// rather than like a JSON blob.
+        case failure(String)
+        /// Not JSON at all -- a bare string result such as `'done'`.
+        case text(String)
+
+        static func == (lhs: ScriptPayload, rhs: ScriptPayload) -> Bool {
+            switch (lhs, rhs) {
+            case let (.failure(a), .failure(b)): return a == b
+            case let (.text(a), .text(b)): return a == b
+            case let (.object(a), .object(b)):
+                return NSDictionary(dictionary: a).isEqual(to: b)
+            default: return false
+            }
+        }
+    }
+
+    /// Classifies a handler script's stdout.
+    ///
+    /// mail_mark_read and mail_move used to detect a failure with
+    /// `output.contains("\"error\"")` and then hand the whole JSON string to the
+    /// caller, so a missing message came back as `{"error":"message not found
+    /// with id: 99999999"}` while every sibling returned the sentence on its
+    /// own. The substring test was also a content check rather than a structural
+    /// one: a successful result that happened to contain the characters `"error"`
+    /// anywhere -- in a mailbox name, say -- would have been reported as a
+    /// failure. Both go away by parsing the thing and reading the field.
+    static func scriptPayload(_ output: String) -> ScriptPayload {
+        guard let data = output.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .text(output)
+        }
+        if let message = object["error"] as? String { return .failure(message) }
+        return .object(object)
+    }
+
     /// Renders a Swift string as the body of a single-quoted JS string literal.
     ///
     /// Everything outside printable ASCII becomes `\uXXXX`. The script reaches
@@ -802,11 +843,12 @@ enum MailService {
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
-        guard let data = output.data(using: .utf8),
-              var payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return textResult(output)
+        var payload: [String: Any]
+        switch scriptPayload(output) {
+        case .failure(let message): return errorResult(message)
+        case .text(let text): return textResult(text)
+        case .object(let object): payload = object
         }
-        if let message = payload["error"] as? String { return errorResult(message) }
         if let attachments = payload["attachments"] as? [[String: Any]] {
             payload["attachments"] = typedAttachments(
                 attachments,
@@ -1978,12 +2020,11 @@ enum MailService {
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
-        if output.contains("\"error\"") { return errorResult(output) }
-        guard let data = output.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return textResult(output.isEmpty ? "email moved" : output)
+        switch scriptPayload(output) {
+        case .failure(let message): return errorResult(message)
+        case .object(let payload): return jsonResult(payload)
+        case .text(let text): return textResult(text.isEmpty ? "email moved" : text)
         }
-        return jsonResult(payload)
     }
 
     private static func markRead(_ args: JSONObject?) -> MCPCallResult {
@@ -2010,7 +2051,7 @@ enum MailService {
         """
         let (output, error) = runJXA(script)
         if let error { return errorResult(error) }
-        if output.contains("\"error\"") { return errorResult(output) }
+        if case .failure(let message) = scriptPayload(output) { return errorResult(message) }
         return textResult("marked \(read ? "read" : "unread")")
     }
 
