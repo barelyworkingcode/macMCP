@@ -1,10 +1,6 @@
 import CoreLocation
 import Foundation
 
-private func numberProp(_ description: String) -> JSONValue {
-    .object(["type": .string("number"), "description": .string(description)])
-}
-
 // CLLocationManager delegate that captures a single location update.
 // Uses CFRunLoop instead of semaphore because CLLocationManager requires
 // an active RunLoop on its thread to deliver delegate callbacks.

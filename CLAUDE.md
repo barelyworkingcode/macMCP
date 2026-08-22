@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 46 tools across 12 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 47 tools across 13 services. No external dependencies.
 
 ## Architecture
 
@@ -26,11 +26,12 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 | Maps | 3 | `CLGeocoder` + `NSWorkspace` URL schemes |
 | Capture | 2 | `/usr/sbin/screencapture`, `/usr/bin/afrecord` |
 | Mail | 11 | JXA via `/usr/bin/osascript -l JavaScript` |
-| Messages | 3 | SQLite3 on `~/Library/Messages/chat.db` (read), AppleScript (send) |
+| Messages | 4 | SQLite3 on `~/Library/Messages/chat.db` (read), AppleScript (send) |
 | Shortcuts | 2 | `/usr/bin/shortcuts` CLI |
 | Utilities | 1 | `/usr/bin/afplay` |
 | Weather | 3 | `api.open-meteo.com` (free, no key) |
 | Web | 1 | `URLSession` (http/https GET, 1 MB cap) |
+| System | 1 | TCC status for every service these tools need |
 
 ## Key Patterns
 
@@ -271,6 +272,10 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
   **`body_check` is behind `verify_body` and defaults to `null`, not `false`.** It is a guard documented to fire on 100% of calls — the sentence above says the plain part comes back empty for *every* scripted draft — and it costs a full download of the saved draft to report that constant, which on a large draft is the whole draft. So the default says `plain_text_matches_body: null, measured: false` with the known behaviour in the detail. Null rather than a hardcoded `false` because a hardcoded claim becomes a confidently wrong answer the day a Mail release stops rewriting the body, which is precisely what this check exists to catch; `verify_body: true` takes the measurement.
 
 - **HTML bodies use `html content`,** which Mail's dictionary marks hidden and "does nothing at all (deprecated)" but which in fact still renders (verified on Darwin 27 — produces `multipart/alternative` with a Mail-generated plain-text part). It wins over `content` when both are set, so only one is ever sent. Compose checks the rendered body and errors rather than silently shipping an empty message if a future Mail makes good on the deprecation.
+
+- **A message id that arrives as a number is still a message id.** The schema said `string` and every handler read `.stringValue`, so a client emitting `"message_id": 63926` unquoted was answered with `message_id is required` — a message about a missing argument, for an argument that was right there. Models write an id that looks like a number as a number, and several clients pass it through that way (LM Studio is the one this was found on). Both halves had to move: `stringOrIntProp` so a client validating the schema will send it at all, and `coercedStringValue` so the handler reads either rendering. It also unwraps a value the client quoted twice (`"\"63926\""` decodes with the quote characters *in* the string) — safe because no id here begins and ends with a quote, an RFC Message-ID being delimited by angle brackets — and renders a whole double as `63926` rather than `63926.0`, which would match no message at all.
+
+- **`messages_search` filters in Swift, not in SQL, and says how far it got.** A message's text lives in `m.text` *or* in the `attributedBody` typedstream archive, and everything a recent Messages build sends is in the second with the column empty — so a `LIKE` in the query would find some messages and silently miss the majority, and a SQL `LIMIT` would cut the candidates before any of them had been decoded. The query therefore selects newest-first over the time window and the matching happens here, bounded by `searchScanLimit` (5,000 rows) with `messages_scanned` and `scan_complete` reported on every answer. Two other things are not what the obvious implementation does: a contact is resolved by **normalising both sides** (`+1 (555) 123-4567` and `5551234567` are one handle; `h.id = ?` matched exactly one spelling and returned nothing for the others), and naming a contact filters by **chat membership** rather than by each message's `handle_id`, because anything sent from this Mac carries `handle_id` 0 and would drop the caller's own half of the conversation. A handle nobody has is said so in a `note` rather than returned as an empty list, which would read as "you have no messages with them".
 
 ## Build
 
