@@ -41,6 +41,72 @@ enum RemindersService {
         return f
     }()
 
+    // MARK: - context/enumerate (ADR-011 decision 6)
+
+    /// Every reminder list, as a container/leaf row.
+    ///
+    /// `store.calendars(for: .reminder)` is exactly what `reminders_list` and
+    /// `reminders_create` already resolve `list_name` against, so the picker
+    /// offers what those tools can see and nothing else. The account is the
+    /// EKSource title, the same axis a calendar uses -- Reminders and Calendar
+    /// share EventKit's source model, which is why the two field pairs are
+    /// shaped identically rather than merely looking alike.
+    ///
+    /// A missing grant is the sentence, never an empty list: `-32000` and
+    /// "there are none" must stay distinguishable.
+    static func listRows() -> (rows: [ScopePath.Row], error: String?) {
+        if let err = ensureAccess() { return ([], err) }
+        return (rows(of: store.calendars(for: .reminder)), nil)
+    }
+
+    // MARK: - Enforcement (ADR-011, "The reconciliation rule the MCP implements")
+
+    /// The words every reminder-list refusal is written in.
+    static let scopeFields = ScopedRows.Fields(
+        containerField: "reminder_accounts",
+        containerNoun: "reminder account",
+        leafField: "reminder_lists",
+        leafNoun: "reminder list",
+        argument: "list_name",
+        listTool: "reminders_list"
+    )
+
+    /// One reminder list as the (container, leaf) pair a scope value is written
+    /// in -- the one place a list becomes a path, so the picker, the listing and
+    /// the enforcement cannot disagree about what a list is called. A leaf name
+    /// is not an identity here either: every account may hold a `Reminders`.
+    static func row(of calendar: EKCalendar) -> ScopePath.Row {
+        ScopePath.Row(
+            container: calendar.source?.title ?? CalendarService.unknownSourceName,
+            leaf: calendar.title
+        )
+    }
+
+    /// Rows positionally aligned with the lists they came from, so an index the
+    /// enforcement returns names the very object the handler acts on.
+    static func rows(of calendars: [EKCalendar]) -> [ScopePath.Row] { calendars.map(row(of:)) }
+
+    private static func confinement(_ scope: ResourceScope, rows: [ScopePath.Row]) -> ScopedRows.RowScope {
+        ScopedRows.allowed(
+            rows: rows,
+            containers: scope.access("reminder_accounts"),
+            leaves: scope.access("reminder_lists"),
+            fields: scopeFields
+        )
+    }
+
+    static func enumerateAccounts() -> ScopeEnumeration {
+        let (rows, error) = listRows()
+        if let error { return ([], error) }
+        return (ScopePath.containerEntries(fromRows: rows), nil)
+    }
+
+    static func enumerateLists(accountFilter: [String]?) -> ScopeEnumeration {
+        let (rows, error) = listRows()
+        if let error { return ([], error) }
+        return (ScopePath.entries(fromRows: rows, containerFilter: accountFilter), nil)
+    }
+
     static func register(_ registry: ToolRegistry) {
         let cat = "Reminders"
 
@@ -52,7 +118,7 @@ enum RemindersService {
                 description: "List reminders. Returns title, completed status, priority, list name, and optional due_date/notes.",
                 inputSchema: schema(
                     properties: [
-                        "list_name": stringProp("Reminder list name to filter by (case-insensitive). Omit to list all reminders.")
+                        "list_name": stringProp("Reminder list to filter by, named as Account/List exactly as reminders_list reports its `list_path` — for example 'iCloud/Groceries'. A bare list name works only when a single list carries it; two carriers is refused with both named. Omit to list every reminder this client may reach.")
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -60,14 +126,40 @@ enum RemindersService {
             category: cat
         ) { ctx in
             let args = ctx.arguments
+            // Authority before availability: the presence check is a question
+            // about this call's authority, which does not depend on whether
+            // this Mac would have answered. Ordering it after the TCC check
+            // would make the refusal a client sees vary with a grant it has
+            // nothing to do with, and would put the one check that is macMCP's
+            // own behind a framework read no hermetic test can make.
+            let scope = ResourceScope.parse(ctx.meta)
+            if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+                return scopeViolationResult(refusal)
+            }
             if let err = ensureAccess() { return errorResult(err) }
 
-            let listName = args?["list_name"]?.stringValue
-            var calendars: [EKCalendar]? = nil
-            if let listName {
-                let match = store.calendars(for: .reminder).filter { $0.title.lowercased() == listName.lowercased() }
-                if match.isEmpty { return errorResult("no reminder list found named '\(listName)'") }
-                calendars = match
+            let all = store.calendars(for: .reminder)
+            let rows = rows(of: all)
+            let admitted: [Int]?
+            switch confinement(scope, rows: rows) {
+            case .unscoped: admitted = nil
+            case .confined(let indices): admitted = indices
+            case .refused(let message): return scopeViolationResult(message)
+            case .misconfigured(let message): return errorResult(message)
+            }
+
+            // `nil` is "every list on this Mac", which `predicateForReminders`
+            // reads it as -- right only when nothing is in play. An omitted
+            // `list_name` under a scope resolves to the scope, because a tool's
+            // own default is not a choice the caller made.
+            var calendars: [EKCalendar]? = admitted.map { $0.map { all[$0] } }
+            if let listName = args?["list_name"]?.stringValue {
+                switch ScopedRows.resolve(listName, rows: rows, allowed: admitted, fields: scopeFields) {
+                case .rows(let indices): calendars = indices.map { all[$0] }
+                case .outOfScope(let message): return scopeViolationResult(message)
+                case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                    return errorResult(message)
+                }
             }
 
             let reminders = fetchReminders(in: calendars)
@@ -78,7 +170,11 @@ enum RemindersService {
                     "title": r.title ?? "",
                     "completed": r.isCompleted,
                     "priority": r.priority,
-                    "list": r.calendar?.title ?? ""
+                    "list": r.calendar?.title ?? "",
+                    // The title is kept because it always has been; the path is
+                    // added because it is the only one of the two a caller can
+                    // pass back as `list_name` and be sure which list it names.
+                    "list_path": r.calendar.map { row(of: $0).path } ?? ""
                 ]
                 if let notes = r.notes, !notes.isEmpty {
                     item["notes"] = notes
@@ -100,7 +196,7 @@ enum RemindersService {
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Reminder title"),
-                        "list_name": stringProp("Reminder list name (case-insensitive). Uses default list if omitted."),
+                        "list_name": stringProp("Reminder list to create in, named as Account/List exactly as reminders_list reports its `list_path` — for example 'iCloud/Groceries'. A bare list name works only when a single list carries it. Omitted, the reminder goes to this Mac's default list; a client whose access profile is scoped gets that default only when it is inside the scope, and is otherwise asked to name one rather than having the reminder filed somewhere it was never granted."),
                         "due_date": stringProp("Due date in ISO 8601 format (e.g. 2026-03-15T09:00:00Z)"),
                         "notes": stringProp("Notes for the reminder"),
                         "priority": intProp("Priority: 0 = none, 1-4 = high, 5 = medium, 6-9 = low")
@@ -112,6 +208,16 @@ enum RemindersService {
             category: cat
         ) { ctx in
             let args = ctx.arguments
+            // Authority before availability: the presence check is a question
+            // about this call's authority, which does not depend on whether
+            // this Mac would have answered. Ordering it after the TCC check
+            // would make the refusal a client sees vary with a grant it has
+            // nothing to do with, and would put the one check that is macMCP's
+            // own behind a framework read no hermetic test can make.
+            let scope = ResourceScope.parse(ctx.meta)
+            if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+                return scopeViolationResult(refusal)
+            }
             if let err = ensureAccess() { return errorResult(err) }
 
             guard let title = args?["title"]?.stringValue, !title.isEmpty else {
@@ -121,12 +227,37 @@ enum RemindersService {
             let reminder = EKReminder(eventStore: store)
             reminder.title = title
 
+            let all = store.calendars(for: .reminder)
+            let rows = rows(of: all)
+            let admitted: [Int]?
+            switch confinement(scope, rows: rows) {
+            case .unscoped: admitted = nil
+            case .confined(let indices): admitted = indices
+            case .refused(let message): return scopeViolationResult(message)
+            case .misconfigured(let message): return errorResult(message)
+            }
+
             if let listName = args?["list_name"]?.stringValue {
-                let match = store.calendars(for: .reminder).first { $0.title.lowercased() == listName.lowercased() }
-                if let match {
-                    reminder.calendar = match
-                } else {
-                    return errorResult("no reminder list found named '\(listName)'")
+                switch ScopedRows.resolve(listName, rows: rows, allowed: admitted, fields: scopeFields) {
+                case .rows(let indices): reminder.calendar = all[indices[0]]
+                case .outOfScope(let message): return scopeViolationResult(message)
+                case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                    return errorResult(message)
+                }
+            } else if let admitted {
+                // EventKit answers `defaultCalendarForNewReminders()` whatever
+                // the scope says. Writing there is how a confined client
+                // silently files a reminder in a list its profile never
+                // granted, so a scoped write resolves to the scope or refuses.
+                let defaultIndex = store.defaultCalendarForNewReminders()
+                    .flatMap { def in all.firstIndex { $0.calendarIdentifier == def.calendarIdentifier } }
+                switch ScopedRows.defaultTarget(
+                    defaultIndex: defaultIndex, allowed: admitted, rows: rows, fields: scopeFields
+                ) {
+                case .rows(let indices): reminder.calendar = all[indices[0]]
+                case .outOfScope(let message): return scopeViolationResult(message)
+                case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                    return errorResult(message)
                 }
             } else {
                 reminder.calendar = store.defaultCalendarForNewReminders()
@@ -174,15 +305,74 @@ enum RemindersService {
             category: cat
         ) { ctx in
             let args = ctx.arguments
+            // Authority before availability: the presence check is a question
+            // about this call's authority, which does not depend on whether
+            // this Mac would have answered. Ordering it after the TCC check
+            // would make the refusal a client sees vary with a grant it has
+            // nothing to do with, and would put the one check that is macMCP's
+            // own behind a framework read no hermetic test can make.
+            let scope = ResourceScope.parse(ctx.meta)
+            if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+                return scopeViolationResult(refusal)
+            }
             if let err = ensureAccess() { return errorResult(err) }
 
             guard let title = args?["title"]?.stringValue, !title.isEmpty else {
                 return errorResult("title is required")
             }
 
-            let reminders = fetchReminders(in: nil)
-            guard let match = reminders.first(where: { ($0.title ?? "").lowercased() == title.lowercased() && !$0.isCompleted }) else {
+            let all = store.calendars(for: .reminder)
+            let rows = rows(of: all)
+            let admitted: [Int]?
+            switch confinement(scope, rows: rows) {
+            case .unscoped: admitted = nil
+            case .confined(let indices): admitted = indices
+            case .refused(let message): return scopeViolationResult(message)
+            case .misconfigured(let message): return errorResult(message)
+            }
+
+            // The scoped read comes first, so the common path never fetches a
+            // reminder this client may not see. Only a miss re-reads every list,
+            // and only to tell ADR-011 decision 11's two answers apart: a title
+            // that is on a real out-of-scope reminder is a refusal, a title on
+            // nothing at all is a plain miss. Saying "not found" for both is
+            // indistinguishable from a real miss and leaves nothing to debug.
+            func incomplete(in calendars: [EKCalendar]?) -> EKReminder? {
+                fetchReminders(in: calendars).first {
+                    ($0.title ?? "").lowercased() == title.lowercased() && !$0.isCompleted
+                }
+            }
+            let match = incomplete(in: admitted.map { $0.map { all[$0] } })
+            if match == nil, let admitted {
+                if incomplete(in: nil) != nil {
+                    return scopeViolationResult(
+                        "a reminder titled '\(title)' exists on this Mac, but not in a reminder list "
+                        + "this client may reach. It may reach: "
+                        + admitted.map { rows[$0].path }.joined(separator: ", ") + ". "
+                        + "The list actually holding it is deliberately not named here."
+                    )
+                }
+            }
+            guard let match else {
                 return errorResult("no incomplete reminder found with title '\(title)'")
+            }
+
+            // A reminder is found by title across the lists in scope, which does
+            // not by itself say where it ended up -- the same shape as mail's
+            // `messages.byId` resolving globally. So where it lives is read back
+            // off the reminder and checked, rather than trusted from the query.
+            if let admitted, let list = match.calendar {
+                let where_ = row(of: list)
+                guard ScopedRows.admits(
+                    container: where_.container, leaf: where_.leaf, allowed: admitted, rows: rows
+                ) else {
+                    return scopeViolationResult(
+                        "the reminder titled '\(title)' is in a reminder list this client may not "
+                        + "reach. It may reach: "
+                        + admitted.map { rows[$0].path }.joined(separator: ", ") + ". "
+                        + "Nothing was changed."
+                    )
+                }
             }
 
             match.isCompleted = true

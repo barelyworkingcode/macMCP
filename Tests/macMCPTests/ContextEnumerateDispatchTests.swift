@@ -68,4 +68,22 @@ final class ContextEnumerateDispatchTests: StdioServerTestCase {
         let fileDirs = try XCTUnwrap(schema["file_dirs"] as? [String: Any])
         XCTAssertNil(fileDirs["enumerable"], "file_dirs must stay non-enumerable for the refusal test above to mean anything")
     }
+
+    /// The calendar / contacts / reminders fields reach the wire too. Their
+    /// shape is pinned in `ScopeDeclarationTests` against the declaration
+    /// itself; what this adds is that the rendering actually leaves the
+    /// process, which is the only thing relay ever sees.
+    func testInitializeCarriesTheCalendarContactsAndRemindersFields() throws {
+        let response = try send(method: "initialize", params: [:])
+        let result = try XCTUnwrap(response["result"] as? [String: Any])
+        let serverInfo = try XCTUnwrap(result["serverInfo"] as? [String: Any])
+        XCTAssertEqual(serverInfo["contextSchemaVersion"] as? Int, 2)
+        let schema = try XCTUnwrap(serverInfo["contextSchema"] as? [String: Any])
+        for name in ["calendar_accounts", "calendars", "contact_accounts",
+                     "contact_groups", "reminder_accounts", "reminder_lists"] {
+            let fragment = try XCTUnwrap(schema[name] as? [String: Any], name)
+            XCTAssertEqual(fragment["scope"] as? String, "restrict", name)
+            XCTAssertEqual(fragment["enumerable"] as? Bool, true, name)
+        }
+    }
 }
