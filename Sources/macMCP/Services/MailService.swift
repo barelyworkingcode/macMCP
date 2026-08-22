@@ -6600,6 +6600,29 @@ var savedDraft = (function() {
         )
     }
 
+    /// **Exactly one mail tool is open world, and it is `mail_send`.**
+    ///
+    /// Every other tool here addresses messages and mailboxes that already
+    /// exist in Mail.app's local store, or puts one there. Mail replicates
+    /// that store to the accounts the user configured -- an IMAP fetch to
+    /// finish downloading a message a read asked for, an upload of a draft or
+    /// a re-file after `mail_move` -- and none of that is counted as this
+    /// server reaching out, for a reason worth stating rather than assuming:
+    /// the counterparty is an account this Mac is already logged into and
+    /// syncs with whether or not any tool is called, nothing the caller
+    /// composed is delivered to anyone new, and every one of those effects is
+    /// reversible from the same account. Counting it would make
+    /// `mail_get_emails` and `mail_send` the same claim, and the whole use
+    /// this annotation was added for -- an agent that may read and draft, but
+    /// not send -- would become inexpressible.
+    ///
+    /// `mail_send` is the other side of exactly that line: it hands a message
+    /// the caller wrote to a recipient the caller named, at a destination that
+    /// was never configured on this Mac, and there is no unsending it. Its
+    /// `attachments` parameter makes it the concrete exfiltration channel
+    /// ADR-011's consequences name -- anything this process can read can be
+    /// mailed anywhere -- which is precisely the reach `allow_external` exists
+    /// to withhold.
     static func register(_ registry: ToolRegistry) {
         let cat = "Mail"
 
@@ -6608,7 +6631,7 @@ var savedDraft = (function() {
                 name: "mail_list_accounts",
                 description: "List all mail accounts configured in Mail.app",
                 inputSchema: schema(properties: ["timeout_seconds": timeoutProp(Budget.listAccounts)]),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listAccounts
@@ -6624,7 +6647,7 @@ var savedDraft = (function() {
                         "timeout_seconds": timeoutProp(Budget.listMailboxes)
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listMailboxes
@@ -6642,7 +6665,7 @@ var savedDraft = (function() {
                         "timeout_seconds": timeoutProp(Budget.getEmails)
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: getEmails
@@ -6661,7 +6684,7 @@ var savedDraft = (function() {
                     ],
                     required: ["message_id"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: getEmail
@@ -6684,23 +6707,35 @@ var savedDraft = (function() {
                     ],
                     required: ["query"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: searchEmails
         )
 
+        // **The send/draft split is the feature, so it is stated at both
+        // ends.** `mail_send` delivers to an arbitrary recipient: open world.
+        // `mail_create_draft` below composes the identical message, with the
+        // identical attachments, and leaves it in the sending account's own
+        // Drafts for a human to read and send -- it is not open world, and the
+        // two tools differing on this one hint is what lets an operator grant
+        // "may draft, may not send" without maintaining a tool-name denylist.
         registry.register(
             MCPTool(
                 name: "mail_send",
                 description: "Send an email via Mail.app, optionally as HTML and with file attachments. The result reports rendered_chars: the length of the body Mail composed with all whitespace removed, so an 18-character body of \"just one line here\" reports 15. It exists to catch a body Mail rendered as empty, not to match the length of what was sent. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced. The result also reports from and account (the identity Mail actually sent as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that copy was found in Drafts and removed",
                 inputSchema: composeSchema(action: "send from", budget: Budget.send),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: true)
             ),
             category: cat,
             handler: sendEmail
         )
 
+        // Not open world, and deliberately so: a draft is written into the
+        // Drafts mailbox of an account this Mac already holds, it is delivered
+        // to nobody, and deleting it undoes the call entirely. What syncs it
+        // upward is Mail doing what it does with that mailbox anyway. See the
+        // note on `register` for why account replication is not counted here.
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
@@ -6710,7 +6745,7 @@ var savedDraft = (function() {
                     budget: Budget.createDraft,
                     extra: ["verify_body": boolProp("Fetch the saved draft back from the server and compare its text/plain part with the body that was asked for, reported as body_check (default: false). Mail rewrites a scripted body and the answer has been the same on every draft measured, so this is off by default: it costs a full download of the draft to confirm something already known. Turn it on to confirm it for this draft, or to find out that a Mail release has changed")]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: createDraft
@@ -6734,7 +6769,7 @@ var savedDraft = (function() {
                     ],
                     required: ["message_id", "destination"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: saveAttachment
@@ -6765,7 +6800,7 @@ var savedDraft = (function() {
                 // read-only access profile call save_to before write_dirs
                 // enforcement exists to refuse it -- ADR-011 finding 9 names
                 // this `true` as wrong for exactly that reason.
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: getSource
@@ -6786,7 +6821,7 @@ var savedDraft = (function() {
                     ],
                     required: ["message_id", "target_mailbox"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: moveEmail
@@ -6806,7 +6841,7 @@ var savedDraft = (function() {
                     ],
                     required: ["message_id", "read"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: markRead

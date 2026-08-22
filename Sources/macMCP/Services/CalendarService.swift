@@ -363,6 +363,12 @@ enum CalendarService {
 
     // MARK: - Registration
 
+    /// Nothing here is open world. All three tools address `EKEventStore`,
+    /// this Mac's own calendar database; `calendars_create_event` writes an
+    /// event into it and takes no attendee list, so no invitation is sent and
+    /// no party outside the machine is addressed by the call. That a CalDAV
+    /// or iCloud calendar then replicates the event is the same background
+    /// sync `MailService.register` declines to count, for the same reasons.
     static func register(_ registry: ToolRegistry) {
         let cat = "Calendar"
 
@@ -371,7 +377,7 @@ enum CalendarService {
                 name: "calendars_list",
                 description: "List all calendars available on this Mac",
                 inputSchema: emptySchema(),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listCalendars
@@ -389,7 +395,7 @@ enum CalendarService {
                     ],
                     required: ["start_date", "end_date"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listEvents
@@ -410,7 +416,7 @@ enum CalendarService {
                     ],
                     required: ["title", "start_date", "end_date"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: createEvent

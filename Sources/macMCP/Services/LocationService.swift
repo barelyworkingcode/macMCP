@@ -44,6 +44,19 @@ private class LocationDelegate: NSObject, CLLocationManagerDelegate {
 }
 
 enum LocationService {
+    /// **All three tools are open world, including the one that only reads a
+    /// sensor.** The two geocoders are obvious: `CLGeocoder` is a network
+    /// service Apple runs, and the caller's address string is what is sent to
+    /// it.
+    ///
+    /// `location_get_current` is the one worth stating, because "read the
+    /// current location" sounds local and is not. A Mac has no GPS; when this
+    /// call runs, `locationd` resolves a position by sending the surrounding
+    /// Wi-Fi environment to Apple's positioning service and waiting for an
+    /// answer. That is an outbound request *caused by this call* -- not a
+    /// background sync that would have happened anyway -- and it discloses
+    /// where the host physically is. It is exactly why this VM answers
+    /// `kCLErrorDomain error 0`: no Wi-Fi positioning source to ask with.
     static func register(_ registry: ToolRegistry) {
         let cat = "Location"
 
@@ -53,7 +66,7 @@ enum LocationService {
                 name: "location_get_current",
                 description: "Get current location coordinates (latitude, longitude, accuracy, timestamp)",
                 inputSchema: emptySchema(),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat
         ) { _ in
@@ -69,7 +82,7 @@ enum LocationService {
                     properties: ["address": stringProp("Address to geocode")],
                     required: ["address"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat
         ) { ctx in
@@ -92,7 +105,7 @@ enum LocationService {
                     ],
                     required: ["latitude", "longitude"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat
         ) { ctx in

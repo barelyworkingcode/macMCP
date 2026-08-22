@@ -33,6 +33,13 @@ enum UtilitiesService {
 
     // MARK: - Registration
 
+    // Not open world: `afplay` plays a local file. Measured rather than
+    // assumed, because the parameter is called `path` and CoreAudio's
+    // `AudioFileOpenURL` takes a URL -- `afplay http://127.0.0.1:<port>/x.mp3`
+    // against a listener made no connection at all and failed with the same
+    // `AudioFileOpen failed ('wht?')` as a nonexistent local path. There is no
+    // way to spell a network fetch through this tool.
+
     static func register(_ registry: ToolRegistry) {
         registry.register(
             MCPTool(
@@ -44,7 +51,7 @@ enum UtilitiesService {
                     ],
                     required: ["path"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: "Utilities",
             handler: playSound

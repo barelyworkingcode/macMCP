@@ -83,12 +83,22 @@ enum ShortcutsService {
                 name: "shortcuts_list",
                 description: "List all available macOS shortcuts",
                 inputSchema: emptySchema(),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listShortcuts
         )
 
+        // **Open world because a shortcut is arbitrary code the annotation
+        // cannot see.** `shortcuts_list` enumerates what is installed on this
+        // Mac and reaches nothing; `shortcuts_run` executes a user-authored
+        // automation that can make HTTP requests, post to a webhook, send
+        // mail or drive any app on the machine, with the caller's `input`
+        // passed straight into it. Nothing here can inspect what a given
+        // shortcut does, and a hint that depended on which shortcuts happened
+        // to be installed today would be a claim that changes without any
+        // change to this server. So it is `true` unconditionally -- the
+        // fail-closed reading, and the honest one.
         registry.register(
             MCPTool(
                 name: "shortcuts_run",
@@ -100,7 +110,7 @@ enum ShortcutsService {
                     ],
                     required: ["name"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: true)
             ),
             category: cat,
             handler: runShortcut

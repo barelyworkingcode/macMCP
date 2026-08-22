@@ -11,6 +11,8 @@ enum MapsService {
     static func register(_ registry: ToolRegistry) {
         let cat = "Maps"
 
+        // Geocoding is `CLGeocoder`, which is a request to an Apple service
+        // carrying the caller's query. Read-only, and open world.
         registry.register(
             MCPTool(
                 name: "maps_search",
@@ -19,12 +21,17 @@ enum MapsService {
                     properties: ["query": stringProp("Place name or address to search for")],
                     required: ["query"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat,
             handler: search
         )
 
+        // `maps_open` opens `maps://?q=<caller's string>` through
+        // `NSWorkspace`. No socket is opened here, but the whole effect of the
+        // call is that Maps.app queries Apple with a string the caller chose
+        // and displays the result on the user's screen. Delegating the request
+        // to another process does not make it local.
         registry.register(
             MCPTool(
                 name: "maps_open",
@@ -33,12 +40,20 @@ enum MapsService {
                     properties: ["query": stringProp("Address or place name to open in Apple Maps")],
                     required: ["query"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: true)
             ),
             category: cat,
             handler: openInMaps
         )
 
+        // **`maps_get_directions` contacts nothing, and its name is the only
+        // reason that is surprising.** The handler is `URLComponents`: it
+        // concatenates the caller's own `from`/`to`/`mode` into a
+        // `maps.apple.com` URL string and returns it. No geocoding, no
+        // routing, no request -- a URL that names a remote service is not a
+        // call to one, and nothing about this Mac or its user is disclosed by
+        // formatting a string the caller supplied. Annotating it open world
+        // would cost a capability to buy nothing.
         registry.register(
             MCPTool(
                 name: "maps_get_directions",
@@ -51,7 +66,7 @@ enum MapsService {
                     ],
                     required: ["to"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: getDirections

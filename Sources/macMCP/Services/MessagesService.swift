@@ -411,7 +411,7 @@ enum MessagesService {
                         "limit": intProp("Maximum number of chats to return (default 20)")
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: listChats
@@ -428,7 +428,7 @@ enum MessagesService {
                     ],
                     required: ["chat_id"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: getChat
@@ -447,12 +447,20 @@ enum MessagesService {
                         "limit": intProp("Maximum number of matching messages to return (default 100)")
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat,
             handler: searchMessages
         )
 
+        // **The one open-world tool here, and the split that says why the
+        // three above are not.** The reads are SQLite queries against
+        // `~/Library/Messages/chat.db`, a local file Messages.app keeps in
+        // sync on its own schedule; nothing the caller supplies leaves this
+        // Mac and no request is made because a read happened. `messages_send`
+        // hands text the caller wrote to a recipient the caller named, and
+        // Apple delivers it to a device that is not this one -- irreversibly,
+        // to an address that was never configured here.
         registry.register(
             MCPTool(
                 name: "messages_send",
@@ -464,7 +472,7 @@ enum MessagesService {
                     ],
                     required: ["to", "text"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: true)
             ),
             category: cat,
             handler: sendMessage

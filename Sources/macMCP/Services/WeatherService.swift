@@ -1,6 +1,15 @@
 import Foundation
 
 enum WeatherService {
+    /// **Every tool here is open world, and read-only is not a defence
+    /// against that.** All three call `api.open-meteo.com` over the network on
+    /// each invocation. That the host is fixed, the API keyless and the
+    /// payload a pair of coordinates does not change what the annotation
+    /// answers: the call itself leaves this Mac, so a profile without
+    /// `allow_external` must not hold it. This is the pairing that shows the
+    /// two hints are orthogonal -- `readOnlyHint: true, openWorldHint: true`
+    /// -- and the reason `openWorldHint` had to exist separately rather than
+    /// being folded into the access mode.
     static func register(_ registry: ToolRegistry) {
         let cat = "Weather"
 
@@ -15,7 +24,7 @@ enum WeatherService {
                     ],
                     required: ["latitude", "longitude"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat,
             handler: currentWeather
@@ -33,7 +42,7 @@ enum WeatherService {
                     ],
                     required: ["latitude", "longitude"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat,
             handler: forecast
@@ -51,7 +60,7 @@ enum WeatherService {
                     ],
                     required: ["latitude", "longitude"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat,
             handler: hourly

@@ -46,13 +46,16 @@ enum AutomationStatus: Equatable {
 /// The Settings UI's "Reset Permissions" button drives the whole flow from
 /// Relay; this service is just the read-side / status surface.
 enum PermissionsService {
+    /// Not open world: it reads TCC status for this process, on this Mac. The
+    /// Automation row does send one Apple Event probe -- to Mail.app, a local
+    /// application -- which is another process rather than another host.
     static func register(_ registry: ToolRegistry) {
         registry.register(
             MCPTool(
                 name: "permissions_check",
                 description: "Report current macOS permission status for the TCC-protected services macMCP uses (Location, Calendars, Contacts, Reminders, and Automation of Mail, which every mail_* tool needs). Read-only; does not trigger system prompts. Use Relay > Settings > MCP > Reset Permissions to grant or re-grant.",
                 inputSchema: emptySchema(),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: "System"
         ) { _ in
