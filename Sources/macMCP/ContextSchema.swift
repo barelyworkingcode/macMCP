@@ -33,15 +33,21 @@ import Foundation
 /// that is not real. The mail fields honour that -- they were declared in the
 /// same server version that enforces them.
 ///
-/// **The six calendar / contacts / reminders fields below are declared ahead
-/// of their enforcement, deliberately and as a staging step, and this branch
-/// must not reach a running relay on its own.** Relay's own call-time presence
-/// check will refuse a `calendars_*` call from a profile that sets no value,
-/// so the *presence* half is live the moment this ships; the *value* half --
-/// which calendar -- is not, and a profile scoped to `iCloud/Work` would be
-/// shown as confined while `calendars_list_events` still answered from every
-/// calendar on the Mac. That is exactly decision 9's failure. The enforcement
-/// lands on top of this in the same release.
+/// **The six calendar / contacts / reminders fields below were declared ahead
+/// of their enforcement, as a staging step, and that state must not reach a
+/// running relay.** Relay's own call-time presence check refuses a `calendars_*`
+/// call from a profile that sets no value, so the *presence* half goes live the
+/// moment a field is declared; the *value* half -- which calendar -- does not,
+/// and a profile scoped to `iCloud/Work` would have been shown as confined while
+/// `calendars_list_events` still answered from every calendar on the Mac. That
+/// is exactly decision 9's failure.
+///
+/// `calendar_accounts`, `calendars`, `reminder_accounts` and `reminder_lists`
+/// are now enforced: `ScopedRows` (`Services/EventKitScope.swift`) applies the
+/// reconciliation rule at every one of the six tools those four govern, and
+/// `CalendarRemindersScopeWiringTests` is what says so tool by tool.
+/// `contact_accounts` and `contact_groups` are the remainder, and this file is
+/// the honest place to say which half of the declaration is real.
 let macmcpContextSchema: JSONObject = {
     var schema: JSONObject = [:]
     for field in scopeFields { schema[field.name] = field.declaration }

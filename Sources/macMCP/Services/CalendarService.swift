@@ -87,16 +87,45 @@ enum CalendarService {
     // MARK: - Tool Handlers
 
     private static func listCalendars(_ ctx: MCPCallContext) -> MCPCallResult {
+        // The presence check runs before the TCC check on purpose: it is a
+        // question about this call's authority, which does not depend on
+        // whether this Mac would have answered. Ordering it second would make
+        // the refusal a client sees vary with a grant it has nothing to do
+        // with, and would put the one check that is macMCP's own behind a
+        // framework read no hermetic test can make.
+        let scope = ResourceScope.parse(ctx.meta)
+        if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+            return scopeViolationResult(refusal)
+        }
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
 
         let calendars = store.calendars(for: .event)
-        let results: [[String: Any]] = calendars.map { cal in
-            [
+        let rows = rows(of: calendars)
+        let admitted: [Int]
+        switch confinement(scope, rows: rows) {
+        case .unscoped: admitted = Array(calendars.indices)
+        case .confined(let indices): admitted = indices
+        case .refused(let message): return scopeViolationResult(message)
+        case .misconfigured(let message): return errorResult(message)
+        }
+
+        // An enumerator is scoped too (ADR-011, "The reconciliation rule the
+        // MCP implements"). Listing every calendar on the machine to a confined
+        // client is a disclosure in itself, and it is also how that client
+        // learns what to try next.
+        let results: [[String: Any]] = admitted.map { index in
+            let cal = calendars[index]
+            return [
                 "title": cal.title,
+                // The handle. `title` is not one -- two sources can each hold a
+                // "Work" -- so the value a caller passes back as
+                // `calendar_name` has to be the path, and it has to be in the
+                // one listing that hands it out.
+                "path": rows[index].path,
                 "type": calendarTypeName(cal.type),
-                "source": cal.source?.title ?? unknownSourceName
+                "source": rows[index].container
             ]
         }
         return jsonResult(results)
@@ -104,6 +133,11 @@ enum CalendarService {
 
     private static func listEvents(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
+        // Authority before availability; see `listCalendars`.
+        let scope = ResourceScope.parse(ctx.meta)
+        if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+            return scopeViolationResult(refusal)
+        }
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
@@ -120,13 +154,29 @@ enum CalendarService {
             return dateFormatError("end_date", endStr)
         }
 
-        var calendars: [EKCalendar]? = nil
+        let all = store.calendars(for: .event)
+        let rows = rows(of: all)
+        let admitted: [Int]?
+        switch confinement(scope, rows: rows) {
+        case .unscoped: admitted = nil
+        case .confined(let indices): admitted = indices
+        case .refused(let message): return scopeViolationResult(message)
+        case .misconfigured(let message): return errorResult(message)
+        }
+
+        // `nil` means "every calendar on this Mac", which is what
+        // `predicateForEvents` reads it as -- correct only when nothing is in
+        // play. An omitted `calendar_name` under a scope resolves **to the
+        // scope**, not to everything: a tool's own default is not a choice the
+        // caller made.
+        var calendars: [EKCalendar]? = admitted.map { $0.map { all[$0] } }
         if let name = args?["calendar_name"]?.stringValue {
-            let matched = store.calendars(for: .event).filter { $0.title == name }
-            if matched.isEmpty {
-                return errorResult("calendar not found: \(name)")
+            switch ScopedRows.resolve(name, rows: rows, allowed: admitted, fields: scopeFields) {
+            case .rows(let indices): calendars = indices.map { all[$0] }
+            case .outOfScope(let message): return scopeViolationResult(message)
+            case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                return errorResult(message)
             }
-            calendars = matched
         }
 
         let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: calendars)
@@ -137,7 +187,11 @@ enum CalendarService {
                 "title": event.title ?? "",
                 "start_date": displayFormatter.string(from: event.startDate),
                 "end_date": displayFormatter.string(from: event.endDate),
-                "calendar": event.calendar?.title ?? ""
+                "calendar": event.calendar?.title ?? "",
+                // The title is kept because it always has been; the path is
+                // added because it is the only one of the two a caller can pass
+                // back as `calendar_name` and be sure which calendar it names.
+                "calendar_path": event.calendar.map { row(of: $0).path } ?? ""
             ]
             if let location = event.location, !location.isEmpty {
                 dict["location"] = location
@@ -152,6 +206,11 @@ enum CalendarService {
 
     private static func createEvent(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
+        // Authority before availability; see `listCalendars`.
+        let scope = ResourceScope.parse(ctx.meta)
+        if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+            return scopeViolationResult(refusal)
+        }
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
@@ -174,11 +233,38 @@ enum CalendarService {
         event.startDate = startDate
         event.endDate = endDate
 
+        let all = store.calendars(for: .event)
+        let rows = rows(of: all)
+        let admitted: [Int]?
+        switch confinement(scope, rows: rows) {
+        case .unscoped: admitted = nil
+        case .confined(let indices): admitted = indices
+        case .refused(let message): return scopeViolationResult(message)
+        case .misconfigured(let message): return errorResult(message)
+        }
+
         if let calendarName = args?["calendar_name"]?.stringValue {
-            if let cal = store.calendars(for: .event).first(where: { $0.title == calendarName }) {
-                event.calendar = cal
-            } else {
-                return errorResult("calendar not found: \(calendarName)")
+            switch ScopedRows.resolve(calendarName, rows: rows, allowed: admitted, fields: scopeFields) {
+            case .rows(let indices): event.calendar = all[indices[0]]
+            case .outOfScope(let message): return scopeViolationResult(message)
+            case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                return errorResult(message)
+            }
+        } else if let admitted {
+            // EventKit answers `defaultCalendarForNewEvents` whatever the scope
+            // says, and writing there is how a confined client silently files an
+            // event on a calendar its profile never granted. The same shape as
+            // mail refusing a `from` no account owns rather than letting Mail
+            // substitute the default account: resolve to the scope, or refuse.
+            let defaultIndex = store.defaultCalendarForNewEvents
+                .flatMap { def in all.firstIndex { $0.calendarIdentifier == def.calendarIdentifier } }
+            switch ScopedRows.defaultTarget(
+                defaultIndex: defaultIndex, allowed: admitted, rows: rows, fields: scopeFields
+            ) {
+            case .rows(let indices): event.calendar = all[indices[0]]
+            case .outOfScope(let message): return scopeViolationResult(message)
+            case .notFound(let message), .ambiguous(let message), .needsChoice(let message):
+                return errorResult(message)
             }
         } else {
             event.calendar = store.defaultCalendarForNewEvents
@@ -220,10 +306,43 @@ enum CalendarService {
     /// `[]`.
     static func calendarRows() -> (rows: [ScopePath.Row], error: String?) {
         guard hasAccess() else { return ([], accessDeniedMsg) }
-        let rows = store.calendars(for: .event).map {
-            ScopePath.Row(container: $0.source?.title ?? unknownSourceName, leaf: $0.title)
-        }
-        return (rows, nil)
+        return (rows(of: store.calendars(for: .event)), nil)
+    }
+
+    // MARK: - Enforcement (ADR-011, "The reconciliation rule the MCP implements")
+
+    /// The words every calendar refusal is written in.
+    static let scopeFields = ScopedRows.Fields(
+        containerField: "calendar_accounts",
+        containerNoun: "calendar account",
+        leafField: "calendars",
+        leafNoun: "calendar",
+        argument: "calendar_name",
+        listTool: "calendars_list"
+    )
+
+    /// One calendar as the (container, leaf) pair a scope value is written in.
+    ///
+    /// The **one** place a calendar becomes a path, so the enumeration an
+    /// operator picks a value out of, the listing a client reads and the
+    /// comparison the enforcement makes cannot disagree about what a calendar
+    /// is called. `EKCalendar.title` is not an identity: two sources can each
+    /// hold a "Work", which is why `$0.title == name` returned both.
+    static func row(of calendar: EKCalendar) -> ScopePath.Row {
+        ScopePath.Row(container: calendar.source?.title ?? unknownSourceName, leaf: calendar.title)
+    }
+
+    /// Rows positionally aligned with the calendars they came from, so an index
+    /// the enforcement returns names the very object the handler acts on.
+    static func rows(of calendars: [EKCalendar]) -> [ScopePath.Row] { calendars.map(row(of:)) }
+
+    private static func confinement(_ scope: ResourceScope, rows: [ScopePath.Row]) -> ScopedRows.RowScope {
+        ScopedRows.allowed(
+            rows: rows,
+            containers: scope.access("calendar_accounts"),
+            leaves: scope.access("calendars"),
+            fields: scopeFields
+        )
     }
 
     /// What `calendars_list` reports for a calendar whose source EventKit will
@@ -266,7 +385,7 @@ enum CalendarService {
                     properties: [
                         "start_date": stringProp("Start date — ISO 8601: '2026-06-12' (local midnight), '2026-06-12T09:00:00' (local time), or '2026-06-12T09:00:00-07:00'"),
                         "end_date": stringProp("End date — same formats as start_date; a bare date like '2026-06-12' means end of that day (23:59:59 local)"),
-                        "calendar_name": stringProp("Filter to a specific calendar by name")
+                        "calendar_name": stringProp("Filter to one calendar, named as Account/Calendar exactly as calendars_list reports its `path` — for example 'iCloud/Work'. A bare calendar name works only when a single calendar carries it; two carriers is refused with both named, because a title on its own does not identify a calendar. Omit to read every calendar this client may reach.")
                     ],
                     required: ["start_date", "end_date"]
                 ),
@@ -285,7 +404,7 @@ enum CalendarService {
                         "title": stringProp("Event title"),
                         "start_date": stringProp("Start date — ISO 8601: '2026-06-12' (local midnight), '2026-06-12T09:00:00' (local time), or '2026-06-12T09:00:00-07:00'"),
                         "end_date": stringProp("End date — same formats as start_date; a bare date like '2026-06-12' means end of that day (23:59:59 local)"),
-                        "calendar_name": stringProp("Calendar to add the event to (uses default if not specified)"),
+                        "calendar_name": stringProp("Calendar to add the event to, named as Account/Calendar exactly as calendars_list reports its `path` — for example 'iCloud/Work'. A bare calendar name works only when a single calendar carries it. Omitted, the event goes to this Mac's default calendar; a client whose access profile is scoped gets that default only when it is inside the scope, and is otherwise asked to name one rather than having the event filed somewhere it was never granted."),
                         "location": stringProp("Event location"),
                         "notes": stringProp("Event notes")
                     ],
