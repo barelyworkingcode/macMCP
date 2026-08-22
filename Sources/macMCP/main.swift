@@ -118,6 +118,14 @@ while let line = readLine(strippingNewline: true) {
         if result.isError == true {
             resultObj["isError"] = .bool(true)
         }
+        // `_meta` on the result, a sibling of `content` and `isError`, which is
+        // where MCP puts it. Today the only key is `scope_violation: true`
+        // (ADR-011 decision 7) -- omitted entirely when nothing set one, so a
+        // client or a relay that does not read it sees exactly the response it
+        // saw before this existed.
+        if let meta = result.meta, !meta.isEmpty {
+            resultObj["_meta"] = .object(meta)
+        }
         respond(JSONRPCResponse(id: req.id, result: .object(resultObj)))
 
     default:
