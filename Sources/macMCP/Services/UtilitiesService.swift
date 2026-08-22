@@ -1,7 +1,8 @@
 import Foundation
 
 enum UtilitiesService {
-    private static func playSound(_ args: JSONObject?) -> MCPCallResult {
+    private static func playSound(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let path = args?["path"]?.stringValue else {
             return errorResult("path is required")
         }

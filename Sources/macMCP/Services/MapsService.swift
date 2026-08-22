@@ -60,7 +60,8 @@ enum MapsService {
 
     // MARK: - Handlers
 
-    private static func search(_ args: JSONObject?) -> MCPCallResult {
+    private static func search(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let query = args?["query"]?.stringValue, !query.isEmpty else {
             return errorResult("query is required")
         }
@@ -113,7 +114,8 @@ enum MapsService {
         return jsonResult(results)
     }
 
-    private static func openInMaps(_ args: JSONObject?) -> MCPCallResult {
+    private static func openInMaps(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let query = args?["query"]?.stringValue, !query.isEmpty else {
             return errorResult("query is required")
         }
@@ -131,7 +133,8 @@ enum MapsService {
         #endif
     }
 
-    private static func getDirections(_ args: JSONObject?) -> MCPCallResult {
+    private static func getDirections(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let to = args?["to"]?.stringValue, !to.isEmpty else {
             return errorResult("to is required")
         }

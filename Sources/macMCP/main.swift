@@ -98,7 +98,16 @@ while let line = readLine(strippingNewline: true) {
         if let args = req.params?["arguments"]?.objectValue {
             arguments = args
         }
-        let result = registry.call(name: name, arguments: arguments)
+        // MCP convention: `_meta` rides as a sibling of `name`/`arguments`
+        // inside `params`. Relay injects `_meta.project_id` and, once a
+        // caller's access profile declares one, resource-scope fields
+        // (mail_accounts, mail_mailboxes, write_dirs -- see contextSchema
+        // below and MailScope). Absent stays absent rather than becoming an
+        // empty object, because MailScope's whole contract depends on being
+        // able to tell "no _meta at all" apart from "_meta present but a
+        // scope field empty" (ADR-011 decision 4).
+        let meta = req.params?["_meta"]?.objectValue
+        let result = registry.call(name: name, arguments: arguments, meta: meta)
 
         let contentValues: [JSONValue] = result.content.map { c in
             .object(["type": .string(c.type), "text": .string(c.text)])

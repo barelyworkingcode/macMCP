@@ -2162,7 +2162,8 @@ enum MailService {
 
     // MARK: - Tool Handlers
 
-    private static func listAccounts(_ args: JSONObject?) -> MCPCallResult {
+    private static func listAccounts(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         // `scopable: false`: there is no account, no mailbox and no limit to
         // pass, so "narrow the scope" would be advice the caller cannot follow.
         // `timeout_seconds` is not scope -- it says how long to wait, not what
@@ -2205,7 +2206,8 @@ enum MailService {
     /// sentence saying why, which is the shape the scan uses for
     /// `skipped_mailboxes`. Naming one account is different: there is nothing
     /// left to degrade to, so that path still refuses.
-    private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
+    private static func listMailboxes(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let account = args?["account"]?.stringValue
         // Naming an account is the only narrowing this tool offers, so once one
         // has been given there is nothing left to suggest.
@@ -2296,7 +2298,8 @@ enum MailService {
         return script
     }
 
-    private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
+    private static func getEmails(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let account = args?["account"]?.stringValue
@@ -2345,7 +2348,8 @@ enum MailService {
         payload["rows_dropped"] = outcome.dropped
     }
 
-    private static func getEmail(_ args: JSONObject?) -> MCPCallResult {
+    private static func getEmail(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
@@ -3055,7 +3059,8 @@ JSON.stringify(out);
         return (candidates, eligible.count, cap - candidates.count)
     }
 
-    private static func searchEmails(_ args: JSONObject?) -> MCPCallResult {
+    private static func searchEmails(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let query = args?["query"]?.stringValue else {
             return errorResult("query is required")
         }
@@ -4166,7 +4171,8 @@ JSON.stringify(out);
     /// is what made it necessary -- there is no window whose closing would
     /// have done it -- so the two go together, and neither can be dropped in
     /// favour of the other.
-    private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
+    private static func sendEmail(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         invalidateSourceCache()
         // `disposesMessage: true`: after `send()` Mail has let go of the
         // compose message, which is the one state in which removing a leftover
@@ -4318,7 +4324,8 @@ var savedDraft = (function() {
 """
     }
 
-    private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
+    private static func createDraft(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         invalidateSourceCache()
         let call = MailCall.forArguments(args, default: Budget.createDraft)
         let account = args?["account"]?.stringValue
@@ -5088,7 +5095,8 @@ var savedDraft = (function() {
         return url
     }
 
-    private static func saveAttachment(_ args: JSONObject?) -> MCPCallResult {
+    private static func saveAttachment(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
@@ -5259,7 +5267,8 @@ var savedDraft = (function() {
         ])
     }
 
-    private static func getSource(_ args: JSONObject?) -> MCPCallResult {
+    private static func getSource(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
@@ -5579,7 +5588,8 @@ var savedDraft = (function() {
     """
     }
 
-    private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
+    private static func moveEmail(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
@@ -5663,7 +5673,8 @@ var savedDraft = (function() {
         """
     }
 
-    private static func markRead(_ args: JSONObject?) -> MCPCallResult {
+    private static func markRead(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }

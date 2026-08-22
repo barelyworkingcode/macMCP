@@ -60,7 +60,8 @@ enum WeatherService {
 
     // MARK: - Handlers
 
-    private static func currentWeather(_ args: JSONObject?) -> MCPCallResult {
+    private static func currentWeather(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let lat = extractDouble(args, key: "latitude"),
               let lon = extractDouble(args, key: "longitude") else {
             return errorResult("latitude and longitude are required")
@@ -73,7 +74,8 @@ enum WeatherService {
         return fetch(urlString)
     }
 
-    private static func forecast(_ args: JSONObject?) -> MCPCallResult {
+    private static func forecast(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let lat = extractDouble(args, key: "latitude"),
               let lon = extractDouble(args, key: "longitude") else {
             return errorResult("latitude and longitude are required")
@@ -90,7 +92,8 @@ enum WeatherService {
         return fetch(urlString)
     }
 
-    private static func hourly(_ args: JSONObject?) -> MCPCallResult {
+    private static func hourly(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let lat = extractDouble(args, key: "latitude"),
               let lon = extractDouble(args, key: "longitude") else {
             return errorResult("latitude and longitude are required")

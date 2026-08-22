@@ -48,7 +48,8 @@ enum MessagesService {
 
     // MARK: - Tool Handlers
 
-    private static func listChats(_ args: JSONObject?) -> MCPCallResult {
+    private static func listChats(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let limit = args?["limit"]?.intValue ?? 20
 
         guard let db = openDB() else {
@@ -90,7 +91,8 @@ enum MessagesService {
         return jsonResult(chats)
     }
 
-    private static func getChat(_ args: JSONObject?) -> MCPCallResult {
+    private static func getChat(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let chatId = args?["chat_id"]?.stringValue, !chatId.isEmpty else {
             return errorResult("chat_id is required")
         }
@@ -226,7 +228,8 @@ enum MessagesService {
         return dateOnly.date(from: raw)
     }
 
-    private static func searchMessages(_ args: JSONObject?) -> MCPCallResult {
+    private static func searchMessages(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let limit = max(args?["limit"]?.intValue ?? 100, 0)
         let query = args?["query"]?.stringValue?.lowercased()
 
@@ -346,7 +349,8 @@ enum MessagesService {
         return jsonResult(payload)
     }
 
-    private static func sendMessage(_ args: JSONObject?) -> MCPCallResult {
+    private static func sendMessage(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let to = args?["to"]?.stringValue, !to.isEmpty else {
             return errorResult("to is required")
         }

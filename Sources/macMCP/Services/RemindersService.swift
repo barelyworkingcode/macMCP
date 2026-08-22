@@ -58,7 +58,8 @@ enum RemindersService {
                 annotations: MCPAnnotations(readOnlyHint: true)
             ),
             category: cat
-        ) { args in
+        ) { ctx in
+            let args = ctx.arguments
             if let err = ensureAccess() { return errorResult(err) }
 
             let listName = args?["list_name"]?.stringValue
@@ -109,7 +110,8 @@ enum RemindersService {
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat
-        ) { args in
+        ) { ctx in
+            let args = ctx.arguments
             if let err = ensureAccess() { return errorResult(err) }
 
             guard let title = args?["title"]?.stringValue, !title.isEmpty else {
@@ -170,7 +172,8 @@ enum RemindersService {
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat
-        ) { args in
+        ) { ctx in
+            let args = ctx.arguments
             if let err = ensureAccess() { return errorResult(err) }
 
             guard let title = args?["title"]?.stringValue, !title.isEmpty else {

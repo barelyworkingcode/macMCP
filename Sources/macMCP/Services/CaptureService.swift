@@ -30,7 +30,8 @@ enum CaptureService {
 
     // MARK: - Tool Handlers
 
-    private static func captureScreenshot(_ args: JSONObject?) -> MCPCallResult {
+    private static func captureScreenshot(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let defaultPath = NSString(string: "~/Desktop/screenshot-\(timestamp()).png").expandingTildeInPath
         let path = args?["path"]?.stringValue ?? defaultPath
         let type = args?["type"]?.stringValue ?? "fullscreen"
@@ -55,7 +56,8 @@ enum CaptureService {
         return textResult("screenshot saved to \(path)")
     }
 
-    private static func captureAudio(_ args: JSONObject?) -> MCPCallResult {
+    private static func captureAudio(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         let defaultPath = NSString(string: "~/Desktop/recording-\(timestamp()).m4a").expandingTildeInPath
         let path = args?["path"]?.stringValue ?? defaultPath
         let duration = args?["duration"]?.intValue ?? 10
