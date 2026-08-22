@@ -84,8 +84,21 @@ while let line = readLine(strippingNewline: true) {
                 "description": .string(tool.description),
                 "inputSchema": tool.inputSchema
             ]
-            if let ann = tool.annotations, let ro = ann.readOnlyHint {
-                obj["annotations"] = .object(["readOnlyHint": .bool(ro)])
+            // Both hints, always, under the spellings the MCP specification
+            // defines. Relay reads them out of this object by exact key to
+            // decide two independent things -- whether a read-only profile may
+            // call the tool (`readOnlyHint`) and whether a profile without
+            // `allow_external` may (`openWorldHint`) -- and both default to the
+            // *unhelpful* answer when absent: absent `readOnlyHint` means
+            // mutating, absent `openWorldHint` means open world. Emitting only
+            // the hints that happened to be set would therefore publish a
+            // permission decision by omission, which is why `MCPAnnotations`
+            // has no optionals left to omit.
+            if let ann = tool.annotations {
+                obj["annotations"] = .object([
+                    "readOnlyHint": .bool(ann.readOnlyHint),
+                    "openWorldHint": .bool(ann.openWorldHint)
+                ])
             }
             if let cat = tool.category {
                 obj["category"] = .string(cat)

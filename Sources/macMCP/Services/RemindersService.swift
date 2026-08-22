@@ -107,6 +107,9 @@ enum RemindersService {
         return (ScopePath.entries(fromRows: rows, containerFilter: accountFilter), nil)
     }
 
+    /// Nothing here is open world: EventKit's local reminder store, read and
+    /// written. Account replication is not counted -- see
+    /// `MailService.register`.
     static func register(_ registry: ToolRegistry) {
         let cat = "Reminders"
 
@@ -121,7 +124,7 @@ enum RemindersService {
                         "list_name": stringProp("Reminder list to filter by, named as Account/List exactly as reminders_list reports its `list_path` — for example 'iCloud/Groceries'. A bare list name works only when a single list carries it; two carriers is refused with both named. Omit to list every reminder this client may reach.")
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
             category: cat
         ) { ctx in
@@ -203,7 +206,7 @@ enum RemindersService {
                     ],
                     required: ["title"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat
         ) { ctx in
@@ -300,7 +303,7 @@ enum RemindersService {
                     ],
                     required: ["title"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat
         ) { ctx in

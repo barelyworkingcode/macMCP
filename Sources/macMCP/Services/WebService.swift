@@ -9,6 +9,14 @@ enum WebService {
     static func register(_ registry: ToolRegistry) {
         let cat = "Web"
 
+        // **The tool this annotation was added for.** `web_fetch` is
+        // genuinely read-only -- it issues a GET and mutates nothing on this
+        // Mac -- so relay's `access: "read"` admits it, and a profile created
+        // to read one mailbox held an outbound HTTP channel to any URL a
+        // caller could name. That is an exfiltration channel wearing a
+        // read-only label, and no honest `readOnlyHint` could have caught it,
+        // because `true` is the honest answer on that axis. `openWorldHint`
+        // is the axis on which it is the most open tool this server has.
         registry.register(
             MCPTool(
                 name: "web_fetch",
@@ -20,7 +28,7 @@ enum WebService {
                     ],
                     required: ["url"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: true)
             ),
             category: cat,
             handler: fetch

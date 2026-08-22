@@ -144,8 +144,65 @@ struct MCPTool: Encodable {
     var category: String?
 }
 
+/// The two hints macMCP publishes about a tool, both of them load-bearing and
+/// therefore both of them **required**.
+///
+/// MCP models every annotation as optional with a default. That is the right
+/// shape for the wire and the wrong shape for the source, because the defaults
+/// run in opposite directions and both of ours are read by a permission check:
+///
+/// - `readOnlyHint` defaults to **false**, and relay's `access: "read"` admits
+///   a tool only if it is explicitly `true` (ADR-011 decision 2). A tool that
+///   forgets it loses read-only profiles.
+/// - `openWorldHint` defaults to **true** — the spec's default, which relay
+///   mirrors by treating an absent hint as open-world and gating it behind
+///   `allow_external`. A tool that forgets it loses *every* profile without
+///   that grant.
+///
+/// So an omission is never inert here; it is a silent permission change in one
+/// direction or the other, decided by which field was forgotten. Optionals
+/// would let a tool registered next year omit one and be wrong at runtime.
+/// Non-optional stored properties make the memberwise initialiser refuse to
+/// compile instead, which is the cheapest possible place to catch it — a test
+/// (`ToolAnnotationTests`) then pins *which* value each tool claims, but the
+/// compiler is what guarantees a claim was made at all. There are deliberately
+/// no default values for the same reason: a default is exactly the silent
+/// omission this is closing.
+///
+/// **`destructiveHint` and `idempotentHint` are deliberately not modelled.**
+/// Nothing consumes them — not relay, not this server — and an annotation
+/// nobody checks is a claim that rots without anyone noticing. Both are also
+/// harder to answer honestly than they look (`destructiveHint` is only defined
+/// when `readOnlyHint` is false, and "destructive" would need a per-tool
+/// judgement about a mail move or a mark-read that no reader would ever
+/// verify). They are worth adding the day something reads them, and not before.
 struct MCPAnnotations: Encodable {
-    var readOnlyHint: Bool?
+    /// The tool does not modify its environment. Read by relay's `access`
+    /// mode; `true` is what admits a tool to a read-only profile.
+    let readOnlyHint: Bool
+
+    /// The tool may interact with an "open world" of external entities — in
+    /// this server's terms, **the call itself is what reaches beyond this
+    /// Mac**.
+    ///
+    /// Orthogonal to `readOnlyHint`, and the pair is orthogonal in both
+    /// directions here: `web_fetch` and `weather_*` are read-only and open
+    /// world, `contacts_create` and `mail_move` are mutating and closed.
+    ///
+    /// Two things are specifically *not* open world, because otherwise the
+    /// annotation would say "true" about most of this server and mean nothing:
+    ///
+    /// 1. **Reading or writing a local store that some background agent keeps
+    ///    in sync with the user's own account.** Mail's Maildir, EventKit,
+    ///    `CNContactStore`, `chat.db`. That replication happens whether or not
+    ///    a tool is called, it carries nothing the caller chose, and it reaches
+    ///    only accounts this Mac was already configured to talk to. Counting it
+    ///    would make `mail_get_emails` and `mail_send` the same claim, which is
+    ///    the distinction this hint exists to draw.
+    /// 2. **Naming a remote thing without contacting it.**
+    ///    `maps_get_directions` builds a `maps.apple.com` URL out of the
+    ///    caller's own strings and opens no socket.
+    let openWorldHint: Bool
 }
 
 struct MCPContent: Encodable {

@@ -73,6 +73,16 @@ enum CaptureService {
 
     // MARK: - Registration
 
+    // **Not open world, and the scary-sounding one is the clearest case.**
+    // `capture_screenshot` drives `/usr/sbin/screencapture` and
+    // `capture_audio` drives `/usr/bin/afrecord`; both read a local device and
+    // write a local file, and neither opens a socket or names anything off
+    // this Mac. They are heavily privileged (Screen Recording, Microphone) and
+    // that privilege is a different question from this one -- what keeps them
+    // away from a mail profile is `allowed_tools`, not this hint. Annotating
+    // them open world because they *feel* dangerous would make the hint mean
+    // "risky" instead of "reaches outside", and then it would answer neither.
+
     static func register(_ registry: ToolRegistry) {
         let cat = "Capture"
 
@@ -86,7 +96,7 @@ enum CaptureService {
                         "type": enumProp("Capture type", values: ["fullscreen", "window", "selection"])
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: captureScreenshot
@@ -102,7 +112,7 @@ enum CaptureService {
                         "duration": intProp("Recording duration in seconds (defaults to 10)")
                     ]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: false)
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
             ),
             category: cat,
             handler: captureAudio

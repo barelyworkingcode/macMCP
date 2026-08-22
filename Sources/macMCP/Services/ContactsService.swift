@@ -23,6 +23,11 @@ enum ContactsService {
 
     // MARK: - Registration
 
+    /// Nothing here is open world: all ten tools read or write
+    /// `CNContactStore`, this Mac's own address book. A card written into an
+    /// iCloud or Exchange container replicates to that account, which is the
+    /// background sync `MailService.register` declines to count -- the call
+    /// addresses a local record and delivers nothing to anyone.
     static func register(_ registry: ToolRegistry) {
         let cat = "Contacts"
 
@@ -35,7 +40,7 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "query": stringProp("Name to search for. Omit to list all contacts."),
             ]),
-            annotations: MCPAnnotations(readOnlyHint: true)
+            annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
         ), category: cat, handler: contactsList)
 
         registry.register(MCPTool(
@@ -44,7 +49,7 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
             ], required: ["id"]),
-            annotations: MCPAnnotations(readOnlyHint: true)
+            annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
         ), category: cat, handler: contactsGet)
 
         registry.register(MCPTool(
@@ -70,7 +75,7 @@ enum ContactsService {
                     + "to no group. Under a contacts resource scope this argument requires a "
                     + "`contact_groups` grant, and the group decides the account."),
             ], required: ["first_name"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsCreate)
 
         registry.register(MCPTool(
@@ -85,7 +90,7 @@ enum ContactsService {
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
             ], required: ["id"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsUpdate)
 
         registry.register(MCPTool(
@@ -94,7 +99,7 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
             ], required: ["id"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsDelete)
 
         registry.register(MCPTool(
@@ -103,7 +108,7 @@ enum ContactsService {
                 + "each. Under a contacts resource scope, only the groups that scope names are listed, "
                 + "and a client whose profile grants accounts but no groups cannot call this at all.",
             inputSchema: emptySchema(),
-            annotations: MCPAnnotations(readOnlyHint: true)
+            annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
         ), category: cat, handler: contactsListGroups)
 
         registry.register(MCPTool(
@@ -114,7 +119,7 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "name": stringProp("Group name"),
             ], required: ["name"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsCreateGroup)
 
         registry.register(MCPTool(
@@ -126,7 +131,7 @@ enum ContactsService {
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
             ], required: ["contact_id", "group_id"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsAddToGroup)
 
         registry.register(MCPTool(
@@ -138,7 +143,7 @@ enum ContactsService {
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
             ], required: ["contact_id", "group_id"]),
-            annotations: MCPAnnotations(readOnlyHint: false)
+            annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
         ), category: cat, handler: contactsRemoveFromGroup)
 
         registry.register(MCPTool(
@@ -149,7 +154,7 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "phone": stringProp("Phone number to search for (any format)"),
             ], required: ["phone"]),
-            annotations: MCPAnnotations(readOnlyHint: true)
+            annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
         ), category: cat, handler: contactsSearchByPhone)
     }
 
