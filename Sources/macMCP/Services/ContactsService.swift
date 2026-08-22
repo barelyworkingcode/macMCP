@@ -30,7 +30,8 @@ enum ContactsService {
             name: "contacts_list",
             description: "Search or list contacts. Returns id, name, phones, emails, and addresses. "
                 + "When this client's access profile carries a contacts resource scope, this lists the "
-                + "members of the contact groups that scope names and nothing else.",
+                + "cards in the contact accounts that scope names and nothing else — including cards "
+                + "that belong to no group.",
             inputSchema: schema(properties: [
                 "query": stringProp("Name to search for. Omit to list all contacts."),
             ]),
@@ -49,9 +50,10 @@ enum ContactsService {
         registry.register(MCPTool(
             name: "contacts_create",
             description: "Create a new contact. Returns the new contact id. When this client's access "
-                + "profile carries a contacts resource scope, the new contact is filed in the account "
-                + "of a group that scope names and added to that group, so the client can read back "
-                + "what it wrote; pass `group` to choose which when the scope names more than one.",
+                + "profile carries a contacts resource scope, the new contact is filed in one of the "
+                + "accounts that scope names, so the client can read back what it wrote; pass "
+                + "`account` to choose which when the scope names more than one. Adding it to a group "
+                + "as well needs `group`, and that argument needs a contact group grant.",
             inputSchema: schema(properties: [
                 "first_name": stringProp("First name"),
                 "last_name": stringProp("Last name"),
@@ -59,10 +61,14 @@ enum ContactsService {
                 "email": stringProp("Email address"),
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
-                "group": stringProp("Group to file the new contact in, written Account/Group (for "
-                    + "example \"iCloud/Family\") as contacts_list_groups reports it. Omit to use the "
-                    + "default account and no group, or — under a contacts resource scope naming "
-                    + "exactly one group — that group."),
+                "account": stringProp("Contact account to file the new contact in, as "
+                    + "contacts_list_groups reports one (for example \"iCloud\" or \"On My Mac\"). "
+                    + "Omit to use the default account, or — under a contacts resource scope naming "
+                    + "exactly one account — that account."),
+                "group": stringProp("Group to add the new contact to, written Account/Group (for "
+                    + "example \"iCloud/Family\") as contacts_list_groups reports it. Omit to add it "
+                    + "to no group. Under a contacts resource scope this argument requires a "
+                    + "`contact_groups` grant, and the group decides the account."),
             ], required: ["first_name"]),
             annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsCreate)
@@ -94,7 +100,8 @@ enum ContactsService {
         registry.register(MCPTool(
             name: "contacts_list_groups",
             description: "List contact groups. Returns id, name, account and path (Account/Group) for "
-                + "each. Under a contacts resource scope, only the groups that scope names are listed.",
+                + "each. Under a contacts resource scope, only the groups that scope names are listed, "
+                + "and a client whose profile grants accounts but no groups cannot call this at all.",
             inputSchema: emptySchema(),
             annotations: MCPAnnotations(readOnlyHint: true)
         ), category: cat, handler: contactsListGroups)
@@ -112,8 +119,9 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_add_to_group",
-            description: "Add a contact to a group. Both the contact and the group must be within this "
-                + "client's contacts resource scope, where it has one.",
+            description: "Add a contact to a group. Under a contacts resource scope both ends are "
+                + "checked: the contact must be in an account the profile names, and the group must be "
+                + "one the profile names.",
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
@@ -123,8 +131,9 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_remove_from_group",
-            description: "Remove a contact from a group. Both the contact and the group must be within "
-                + "this client's contacts resource scope, where it has one.",
+            description: "Remove a contact from a group. Under a contacts resource scope both ends "
+                + "are checked: the contact must be in an account the profile names, and the group "
+                + "must be one the profile names.",
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
@@ -135,7 +144,7 @@ enum ContactsService {
         registry.register(MCPTool(
             name: "contacts_search_by_phone",
             description: "Search contacts by phone number. Normalizes formatting before matching. "
-                + "Under a contacts resource scope, only the members of the groups that scope names "
+                + "Under a contacts resource scope, only the cards in the accounts that scope names "
                 + "are searched.",
             inputSchema: schema(properties: [
                 "phone": stringProp("Phone number to search for (any format)"),
@@ -317,23 +326,41 @@ enum ContactsService {
         return (groups.map(\.row), nil)
     }
 
+    /// Every contact account on this Mac, with the handle a card fetch is
+    /// predicated on.
+    ///
+    /// **This is the read half of the card bound**, and the counterpart of
+    /// `groupCatalog`: `ContactScope.select(containers:accounts:)` takes the
+    /// list and decides what is in scope, and that function touches no
+    /// framework, which is what lets the rule be tested without the user's
+    /// address book. The read does nothing but read.
+    static func accountCatalog() -> (accounts: [ContactAccountRef], error: String?) {
+        guard hasAccess() else { return ([], accessDeniedMsg) }
+        do {
+            let containers = try store.containers(matching: nil)
+            return (
+                containers.map { ContactAccountRef(name: containerName($0), identifier: $0.identifier) },
+                nil
+            )
+        } catch {
+            return ([], "failed to read contact accounts: \(error.localizedDescription)")
+        }
+    }
+
     /// The containers themselves, read directly rather than derived from
     /// `groupRows`.
     ///
     /// A calendar account with no calendars grants nothing and is left out of
     /// that picker; a contact account with no *groups* is not the same thing,
-    /// because `contact_accounts` governs the cards as well -- `contacts_list`
-    /// and `contacts_search_by_phone` read contacts, which live in a container
-    /// whether or not any group does. Deriving accounts from group rows would
-    /// hide an account holding a thousand cards and no group.
+    /// because `contact_accounts` is the field that governs the **cards** --
+    /// `contacts_list` and `contacts_search_by_phone` read contacts, which live
+    /// in a container whether or not any group does. Deriving accounts from
+    /// group rows would hide an account holding a thousand cards and no group,
+    /// which is precisely the profile this field exists to make expressible.
     static func enumerateAccounts() -> ScopeEnumeration {
-        guard hasAccess() else { return ([], accessDeniedMsg) }
-        do {
-            let containers = try store.containers(matching: nil)
-            return (ScopePath.containerEntries(fromContainers: containers.map(containerName)), nil)
-        } catch {
-            return ([], "failed to read contact accounts: \(error.localizedDescription)")
-        }
+        let (accounts, error) = accountCatalog()
+        if let error { return ([], error) }
+        return (ScopePath.containerEntries(fromContainers: accounts.map(\.name)), nil)
     }
 
     static func enumerateGroups(accountFilter: [String]?) -> ScopeEnumeration {
@@ -350,40 +377,79 @@ enum ContactsService {
     ///
     /// 1. **The presence check** (ADR-011 decision 4), read off macMCP's own
     ///    declaration rather than a list re-typed per handler. A mediated call
-    ///    carrying no `contact_accounts` or no `contact_groups` refuses here,
-    ///    before the address book is touched at all.
-    /// 2. **The catalog read.** Only reached when the call is either unmediated
-    ///    or carries both values.
-    /// 3. **The reconciliation** (`contactGroupTargets`), which is pure.
+    ///    carrying no `contact_accounts` -- or, for one of the four group
+    ///    tools, no `contact_groups` -- refuses here, before the address book
+    ///    is touched at all.
+    /// 2. **The catalog reads.** Only reached when the call is either
+    ///    unmediated or carries what it needs. The **group** catalog is read
+    ///    only for the tools `contact_groups` governs, which is what makes an
+    ///    account-only profile cost one framework read rather than two.
+    /// 3. **The reconciliation** (`contactAccountTargets`, and
+    ///    `contactGroupTargets` where it applies), which is pure.
     ///
-    /// **The catalog is read only when a scope is in play.** An unscoped call
+    /// **The catalogs are read only when a scope is in play.** An unscoped call
     /// must cost exactly what it always did and must not acquire a new way to
     /// fail: reading the containers on every `contacts_get` would make a
     /// container that will not answer break a tool that never needed one. The
-    /// two unscoped paths that do need it (`contacts_list_groups`, and
-    /// `contacts_create` when a `group` was named) read it themselves.
+    /// two unscoped paths that do need one (`contacts_list_groups`, and
+    /// `contacts_create` when a `group` or an `account` was named) read it
+    /// themselves.
     enum ContactsGate {
         /// Nobody mediated. Every tool behaves exactly as it always has.
         case unscoped
-        /// Confined to these groups, and to their members.
-        case scoped([ContactGroupRef])
+        /// Confined to this.
+        case scoped(ContactsBound)
         /// The call is over. `result` is what it answers.
         case stop(MCPCallResult)
     }
 
+    /// What a confined call may reach: the accounts whose cards are in play,
+    /// and -- only for a tool `contact_groups` governs -- the groups.
+    ///
+    /// **`groups` is `nil` rather than `[]` for a tool the group field does not
+    /// govern, and the difference is load-bearing.** `[]` is not a reachable
+    /// state (an empty selection is a misconfiguration, never a confinement to
+    /// nothing), so `nil` cannot be confused with "granted no groups"; it means
+    /// *this tool never asked*. A group handler that finds it `nil` refuses,
+    /// which is the second, independent check on the declaration: a group tool
+    /// added to this file but not to `contact_groups`'s `applies_to` fails
+    /// closed rather than running unconfined.
+    struct ContactsBound: Equatable {
+        let accounts: [ContactAccountRef]
+        let groups: [ContactGroupRef]?
+
+        init(accounts: [ContactAccountRef], groups: [ContactGroupRef]? = nil) {
+            self.accounts = accounts
+            self.groups = groups
+        }
+    }
+
+    /// Whether `contact_groups` governs this tool, asked of macMCP's own
+    /// declaration rather than of a list re-typed here.
+    ///
+    /// The same reasoning as `presenceRefusal`'s: a field added to (or removed
+    /// from) a tool's `applies_to` must change what that tool checks, without
+    /// anyone remembering to widen a second list. This is the one place the
+    /// account/group split is read at runtime.
+    static func governedByGroups(tool: String) -> Bool {
+        restrictFieldsGoverning(tool: tool).contains("contact_groups")
+    }
+
     /// The two impure steps are **injected**, defaulted to the real ones.
     ///
-    /// Not for flexibility -- nothing but a test will ever pass either -- but
-    /// because this is the single chokepoint all ten tools go through, and the
-    /// alternative was a chokepoint that could only be exercised by reading the
-    /// user's own address book. With them injected the whole of it is a pure
-    /// decision, including the two orderings that matter: that a call with no
-    /// authority is refused **before** the store is asked anything, and that an
-    /// unmediated one never reads the catalog at all.
+    /// Not for flexibility -- nothing but a test will ever pass any of them --
+    /// but because this is the single chokepoint all ten tools go through, and
+    /// the alternative was a chokepoint that could only be exercised by reading
+    /// the user's own address book. With them injected the whole of it is a
+    /// pure decision, including the three orderings that matter: that a call
+    /// with no authority is refused **before** the store is asked anything,
+    /// that an unmediated one reads no catalog at all, and that a card tool
+    /// never reads the group catalog.
     static func gate(
         _ ctx: MCPCallContext,
         authorized: () -> Bool = hasAccess,
-        catalog readCatalog: () -> (groups: [ContactGroupRef], error: String?) = groupCatalog
+        accounts readAccounts: () -> (accounts: [ContactAccountRef], error: String?) = accountCatalog,
+        groups readGroups: () -> (groups: [ContactGroupRef], error: String?) = groupCatalog
     ) -> ContactsGate {
         // The presence check runs before the TCC check, because it is a
         // question about this client's authority rather than about this Mac:
@@ -395,9 +461,61 @@ enum ContactsService {
         }
         guard authorized() else { return .stop(errorResult(accessDeniedMsg)) }
         guard scope.isScoped else { return .unscoped }
-        let (catalog, error) = readCatalog()
-        if let error { return .stop(errorResult(error)) }
-        return gate(for: scope.contactGroupTargets(catalog: catalog))
+
+        let (accountRows, accountError) = readAccounts()
+        if let accountError { return .stop(errorResult(accountError)) }
+        let accounts = scope.contactAccountTargets(catalog: accountRows)
+        // A scope that does not resolve to an account is already the answer,
+        // and reading the groups for it would be a framework read on behalf of
+        // a call that is over.
+        guard case .use = accounts else { return gate(for: bind(accounts: accounts, groups: nil)) }
+
+        var groups: ResourceScope.Decision<[ContactGroupRef]>?
+        if governedByGroups(tool: ctx.toolName) {
+            let (groupRows, groupError) = readGroups()
+            if let groupError { return .stop(errorResult(groupError)) }
+            groups = scope.contactGroupTargets(catalog: groupRows)
+        }
+        return gate(for: bind(accounts: accounts, groups: groups))
+    }
+
+    /// The two decisions, combined into the one the gate maps. Pure.
+    ///
+    /// **The account decision is the outer one.** It bounds the cards, it
+    /// governs every tool, and the group half is already a cross-product
+    /// against the same `contact_accounts` values -- so an account failure is
+    /// the whole answer and the group failure is only reached once the
+    /// accounts hold.
+    static func bind(
+        accounts: ResourceScope.Decision<[ContactAccountRef]>,
+        groups: ResourceScope.Decision<[ContactGroupRef]>?
+    ) -> ResourceScope.Decision<ContactsBound> {
+        switch accounts {
+        case .unscoped:
+            return .unscoped
+        case .refuse(let message):
+            return .refuse(message)
+        case .misconfigured(let message):
+            return .misconfigured(message)
+        case .use(let inScopeAccounts):
+            guard let groups else { return .use(ContactsBound(accounts: inScopeAccounts)) }
+            switch groups {
+            // Unreachable: one call carries one scope, so a `.use` on the
+            // account field cannot sit beside an `.unscoped` on the group
+            // field. Mapped to a refusal rather than to `.unscoped` anyway,
+            // because the fail-open reading of an impossible state is the one
+            // that turns a confined call into an unconfined one.
+            case .unscoped:
+                return .refuse(ResourceScope.refusalNoValue(
+                    field: "contact_groups", noun: "contact group"))
+            case .refuse(let message):
+                return .refuse(message)
+            case .misconfigured(let message):
+                return .misconfigured(message)
+            case .use(let inScopeGroups):
+                return .use(ContactsBound(accounts: inScopeAccounts, groups: inScopeGroups))
+            }
+        }
     }
 
     /// The last step of `gate`, split out because it carries the one
@@ -406,15 +524,15 @@ enum ContactsService {
     ///
     /// **A `.refuse` is a `scope_violation` and a `.misconfigured` is not.** A
     /// violation is a client probing a boundary and belongs in relay's
-    /// alerting; a `contact_groups` value naming a group that is not on this
-    /// Mac is an operator's typo and belongs in the editor. Conflating them
-    /// fills a security signal with configuration mistakes.
-    static func gate(for decision: ResourceScope.Decision<[ContactGroupRef]>) -> ContactsGate {
+    /// alerting; a `contact_accounts` value naming an account that is not on
+    /// this Mac is an operator's typo and belongs in the editor. Conflating
+    /// them fills a security signal with configuration mistakes.
+    static func gate(for decision: ResourceScope.Decision<ContactsBound>) -> ContactsGate {
         switch decision {
         case .unscoped:
             return .unscoped
-        case .use(let groups):
-            return .scoped(groups)
+        case .use(let bound):
+            return .scoped(bound)
         case .refuse(let message):
             return .stop(scopeViolationResult(message))
         case .misconfigured(let message):
@@ -422,9 +540,26 @@ enum ContactsService {
         }
     }
 
+    /// The answer for a group tool whose gate carried no group bound.
+    ///
+    /// Unreachable while `contact_groups`'s `applies_to` names the tool: the
+    /// presence check refuses first, and `gate` reads the group catalog for
+    /// exactly the tools that declaration selects. It exists because the two
+    /// have to agree, and a group tool added to this file without being added
+    /// to the declaration must refuse rather than run unconfined -- the same
+    /// fail-closed reading ADR-011 finding 9 asks of a denylist one level up.
+    static func groupBoundMissing() -> MCPCallResult {
+        scopeViolationResult(
+            "this call is confined by a contacts resource scope that names no contact group, and "
+            + "this tool cannot act without one. An access profile that grants `contact_accounts` "
+            + "reads cards; changing a group needs `contact_groups` set to the groups this client "
+            + "may reach."
+        )
+    }
+
     // MARK: - Reading cards, under a scope and without one
 
-    /// Every card that is a member of one of these groups, deduplicated.
+    /// Every card in one of these accounts, deduplicated.
     ///
     /// **`unifyResults = false`.** A scoped read never unifies: a unified
     /// contact merges linked cards across containers, so its fields can carry
@@ -435,24 +570,25 @@ enum ContactsService {
     /// accounts in scope -- which is the truthful rendering of what it may
     /// reach.
     ///
-    /// One fetch per group, each predicated on that group, so a scoped read
-    /// touches only the cards in scope. It is not a filter over the store: the
-    /// store is never enumerated.
+    /// **One fetch per in-scope container**, each predicated on that container,
+    /// so a scoped read touches only the cards in scope. It is not a filter over
+    /// the store: the store is never enumerated. `CNContactFetchRequest` takes
+    /// one predicate and Contacts has no compound predicates, so any further
+    /// matching -- a name, a phone number -- happens in Swift over what came
+    /// back, which is the choice that reads *less* (`nameMatches`,
+    /// `phoneMatches`).
     ///
-    /// **The account half of the cross-product is already spent by the time
-    /// this runs.** A group belongs to a container and its members are cards in
-    /// that container, and `ContactScope.select` has already refused any group
-    /// whose container is not in `contact_accounts` -- so there is no second
-    /// per-card container check here, and adding one would be checking a
-    /// property of the group against a list the group has already been checked
-    /// against. The confinement a caller was granted is the *group*; that is
-    /// what is fetched.
-    private static func members(of groups: [ContactGroupRef]) -> (contacts: [CNContact], error: String?) {
+    /// This is the whole card bound. A card is in scope because its container
+    /// is, group or no group -- which is the shape the group-membership fetch
+    /// this replaced could not express, since a card that is in no group is a
+    /// member of nothing and came back from no fetch.
+    private static func cards(in accounts: [ContactAccountRef]) -> (contacts: [CNContact], error: String?) {
         var byID: [String: CNContact] = [:]
         var order: [String] = []
-        for group in groups {
+        for account in accounts {
             let request = CNContactFetchRequest(keysToFetch: fetchKeys)
-            request.predicate = CNContact.predicateForContactsInGroup(withIdentifier: group.identifier)
+            request.predicate = CNContact.predicateForContactsInContainer(
+                withIdentifier: account.identifier)
             request.unifyResults = false
             request.sortOrder = .givenName
             do {
@@ -463,31 +599,68 @@ enum ContactsService {
                     }
                 }
             } catch {
-                return ([], "failed to read the members of \(group.path): \(error.localizedDescription)")
+                return ([], "failed to read the contacts in \(account.name): \(error.localizedDescription)")
             }
         }
         return (order.compactMap { byID[$0] }, nil)
     }
 
-    /// Whether a contact id names a card that exists *somewhere* on this Mac,
-    /// asked without reading the card.
+    /// Which containers hold the card with this id, asked **without reading the
+    /// card**. `nil` means the probe itself failed.
     ///
-    /// ADR-011 decision 11 needs this: a found-but-out-of-scope handle must be
-    /// refused as out of scope rather than reported as "not found", because a
-    /// "not found" is indistinguishable from a real miss and leaves an operator
-    /// nothing to debug. `CNContainer.predicateForContainerOfContact` answers
-    /// the existence question **without returning any of the card's data**, so
-    /// the check discloses nothing to the caller beyond what the refusal
-    /// already says, and the refusal never names the container that came back.
+    /// This is both halves of the card check. `CNContainer
+    /// .predicateForContainerOfContact` returns containers, not contact data,
+    /// so it answers "is this card in an account I may reach" and "does this
+    /// card exist at all" while disclosing nothing to the caller -- which is
+    /// what lets the confinement be decided **before** a single field of the
+    /// card is fetched.
+    ///
+    /// ADR-011 decision 11 needs the second half: a found-but-out-of-scope
+    /// handle must be refused as out of scope rather than reported as "not
+    /// found", because a "not found" is indistinguishable from a real miss and
+    /// leaves an operator nothing to debug. The refusal never names the
+    /// container that came back.
+    private static func containersOf(id: String) -> [String]? {
+        guard let containers = try? store.containers(
+            matching: CNContainer.predicateForContainerOfContact(withIdentifier: id)
+        ) else { return nil }
+        return containers.map(\.identifier)
+    }
+
+    /// Whether a contact id names a card that exists *somewhere* on this Mac.
     ///
     /// A probe that throws is read as "it exists": the refusal then says "out
     /// of scope" about an id that may be a typo, which is the harmless
     /// direction, where the other one is the answer decision 11 rules out.
     private static func contactExistsAnywhere(id: String) -> Bool {
-        guard let containers = try? store.containers(
-            matching: CNContainer.predicateForContainerOfContact(withIdentifier: id)
-        ) else { return true }
+        guard let containers = containersOf(id: id) else { return true }
         return !containers.isEmpty
+    }
+
+    /// The one card this id names, read raw.
+    ///
+    /// **`unifyResults = false` here too**, and for the reason the whole file
+    /// turns unification off under a scope: `unifiedContact(withIdentifier:)`
+    /// would hand back a merge of this card with whatever it is linked to,
+    /// including cards in containers the caller may not reach, and the
+    /// container check that just passed was made about *this* card.
+    private static func rawContact(id: String) -> Resolution {
+        let request = CNContactFetchRequest(keysToFetch: fetchKeys)
+        request.predicate = CNContact.predicateForContacts(withIdentifiers: [id])
+        request.unifyResults = false
+        var found: CNContact?
+        do {
+            try store.enumerateContacts(with: request) { contact, stop in
+                if found == nil {
+                    found = contact
+                    stop.pointee = true
+                }
+            }
+        } catch {
+            return .failed("failed to read contact \(id): \(error.localizedDescription)")
+        }
+        guard let found else { return .missing }
+        return .found(found)
     }
 
     private static func groupExistsAnywhere(id: String) -> Bool {
@@ -515,8 +688,8 @@ enum ContactsService {
         if inScope { return nil }
         guard existsElsewhere else { return errorResult("\(noun) not found: \(id)") }
         return scopeViolationResult(
-            "\(noun) \"\(id)\" is outside the contacts this client may reach. It may reach the "
-            + "members of: \(reachable.joined(separator: ", ")). Nothing about where that "
+            "\(noun) \"\(id)\" is outside the contacts this client may reach. It may reach: "
+            + "\(reachable.joined(separator: ", ")). Nothing about where that "
             + "\(noun) is has been read or reported."
         )
     }
@@ -627,8 +800,8 @@ enum ContactsService {
             }
             return jsonResult(results)
 
-        case .scoped(let groups):
-            let (contacts, error) = members(of: groups)
+        case .scoped(let bound):
+            let (contacts, error) = cards(in: bound.accounts)
             if let error { return errorResult(error) }
             let matched = query.map { needle in
                 contacts.filter {
@@ -640,7 +813,7 @@ enum ContactsService {
     }
 
     /// The sort `CNContactFetchRequest.sortOrder` gives one fetch, applied
-    /// across several. A scoped list is the union of one fetch per group, so
+    /// across several. A scoped list is the union of one fetch per account, so
     /// the per-fetch ordering says nothing about the whole.
     private static func sortedByName(_ contacts: [CNContact]) -> [CNContact] {
         contacts.sorted {
@@ -665,14 +838,19 @@ enum ContactsService {
         case failed(String)
     }
 
-    /// A card the caller named, resolved and scope-checked in one step.
+    /// A card the caller named, resolved and scope-checked -- **in that
+    /// order, checked first and read second.**
     ///
-    /// The resolution *is* the check, which is what makes it sound: under a
-    /// scope the card is looked for among the members of the groups in scope
-    /// and nowhere else, so a card that comes back is in scope by construction
-    /// rather than by a comparison someone remembered to write. Only when it is
-    /// **not** found is the store asked whether the id exists at all, and that
-    /// question is asked in the one way that returns none of the card's data.
+    /// Under a scope the card's *container* is asked for before any of its
+    /// fields are, and the fetch happens only once that container has been
+    /// found in `contact_accounts`. So no byte of an out-of-scope card is ever
+    /// read, and the confinement does not depend on a filter applied to data
+    /// already in hand.
+    ///
+    /// This replaces a walk over the members of every group in scope, which
+    /// under account scoping would have meant enumerating whole containers to
+    /// find one card by id. The container probe returns no contact data at all
+    /// (`containersOf`), so it is both cheaper and narrower.
     private static func resolve(id: String, gate: ContactsGate) -> Resolution {
         switch gate {
         case .stop:
@@ -682,11 +860,17 @@ enum ContactsService {
                 return .missing
             }
             return .found(contact)
-        case .scoped(let groups):
-            let (contacts, error) = members(of: groups)
-            if let error { return .failed(error) }
-            guard let contact = contacts.first(where: { $0.identifier == id }) else { return .missing }
-            return .found(contact)
+        case .scoped(let bound):
+            guard let containers = containersOf(id: id) else {
+                return .failed("could not read which contact account \(id) is filed under")
+            }
+            // Not there at all, or there and out of scope. Both are `.missing`;
+            // `unresolved` is what tells the two apart, and it is the only
+            // place that costs a second probe.
+            guard !containers.isEmpty else { return .missing }
+            let reachable = Set(bound.accounts.map(\.identifier))
+            guard containers.contains(where: { reachable.contains($0) }) else { return .missing }
+            return rawContact(id: id)
         }
     }
 
@@ -716,13 +900,13 @@ enum ContactsService {
             return result
         case .unscoped:
             return errorResult("\(noun) not found: \(id)")
-        case .scoped(let groups):
+        case .scoped(let bound):
             return handleRefusal(
                 noun: noun,
                 id: id,
                 inScope: false,
                 existsElsewhere: contactExistsAnywhere(id: id),
-                reachable: groups.map(\.path)
+                reachable: bound.accounts.map(\.name)
             ) ?? errorResult("\(noun) not found: \(id)")
         }
     }
@@ -748,22 +932,34 @@ enum ContactsService {
         if case .stop(let result) = access { return result }
 
         // Where the card goes. **A create with no container goes to the
-        // default container, which may be outside the scope**, so under a
-        // scope the destination is resolved to the scope rather than left to
-        // the framework: the card is filed in the account of a group the
-        // client may reach and added to that group, which is what makes the
-        // confinement closed under creation -- a client can read back what it
-        // wrote, and it has written nothing it cannot see.
-        let requested = args?["group"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        // framework's default container, which may be outside the scope**, so
+        // under a scope the destination is resolved to the scope rather than
+        // left to the framework: the card is filed in an account the client may
+        // reach, which is what makes the confinement closed under creation -- a
+        // client can read back what it wrote, and it has written nothing it
+        // cannot see.
+        //
+        // **The account is what places the card; the group is an extra.** Under
+        // the shape this replaced, filing was done *through* a group, because a
+        // card was only reachable as a member of one -- so a scoped create had
+        // to pick a group or produce a card the client could not read. Under
+        // account scoping the card is readable wherever in the account it
+        // lands, so `group` goes back to meaning what it says, and it is
+        // governed by the grant that governs groups: a client holding
+        // `contact_accounts` and no `contact_groups` may create a card and may
+        // not put it in a group.
+        let requestedGroup = args?["group"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
+        let requestedAccount = args?["account"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 }
         var destination: ContactGroupRef?
+        var account: ContactAccountRef?
         switch access {
         case .stop:
             return errorResult("unreachable")
         case .unscoped:
-            if let requested {
+            if let requestedGroup {
                 let (catalog, error) = groupCatalog()
                 if let error { return errorResult(error) }
-                switch ContactScope.choose(group: requested, from: catalog) {
+                switch ContactScope.choose(group: requestedGroup, from: catalog) {
                 case .chosen(let group):
                     destination = group
                 case .outside(let name):
@@ -777,21 +973,96 @@ enum ContactsService {
                     destination = nil
                 }
             }
-        case .scoped(let groups):
-            switch ContactScope.choose(group: requested, from: groups) {
-            case .chosen(let group):
-                destination = group
-            case .outside(let name):
-                return scopeViolationResult(
-                    "group \"\(name)\" is outside the contact groups this client may reach. "
-                    + "It may reach: \(groups.map(\.path).joined(separator: ", ")). A contact created "
-                    + "outside them would be one this client could not read back."
-                )
-            case .underSpecified(let choices):
-                return errorResult(
-                    "this client may file a new contact in more than one group, so `group` is "
-                    + "required: \(choices.joined(separator: ", "))."
-                )
+            if let requestedAccount {
+                let (catalog, error) = accountCatalog()
+                if let error { return errorResult(error) }
+                switch ContactScope.choose(account: requestedAccount, from: catalog) {
+                case .chosen(let chosen):
+                    account = chosen
+                case .outside(let name):
+                    return errorResult(
+                        "no contact account named \"\(name)\". Accounts are reported by "
+                        + "contacts_list_groups as the `account` of each group."
+                    )
+                case .underSpecified:
+                    account = nil
+                }
+            }
+        case .scoped(let bound):
+            if let requestedGroup {
+                // The `group` argument needs the group grant. The tool does
+                // not: `contact_groups` deliberately does not name
+                // `contacts_create` in its `applies_to`, because a create works
+                // perfectly well without a group -- so the **parameter** is
+                // what refuses, exactly as `file_dirs` governs
+                // `mail_get_source`'s `save_to` without governing the tool.
+                let scope = ResourceScope.parse(ctx.meta)
+                let (catalog, error) = groupCatalog()
+                if let error { return errorResult(error) }
+                switch scope.contactGroupTargets(catalog: catalog) {
+                case .unscoped:
+                    return errorResult("unreachable")
+                case .refuse(let message):
+                    return scopeViolationResult(
+                        "`group` asks for this contact to be added to a contact group, and this "
+                        + "client holds no contact group grant. " + message + " The contact was "
+                        + "not created; omit `group` to create it in an account this client may "
+                        + "reach."
+                    )
+                case .misconfigured(let message):
+                    return errorResult(message)
+                case .use(let groups):
+                    switch ContactScope.choose(group: requestedGroup, from: groups) {
+                    case .chosen(let group):
+                        destination = group
+                    case .outside(let name):
+                        return scopeViolationResult(
+                            "group \"\(name)\" is outside the contact groups this client may reach. "
+                            + "It may reach: \(groups.map(\.path).joined(separator: ", ")). Nothing "
+                            + "was created."
+                        )
+                    case .underSpecified(let choices):
+                        return errorResult(
+                            "this client may file a new contact in more than one group, so `group` is "
+                            + "required: \(choices.joined(separator: ", "))."
+                        )
+                    }
+                }
+            }
+            if let destination {
+                // A group decides the account, because its members are cards in
+                // its own container. An `account` argument that says otherwise
+                // is a request that cannot be carried out, and is refused rather
+                // than resolved either way round.
+                if let requestedAccount,
+                   ResourceScope.fold(requestedAccount) != ResourceScope.fold(destination.account) {
+                    return errorResult(
+                        "`account` says \"\(requestedAccount)\" and `group` "
+                        + "\"\(destination.path)\" is in \"\(destination.account)\". A contact is "
+                        + "filed in the account of the group it joins; omit one of the two. Nothing "
+                        + "was created."
+                    )
+                }
+                account = bound.accounts.first {
+                    ResourceScope.fold($0.name) == ResourceScope.fold(destination.account)
+                }
+            } else {
+                switch ContactScope.choose(account: requestedAccount, from: bound.accounts) {
+                case .chosen(let chosen):
+                    account = chosen
+                case .outside(let name):
+                    return scopeViolationResult(
+                        "account \"\(name)\" is outside the contact accounts this client may reach. "
+                        + "It may reach: \(bound.accounts.map(\.name).joined(separator: ", ")). A "
+                        + "contact created outside them would be one this client could not read "
+                        + "back. Nothing was created."
+                    )
+                case .underSpecified(let choices):
+                    return errorResult(
+                        "this client may file a new contact in more than one account, so `account` "
+                        + "is required: \(choices.joined(separator: ", "))."
+                    )
+                }
             }
         }
 
@@ -809,9 +1080,11 @@ enum ContactsService {
 
         let saveRequest = CNSaveRequest()
         // `nil` is the framework's "default container", which is exactly what
-        // an unscoped create has always used and exactly what a scoped one
-        // must never fall back to.
-        let container = destination.flatMap { $0.containerIdentifier.isEmpty ? nil : $0.containerIdentifier }
+        // an unscoped create with no `account` and no `group` has always used
+        // and exactly what a scoped one must never fall back to. Under a scope
+        // `account` is always resolved, so it is never `nil` there.
+        let container = account.map(\.identifier)
+            ?? destination.flatMap { $0.containerIdentifier.isEmpty ? nil : $0.containerIdentifier }
         saveRequest.add(contact, toContainerWithIdentifier: container)
         do {
             try store.execute(saveRequest)
@@ -820,7 +1093,13 @@ enum ContactsService {
         }
 
         guard let destination else {
-            return jsonResult(["id": contact.identifier, "created": true])
+            var payload: [String: Any] = ["id": contact.identifier, "created": true]
+            // The account only when one was resolved, which is the scoped case
+            // and the unscoped one that asked: an unscoped create that named
+            // neither an account nor a group answers byte-for-byte what it
+            // always has.
+            if let account { payload["account"] = account.name }
+            return jsonResult(payload)
         }
 
         // The membership is a **second** save request, because a card added
@@ -850,12 +1129,14 @@ enum ContactsService {
                 why: "adding it to \(destination.path) failed: \(error.localizedDescription)"
             )
         }
-        return jsonResult([
+        var payload: [String: Any] = [
             "id": contact.identifier,
             "created": true,
             "group": destination.path,
             "added_to_group": true
-        ])
+        ]
+        if let account { payload["account"] = account.name }
+        return jsonResult(payload)
     }
 
     private static func contactsUpdate(_ ctx: MCPCallContext) -> MCPCallResult {
@@ -926,7 +1207,8 @@ enum ContactsService {
             let (catalog, error) = groupCatalog()
             if let error { return errorResult(error) }
             return jsonResult(catalog.map(groupDict))
-        case .scoped(let groups):
+        case .scoped(let bound):
+            guard let groups = bound.groups else { return groupBoundMissing() }
             return jsonResult(groups.map(groupDict))
         }
     }
@@ -939,28 +1221,42 @@ enum ContactsService {
         let access = gate(ctx)
         if case .stop(let result) = access { return result }
 
-        // **This is the one contacts tool a scope cannot be honestly applied
-        // to, so it is refused rather than filtered.** `contact_groups` is an
-        // enumeration of the groups this client may reach; a group that has
-        // just been created is by construction not in it. Neither available
-        // reading survives contact with the rest of the surface:
+        // **Re-derived under the account/group split rather than inherited.**
+        // The reason this was refused before was that a card was reachable only
+        // through a group, so a new group was a dead end. That premise is gone:
+        // under account scoping the client can read the cards regardless, and a
+        // group it created inside an account it holds would be a place to *put*
+        // them. So the question has to be asked again, and the answer is still
+        // no, for three reasons the new shape does not touch.
         //
-        // * Create it anyway, in an in-scope account. The client then holds a
-        //   group it cannot list, cannot add anyone to (`contacts_add_to_group`
-        //   checks both ends against the scope) and cannot read the members of
-        //   -- a capability that always leads to a dead end, advertised as if
-        //   it worked.
-        // * Treat the new group as in scope. That is a client widening its own
-        //   confinement by writing, which is the escalation shape ADR-011
-        //   carves out as the one thing worse than exfiltration here.
+        // 1. **A `contact_groups` value cannot be split into an account and a
+        //    name, so there is nothing to create.** The obvious coherent case
+        //    is a scope naming `iCloud/Family` where no such group exists yet:
+        //    creating it would produce exactly what the operator granted, with
+        //    no widening. But the path is **matched whole and never split**
+        //    (`ScopePath`), deliberately, because a group name may contain a
+        //    `/` and Contacts has no rule against it -- unlike a mailbox leaf,
+        //    where `a/b` creates `b` inside `a`. To act on that value macMCP
+        //    would have to guess which `/` was the separator, which is the
+        //    class of guess this representation exists to remove.
+        // 2. **A value naming no group is an operator's mistake, and decision
+        //    11 says surface it rather than act on it.** The picker
+        //    (`context/enumerate`) only ever offers groups that exist, so a
+        //    value that resolves to nothing arrived by hand-typing or by the
+        //    group having been deleted. Creating `iCloud/Familly` on the
+        //    strength of a typo makes the mistake real and silently removes the
+        //    misconfiguration signal that would have shown it.
+        // 3. **For any name the scope does *not* hold, the original dilemma
+        //    stands**: either the client gets a group it cannot list, cannot
+        //    add to and cannot read the members of -- a capability advertised
+        //    as working that always dead-ends -- or the new group counts as in
+        //    scope, which is a client widening its own confinement by writing.
         //
-        // ADR-011's own instruction for exactly this is that refusing a tool is
-        // better than returning a filtered-looking result that is not confined.
         // It is a violation rather than a misconfiguration: nothing about the
         // operator's scope is wrong, the client asked to create a resource
         // outside it.
-        if case .scoped(let groups) = access {
-            return createGroupRefusal(inScope: groups)
+        if case .scoped(let bound) = access {
+            return createGroupRefusal(inScope: bound.groups ?? [])
         }
 
         let group = CNMutableGroup()
@@ -979,12 +1275,16 @@ enum ContactsService {
     /// The refusal above, as a value, so what a confined client is told can be
     /// pinned by a test that needs no address book.
     static func createGroupRefusal(inScope groups: [ContactGroupRef]) -> MCPCallResult {
-        scopeViolationResult(
+        let held = groups.isEmpty ? "none" : groups.map(\.path).joined(separator: ", ")
+        return scopeViolationResult(
             "this client may not create contact groups: its access profile confines it to the "
-            + "groups named in `contact_groups` (\(groups.map(\.path).joined(separator: ", "))), "
-            + "and a group created now would not be one of them — it could not be listed, added "
-            + "to, or read back. Nothing was created. An operator can create the group in "
-            + "Contacts and name it in the profile."
+            + "groups named in `contact_groups` (\(held)), and a group created now would not be "
+            + "one of them — it could not be listed, added to, or removed from. Nothing was "
+            + "created. A `contact_groups` entry naming a group that does not exist is not an "
+            + "instruction to create it either: the value is an Account/Group path matched whole, "
+            + "so it cannot be split into an account and a name to create one from, and a value "
+            + "that matches nothing is a stale or mistyped grant an operator needs to see. An "
+            + "operator can create the group in Contacts and name it in the profile."
         )
     }
 
@@ -993,9 +1293,15 @@ enum ContactsService {
     /// **Both, and the contact end is the one that is easy to miss.** A client
     /// that could add *any* card to a group it holds would be able to read that
     /// card on the next call -- widening its own scope by writing rather than
-    /// by being granted anything. So a card must already be reachable (a member
-    /// of some group in scope) before it can be moved between the groups in
-    /// scope.
+    /// by being granted anything. So a card must already be reachable before it
+    /// can be moved between the groups in scope.
+    ///
+    /// The two ends are checked against **different fields**, which is the
+    /// whole of what the account/group split changed here: the card against
+    /// `contact_accounts` (it must be in an account the profile names, group or
+    /// no group), the group against `contact_groups` *and* `contact_accounts`
+    /// (its path named, its container named). The reasoning for checking both
+    /// is unchanged; only the field the card end answers to has moved.
     private static func membership(
         _ ctx: MCPCallContext,
         add: Bool
@@ -1015,7 +1321,8 @@ enum ContactsService {
         // here is the scoped case, where a group the scope does not name is a
         // violation and a group nothing names is a miss.
         var target: ContactGroupRef?
-        if case .scoped(let groups) = access {
+        if case .scoped(let bound) = access {
+            guard let groups = bound.groups else { return groupBoundMissing() }
             target = groups.first { $0.identifier == groupId }
             guard target != nil else {
                 return handleRefusal(
@@ -1087,14 +1394,14 @@ enum ContactsService {
             } catch {
                 return errorResult("failed to search contacts by phone: \(error.localizedDescription)")
             }
-        case .scoped(let groups):
+        case .scoped(let bound):
             // **This is the tool the unified-contact decision matters most
             // for**, because it is the one that called `unifiedContacts`
             // directly: a merged card matching on a number held by an
             // out-of-scope linked card would have been returned whole, fields
             // from both accounts included. Under a scope the search runs over
-            // the members of the groups in scope, read raw, and matches here.
-            let (contacts, error) = members(of: groups)
+            // the cards in the accounts in scope, read raw, and matches here.
+            let (contacts, error) = cards(in: bound.accounts)
             if let error { return errorResult(error) }
             let matched = contacts.filter {
                 phoneMatches(phone, numbers: $0.phoneNumbers.map(\.value.stringValue))

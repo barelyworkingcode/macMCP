@@ -277,11 +277,21 @@ final class MailScopeHardeningTests: XCTestCase {
         )
         // `contacts_list` used to be the "a non-mail tool is governed by
         // nothing" case. It is governed now -- the calendar/contacts/reminders
-        // fields declare `contacts_*` -- so the original claim moves to a tool
-        // no field names at all, and this line becomes the check that a new
-        // service's `applies_to` reaches its own tools and stops there.
+        // fields declare their own tools -- so the original claim moves to a
+        // tool no field names at all, and this line becomes the check that a
+        // new service's `applies_to` reaches its own tools and stops there.
+        //
+        // Contacts is also the one service whose two fields do **not** share an
+        // `applies_to`: a card need not be in a group, so `contact_groups`
+        // governs only the four tools that act on a group, and a card tool is
+        // bounded by its account alone. `ScopeDeclarationTests` is where that
+        // is asserted tool by tool.
         XCTAssertEqual(
             restrictFieldsGoverning(tool: "contacts_list"),
+            ["contact_accounts"]
+        )
+        XCTAssertEqual(
+            restrictFieldsGoverning(tool: "contacts_add_to_group"),
             ["contact_accounts", "contact_groups"]
         )
         XCTAssertEqual(

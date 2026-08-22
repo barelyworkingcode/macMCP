@@ -46,8 +46,10 @@ import Foundation
 /// are now enforced: `ScopedRows` (`Services/EventKitScope.swift`) applies the
 /// reconciliation rule at every one of the six tools those four govern, and
 /// `CalendarRemindersScopeWiringTests` is what says so tool by tool.
-/// `contact_accounts` and `contact_groups` are the remainder, and this file is
-/// the honest place to say which half of the declaration is real.
+/// `contact_accounts` and `contact_groups` are enforced too, by
+/// `ContactsService.gate`; the four calendar and reminder fields above are the
+/// remainder, and this file is the honest place to say which half of the
+/// declaration is real.
 let macmcpContextSchema: JSONObject = {
     var schema: JSONObject = [:]
     for field in scopeFields { schema[field.name] = field.declaration }
@@ -206,32 +208,73 @@ private let calendarScopeFields: [ScopeField] = [
 // **The contacts pair is enforced, as of the branch that added this note**, so
 // the staging warning above no longer applies to these two: `contact_accounts`
 // and `contact_groups` are read by `ContactsService.gate`, which every one of
-// the ten `contacts_*` tools goes through. What a value *means* is stated in
-// `ContactsScope.swift` and is one decision worth knowing from here: a card is
-// reachable when it is a member of a group in scope, because a card -- unlike a
-// message, which is always in a mailbox -- need not be in a group at all, and
-// the alternative reading would have let a profile naming one group read the
-// whole address book. The four calendar and reminder fields are still
-// declaration-only.
+// the ten `contacts_*` tools goes through. The four calendar and reminder
+// fields are still declaration-only.
+//
+// **The two contacts fields do NOT share an `applies_to`, and that asymmetry
+// with mail is the whole shape of this service.** Mail can require both of its
+// axes on every tool because *a message is always in a mailbox*: scoping
+// mailboxes scopes messages, and there is no message the pair cannot describe.
+// *A card need not be in any group.* Declaring `contact_groups` with
+// `applies_to: ["contacts_*"]` -- which is what the first pass did, by copying
+// mail's shape -- therefore made group membership mandatory for every contacts
+// tool, and the consequence was not a tightening but a **hole in what an
+// operator can say**: "every card in this account, group or not" became
+// inexpressible, so a profile could only ever be granted the cards somebody had
+// remembered to file. The enforcement built on that declaration was correct
+// about the declaration and wrong about contacts.
+//
+// So the axes are separated by what they actually bound:
+//
+// * `contact_accounts` bounds **cards**, and governs every `contacts_*` tool. A
+//   card is reachable when its container is named here, group or no group.
+// * `contact_groups` bounds **groups**, and governs only the four tools that
+//   list, create or change membership of one. A group is reachable when its
+//   path is named here *and* its container is named in `contact_accounts` --
+//   still a cross-product, one level down.
+//
+// The four are named explicitly rather than matched by a glob. `contacts_*group*`
+// would select exactly these four today, but it selects them by the *spelling*
+// of a tool name, and a permission boundary that depends on a naming convention
+// is one rename away from being wrong in the fail-open direction. The rule for
+// adding a fifth is stated here instead, where someone adding a tool will read
+// it: **a tool belongs in this list when it cannot function without naming a
+// group.** `contacts_create`, which merely *may* take a `group` argument, does
+// not -- it works without one, and the argument itself is what refuses when the
+// grant is absent, exactly as `file_dirs` governs `mail_get_source`'s `save_to`
+// without governing the tool.
+//
+// Note what this costs a profile holding accounts and no groups:
+// `contacts_list_groups` refuses rather than answering `[]`. That is decision
+// 4's rule and it is the right answer -- an empty list is an affirmative claim
+// that this Mac holds no group, which is the `total_messages: 0` shape the mail
+// work removed -- but it does mean an account-scoped client sees no groups at
+// all, which is exactly what it was granted.
 private let contactsScopeFields: [ScopeField] = [
     ScopeField(
         name: "contact_accounts",
         noun: "contact account",
         description: "Contact accounts this client may reach — the containers Contacts files cards "
             + "under, such as On My Mac, iCloud, or an Exchange or CardDAV server. A client sees no "
-            + "card and no group outside these accounts.",
+            + "card and no group outside these accounts. This is the field that bounds cards: every "
+            + "card in one of these accounts is reachable, whether or not it is in any group.",
         appliesTo: ["contacts_*"],
         enumerate: { _ in ContactsService.enumerateAccounts() }
     ),
     ScopeField(
         name: "contact_groups",
         noun: "contact group",
-        description: "Contact groups this client may reach, each written as Account/Group — for "
-            + "example “iCloud/Family”. The account is part of the value because a group name on "
-            + "its own does not identify one: two accounts can each hold a group called Family, "
-            + "and a bare name would silently grant both. Choose these from the list rather than "
-            + "typing them.",
-        appliesTo: ["contacts_*"],
+        description: "Contact groups this client may list and change the membership of, each "
+            + "written as Account/Group — for example “iCloud/Family”. The account is part of the "
+            + "value because a group name on its own does not identify one: two accounts can each "
+            + "hold a group called Family, and a bare name would silently grant both. Choose these "
+            + "from the list rather than typing them. This field bounds groups, not cards: a "
+            + "client granted contact_accounts and no groups still reads every card in those "
+            + "accounts, and simply has no group tools.",
+        appliesTo: [
+            "contacts_list_groups", "contacts_create_group",
+            "contacts_add_to_group", "contacts_remove_from_group"
+        ],
         dependsOn: ["contact_accounts"],
         enumerate: { values in
             ContactsService.enumerateGroups(accountFilter: values?["contact_accounts"]?.stringsValue)
