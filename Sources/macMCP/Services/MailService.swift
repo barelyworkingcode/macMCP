@@ -811,26 +811,74 @@ enum MailService {
         return split.violation ? scopeViolationResult(split.message) : errorResult(split.message)
     }
 
-    /// A JS array literal of lowercased strings, or `null` for "no scope in
+    /// `MailScope.fold` transliterated, and the JavaScript half of the one
+    /// boundary every scope comparison is made at.
+    ///
+    /// **The two halves used to fold differently, and the difference was
+    /// invisible.** Swift's `==` on `String` compares by canonical
+    /// equivalence, so an account or mailbox name spelled NFC and the same
+    /// name spelled NFD are one string at the Swift front door; JavaScript's
+    /// `===` compares UTF-16 code units, so in every generated script they are
+    /// two. A scope naming an accented or Hebrew mailbox in the spelling the
+    /// operator typed, against a Mail reporting the other, therefore passed
+    /// `MailScope.names` and was rejected by `scanScriptJXA`,
+    /// `listMailboxesScriptJXA`, `findMessageJXA`, `mailboxInAccountJXA` and
+    /// `senderJXA` alike: a **correct** scope reached nothing, silently, with
+    /// no violation logged because none had occurred. It fails closed, so it
+    /// is a correctness bug rather than a hole -- but a confinement that
+    /// cannot express the names the machine holds is one an operator cannot
+    /// use, and it hits exactly the names the fixture exercises.
+    ///
+    /// `normalize('NFC')` exists in the JavaScriptCore `osascript -l
+    /// JavaScript` runs (verified: `"e\u{301}".normalize('NFC') ===
+    /// "\u{e9}"`). It is applied again after the case fold because
+    /// lowercasing is not guaranteed to preserve the form, which is what
+    /// `MailScope.fold` does on the other side.
+    ///
+    /// Not private: every generated comparison emits it, and a test can only
+    /// pin that the two halves agree by running one.
+    static let scopeFoldJXA = """
+    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().normalize('NFC'); }
+    """
+
+    /// A JS array literal of folded strings, or `null` for "no scope in
     /// play". Every scope comparison inside a generated script is against one
-    /// of these, and each is lowercased once here rather than per element per
-    /// message -- the comparison is case-insensitive for the reason
-    /// `MailScope.names` gives.
+    /// of these, and each is folded once here rather than per element per
+    /// message.
+    ///
+    /// An **empty** array is a real value meaning "nothing is allowed" (see
+    /// `allowedList`), and is deliberately not the same as `null`.
     static func scopeArrayJXA(_ values: [String]?) -> String {
         guard let values else { return "null" }
-        return "[" + values.map { "'\(escapeJSString($0.lowercased()))'" }.joined(separator: ", ") + "]"
+        return "[" + values.map { "'\(escapeJSString(MailScope.fold($0)))'" }.joined(separator: ", ") + "]"
     }
 
-    /// The allowed lists a generated script needs, or `nil` for each field
-    /// that is not in play.
+    /// The allowed lists a generated script needs.
     ///
-    /// `.refuse` never reaches a script: a field with no value refuses in
-    /// Swift, before anything is generated and long before an Apple Event, so
-    /// there is exactly one shape here rather than a `.refuse` branch in every
-    /// generator.
+    /// `nil` means **no restriction**, and only `.unscoped` produces it. A
+    /// field a mediated call carries no value for produces the **empty list**,
+    /// which every generated comparison reads as "nothing is allowed".
+    ///
+    /// That distinction is the whole of this function and it is a
+    /// belt-and-braces one. `.refuse` should never reach a script at all --
+    /// `presenceRefusal` turns it into a refusal in Swift, before anything is
+    /// generated and long before an Apple Event. But it *did*: mapping
+    /// `.refuse` to `nil` alongside `.unscoped` meant a handler that forgot
+    /// the presence check emitted `SCOPE_MAILBOXES = null`, which reads as "no
+    /// restriction", and `mail_list_mailboxes` listed every mailbox on the
+    /// machine to a client whose profile named none. One missing check at one
+    /// call site should not be able to widen a confinement into its opposite,
+    /// so the two states that mean "this field grants nothing" and "this field
+    /// is not in play" no longer spell the same thing on the way into a
+    /// script. An empty list yields an empty scan, which is the fail-closed
+    /// answer; the presence check is what turns it into a sentence that
+    /// explains itself.
     static func allowedList(_ access: MailScope.Access) -> [String]? {
-        if case .allowed(let list) = access { return list }
-        return nil
+        switch access {
+        case .unscoped: return nil
+        case .refuse: return []
+        case .allowed(let list): return list
+        }
     }
 
     /// The `mailbox` argument a **scan** should run with.
@@ -872,11 +920,13 @@ enum MailService {
     /// `mailboxKeys` is a list because `mail_move` writes its two ends as
     /// `source_mailbox` and `target_mailbox`.
     static func scopeRefusal(
-        forArguments args: JSONObject?,
+        for ctx: MCPCallContext,
         call: MailCall,
         accountKeys: [String] = ["account"],
         mailboxKeys: [String] = ["mailbox"]
     ) -> MCPCallResult? {
+        if let refusal = presenceRefusal(tool: ctx.toolName, call: call) { return refusal }
+        let args = ctx.arguments
         for key in accountKeys {
             if case .refuse(let message) = call.scope.accountTargets(requested: args?[key]?.stringValue) {
                 return scopeViolationResult(message)
@@ -885,6 +935,64 @@ enum MailService {
         for key in mailboxKeys {
             if case .refuse(let message) = call.scope.mailboxTargets(requested: args?[key]?.stringValue) {
                 return scopeViolationResult(message)
+            }
+        }
+        return nil
+    }
+
+    /// ADR-011 decision 4's presence requirement, read off macMCP's own
+    /// declaration rather than off a list re-typed per handler.
+    ///
+    /// For every `scope: "restrict"` field whose `applies_to` selects this
+    /// tool, a mediated call must carry a non-empty value or the call refuses.
+    /// The three states `MailScope` keeps apart are what makes it correct:
+    /// `.unscoped` (nobody mediated -- behave exactly as macmcp on a bare
+    /// stdio pipe always has), `.refuse` (mediated, field absent or empty --
+    /// refuse), `.allowed` (proceed, confined).
+    ///
+    /// **`file_dirs` is excluded here, and that is the one judgement in this
+    /// function.** ADR-011 decision 4 says a governed call refuses; relay
+    /// applies that to the whole tool. macMCP applies it to the *parameter*,
+    /// because that is a distinction only macMCP can make and the tool-level
+    /// reading gives a wrong answer at both tools the field names:
+    /// `mail_get_source` reads a message inline perfectly well with nowhere to
+    /// write (its own comment has said so since the field existed), and
+    /// `mail_save_attachment` is unusable without a destination anyway -- so
+    /// the tool-level check would be redundant where it is right and wrong
+    /// where it is not. The parameter checks live at the three places a path
+    /// is actually used (`destination`, `save_to`, `attachments`) and each
+    /// refuses on its own. Selecting by `source` rather than by field name
+    /// keeps that from being a hardcoded exception: an operator-set field is a
+    /// grant of *resources*, and having none of them means there is nothing
+    /// for the tool to act on; a `project_path` field is a filesystem
+    /// foothold, and having none of it means one argument is unavailable.
+    static func presenceRefusal(tool: String, call: MailCall) -> MCPCallResult? {
+        guard call.scope.isScoped else { return nil }
+        for field in restrictFieldsGoverning(tool: tool) {
+            guard mailContextSchema[field]?.objectValue?["source"]?.stringValue == "operator" else { continue }
+            let access: MailScope.Access
+            switch field {
+            case "mail_accounts": access = call.scope.accountsAccess
+            case "mail_mailboxes": access = call.scope.mailboxesAccess
+            // A restrict field declared and not wired to a value here would
+            // otherwise be silently unenforced -- the fail-open shape this
+            // whole function exists to close -- so it refuses until someone
+            // wires it, which is loud and closed rather than quiet and open.
+            default:
+                return errorResult(
+                    "macmcp declares the resource scope field `\(field)` as governing \(tool) but does "
+                    + "not know how to apply it, so the call is refused rather than run unconfined. "
+                    + "This is a bug in macmcp, not in the access profile."
+                )
+            }
+            if case .refuse = access {
+                let noun = field == "mail_accounts" ? "mail account" : "mailbox"
+                return scopeViolationResult(
+                    "this call carries no `\(field)`, so there is no \(noun) \(tool) may reach. "
+                    + "An absent or empty resource scope is a refusal rather than \"everything\": "
+                    + "the access profile making this call needs \(field) set to the "
+                    + "\(noun)(s) it is allowed to reach."
+                )
             }
         }
         return nil
@@ -991,6 +1099,7 @@ enum MailService {
     /// Not private: several generated scripts are only meaningful with these
     /// helpers in scope, so a test that runs one has to emit them too.
     static let boundByNameJXA = """
+    \(scopeFoldJXA)
     var MB_MAX_DEPTH = 16;
     var MB_ATTEMPTS = 3;
     function mbSameNames(before, after) {
@@ -1044,7 +1153,7 @@ enum MailService {
     // mailboxes in one account may differ only in case.
     function mbSamePlace(at, acctName, path) {
         return at !== null
-            && ('' + at.account).toLowerCase() === ('' + acctName).toLowerCase()
+            && scopeFold(at.account) === scopeFold(acctName)
             && ('' + at.mailbox) === ('' + path);
     }
     function boundByName(collection) {
@@ -1167,7 +1276,7 @@ enum MailService {
             body = """
             var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             for (var ai = 0; ai < accts.length; ai++) {
-                if (accts[ai].name.toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+                if (scopeFold(accts[ai].name) === scopeFold('\(escapedAccount)')) {
         \(pushAccountBoxes)
                     return sink;
                 }
@@ -1271,10 +1380,11 @@ enum MailService {
         // means the one mailbox the client may reach whose leaf name is
         // Archive, rather than a top-level `Archive` it may not.
         let scopeFilter = """
+        \(scopeFoldJXA)
         var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
         if (SCOPE_MAILBOXES !== null) {
             allBoxes = allBoxes.filter(function(b) {
-                return SCOPE_MAILBOXES.indexOf(('' + b.path).toLowerCase()) >= 0;
+                return SCOPE_MAILBOXES.indexOf(scopeFold(b.path)) >= 0;
             });
         }
         """
@@ -1338,10 +1448,10 @@ enum MailService {
             // one of two is.
             filter = """
         var excluded = [];
-        var WANT = '\(escaped)'.toLowerCase();
-        var entries = allBoxes.filter(function(b) { return b.path.toLowerCase() === WANT; });
+        var WANT = scopeFold('\(escaped)');
+        var entries = allBoxes.filter(function(b) { return scopeFold(b.path) === WANT; });
         if (entries.length === 0) {
-            entries = allBoxes.filter(function(b) { return b.name.toLowerCase() === WANT; });
+            entries = allBoxes.filter(function(b) { return scopeFold(b.name) === WANT; });
         }
         """
         }
@@ -1770,6 +1880,12 @@ enum MailService {
         switch call?.scope.accountTargets(requested: account) ?? .unscoped {
         case .refuse(let message):
             return ([], scopeViolationResult(message))
+        // Nothing account-shaped produces this today -- only `file_dirs`
+        // carries a value macMCP can find unusable -- but it is a refusal
+        // about the *scope* rather than about the caller, so it must never
+        // wear the violation marker.
+        case .misconfigured(let message):
+            return ([], errorResult(message))
         case .use(let allowed):
             // `nil` is the local pass, so an allowed "On My Mac" is that pass.
             return (allowed.map { isLocalAccount($0) ? nil : $0 }, nil)
@@ -2073,7 +2189,7 @@ enum MailService {
             (function() {
                 var known = mail.accounts.name();
                 for (var i = 0; i < known.length; i++) {
-                    if (('' + known[i]).toLowerCase() === ('' + FM_ACCOUNT).toLowerCase()) return;
+                    if (scopeFold(known[i]) === scopeFold(FM_ACCOUNT)) return;
                 }
                 throw new Error('account not found: \(escapeJSString(account))');
             })();
@@ -2082,6 +2198,7 @@ enum MailService {
 
         let preamble = """
     \(boundByNameJXA)
+    \(scopeFoldJXA)
     var found = null; var foundAccount = null; var foundMailbox = null;
     var FM_ACCOUNT = \(accountExpr);
     function fmBare(v) { return v == null ? null : ('' + v).replace(/^</, '').replace(/>$/, ''); }
@@ -2100,16 +2217,26 @@ enum MailService {
         try { box = msg.mailbox; } catch (e) { return null; }
         var boxName = null;
         try { boxName = '' + box.name(); } catch (e) { return null; }
+        // Whether the container walk succeeded travels with the answer.
+        // Degrading to the leaf name and saying nothing was a hole: the leaf
+        // name does not identify a mailbox -- an account holding
+        // `Projects/Archive` beside a top-level `Archive` offers two of them
+        // -- so a walk that lost a level to a rename or a delete handed
+        // `fmScopeAllows` the string `Archive` for a message in
+        // `Projects/Archive`, and a scope naming `Archive` admitted it. The
+        // leaf is still what gets *reported* when there is no scope to check,
+        // because a label is all it ever was there.
         var boxPath = mbPathOf(box);
-        if (boxPath === null) boxPath = boxName;
+        var pathKnown = boxPath !== null;
+        if (!pathKnown) boxPath = boxName;
         // A local On My Mac mailbox has no account and raises here.
         var acctName = 'On My Mac';
         try { acctName = '' + box.account.name(); } catch (e) { acctName = 'On My Mac'; }
-        return {account: acctName, mailbox: boxPath, leaf: boxName};
+        return {account: acctName, mailbox: boxPath, leaf: boxName, pathKnown: pathKnown};
     }
     function fmInScope(at) {
         return FM_ACCOUNT === null
-            || ('' + at.account).toLowerCase() === ('' + FM_ACCOUNT).toLowerCase();
+            || scopeFold(at.account) === scopeFold(FM_ACCOUNT);
     }
     // The relay-supplied resource scope, ANDed with the caller's own account
     // argument above rather than replacing it: they answer different
@@ -2122,15 +2249,29 @@ enum MailService {
     // an agent build a false model of what it can reach, and the sentence
     // deliberately does not say where the message actually is.
     var FM_OUT_OF_SCOPE = false;
+    // Set when the message was found but where it is could not be established
+    // -- `mbPathOf` walks one container per level and an ancestor renamed or
+    // deleted mid-walk loses it. That is a **transient failure to check**, not
+    // a boundary being probed, so it is reported as an error the caller can
+    // retry rather than as a violation: filling a security signal with races
+    // is what ADR-011 decision 11 keeps a nonexistent mailbox out of it for.
+    var FM_UNLOCATED = false;
     function fmAllowed(list, value) {
         if (list === null) return true;
-        var v = ('' + value).toLowerCase();
+        var v = scopeFold(value);
         for (var i = 0; i < list.length; i++) { if (list[i] === v) return true; }
         return false;
     }
     function fmScopeAllows(at) {
-        return fmAllowed(FM_SCOPE_ACCOUNTS, at.account)
-            && fmAllowed(FM_SCOPE_MAILBOXES, at.mailbox);
+        if (!fmAllowed(FM_SCOPE_ACCOUNTS, at.account)) return false;
+        if (FM_SCOPE_MAILBOXES === null) return true;
+        // A scope is a list of **paths**, so a leaf name cannot be checked
+        // against it. Refusing is the only honest answer: passing the leaf
+        // through would let an out-of-scope `Projects/Archive` satisfy a scope
+        // of `["Archive"]`, and silently allowing it is the one direction this
+        // check must never fail in.
+        if (!at.pathKnown) { FM_UNLOCATED = true; return false; }
+        return fmAllowed(FM_SCOPE_MAILBOXES, at.mailbox);
     }
     function fmBind(msg, at) { found = msg; foundAccount = at.account; foundMailbox = at.mailbox; }
     \(accountCheck)
@@ -2174,7 +2315,7 @@ enum MailService {
         });
     }
     (function() {
-        var targetLC = '\(escapedMailbox)'.toLowerCase();
+        var targetLC = scopeFold('\(escapedMailbox)');
         var TARGET = '\(escapedRfc)';
         function searchIn(subset) {
             for (var i = 0; i < subset.length; i++) {
@@ -2216,7 +2357,7 @@ enum MailService {
         var named = []; var rest = [];
         for (var i = 0; i < fmBoxes.length; i++) {
             if (fmBoxes[i].mbox === null) continue;
-            if (fmBoxes[i].path.toLowerCase() === targetLC || fmBoxes[i].name.toLowerCase() === targetLC) named.push(fmBoxes[i]); else rest.push(fmBoxes[i]);
+            if (scopeFold(fmBoxes[i].path) === targetLC || scopeFold(fmBoxes[i].name) === targetLC) named.push(fmBoxes[i]); else rest.push(fmBoxes[i]);
         }
         if (!searchIn(named)) searchIn(rest);
     })();
@@ -2242,7 +2383,16 @@ enum MailService {
         let refusal = MailScopeRefusal.mark(
             "message \(messageId) is outside the accounts and mailboxes this client may reach"
         )
-        return "(FM_OUT_OF_SCOPE ? '\(escapeJSString(refusal))' : 'message not found with id: \(escapeJSString(messageId))')"
+        // Three answers, and the third is neither of the other two. A message
+        // whose mailbox could not be walked to the root was not shown to be
+        // out of scope -- it was not checked at all -- so it is neither a
+        // refusal to audit nor a miss, and saying either would be a claim
+        // about a fact nobody established.
+        let unlocated = "message \(messageId) was found, but the mailbox it is in could not be identified "
+            + "-- a mailbox in the path above it was renamed or removed while it was being read -- so "
+            + "whether this client may reach it could not be decided and nothing was done. This is "
+            + "transient: try again in a moment."
+        return "(FM_UNLOCATED ? '\(escapeJSString(unlocated))' : (FM_OUT_OF_SCOPE ? '\(escapeJSString(refusal))' : 'message not found with id: \(escapeJSString(messageId))'))"
     }
 
     /// JXA snippet resolving a mailbox *inside one account*, named by a
@@ -2296,17 +2446,17 @@ enum MailService {
     /// osascript's wrapper (`scriptErrorMessage`); it used to arrive as
     /// `execution error: Error: Error: … (-2700)`.
     ///
-    /// `scopeMailboxes` narrows what this may *name* and what a leaf name may
-    /// resolve to, without narrowing what an exact path may resolve to. The
-    /// asymmetry is deliberate: an exact out-of-scope path must resolve so
-    /// that the caller gets the marked scope refusal `moveScriptJXA` raises
-    /// before it mutates anything, rather than a "no such mailbox" that is
-    /// both untrue and indistinguishable from a typo. What must not happen is
-    /// the *listing* naming mailboxes this client may not reach -- that is the
+    /// `scopeMailboxes` narrows what this resolves, at both steps, before an
+    /// out-of-scope mailbox is considered at all -- which is the order the
+    /// scan applies the same two rules in, and the two must agree or the same
+    /// string means two mailboxes depending on which tool it was passed to.
+    /// An exact out-of-scope path is resolved only as a **last** resort, so
+    /// the caller gets the marked scope refusal `moveScriptJXA` raises before
+    /// it mutates anything, rather than a "no such mailbox" that is both
+    /// untrue and indistinguishable from a typo. What must not happen is the
+    /// *listing* naming mailboxes this client may not reach -- that is the
     /// disclosure `mail_list_mailboxes` is scoped to prevent, and a wrong
-    /// target_mailbox would have handed it over anyway -- or a bare leaf name
-    /// silently picking an out-of-scope mailbox when an in-scope one carries
-    /// the same name.
+    /// target_mailbox would have handed it over anyway.
     private static func mailboxInAccountJXA(
         mailbox: String,
         accountExpr: String,
@@ -2316,15 +2466,16 @@ enum MailService {
         let escapedMailbox = escapeJSString(mailbox)
         return """
     \(boundByNameJXA)
+    \(scopeFoldJXA)
     var \(varName)Account = null;
     var \(varName)Path = null;
     var \(varName) = (function() {
-        var wantName = '\(escapedMailbox)'.toLowerCase();
+        var wantName = scopeFold('\(escapedMailbox)');
         var wantAcct = \(accountExpr);
         var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
         function inScope(box) {
             return SCOPE_MAILBOXES === null
-                || SCOPE_MAILBOXES.indexOf(('' + box.path).toLowerCase()) >= 0;
+                || SCOPE_MAILBOXES.indexOf(scopeFold(box.path)) >= 0;
         }
         function reachable(boxes) { return boxes.filter(inScope); }
         // Name what the account does have, by path. The mailboxes are already
@@ -2342,39 +2493,60 @@ enum MailService {
             for (var n = 0; n < boxes.length; n++) names.push('"' + boxes[n].path + '"');
             return names.join(' and ');
         }
+        // **The scope is applied before the two resolution steps, not after
+        // one of them.** The exact-path list used to be built from every
+        // mailbox in the account while the leaf list was built from the
+        // reachable ones, so an exact match anywhere beat a leaf match in
+        // scope -- and the two ends of the same argument then disagreed:
+        // the scan filters its mailboxes to the scope *first*, so under
+        // `mail_mailboxes: ["Projects/Archive"]` a `mailbox: "Archive"` read
+        // the nested one, while `mail_move target_mailbox: "Archive"` resolved
+        // the top-level `Bob:Archive` and was refused naming a mailbox the
+        // caller had never asked for, with the one it could reach unreachable
+        // by that name. Within the scope, `Archive` means the one mailbox this
+        // client may reach whose leaf name is Archive -- the same sentence the
+        // scan's own comment makes -- so a name means the same mailbox to a
+        // move as it does to a read.
+        //
+        // An exact path that exists but is out of scope is still resolved,
+        // **last**, and only when nothing in scope carries the name. That is
+        // what makes the refusal `moveScriptJXA` raises name the mailbox the
+        // caller asked for rather than a "no such mailbox" that is both untrue
+        // and indistinguishable from a typo.
         function pick(allBoxes, where) {
             var boxes = reachable(allBoxes);
-            var exact = [], leaf = [];
+            var exact = [], leaf = [], exactOutOfScope = [];
             for (var i = 0; i < allBoxes.length; i++) {
                 if (allBoxes[i].element === null) continue;
-                // An exact path resolves whether or not it is in scope, so the
-                // refusal the caller gets names the scope rather than denying
-                // the mailbox exists. A leaf name only ever reaches a mailbox
-                // this client may already reach.
-                if (allBoxes[i].path.toLowerCase() === wantName) exact.push(allBoxes[i]);
+                if (scopeFold(allBoxes[i].path) !== wantName) continue;
+                if (inScope(allBoxes[i])) exact.push(allBoxes[i]); else exactOutOfScope.push(allBoxes[i]);
             }
             for (var j = 0; j < boxes.length; j++) {
                 if (boxes[j].element === null) continue;
-                if (boxes[j].path.toLowerCase() !== wantName && boxes[j].name.toLowerCase() === wantName) leaf.push(boxes[j]);
+                if (scopeFold(boxes[j].path) !== wantName && scopeFold(boxes[j].name) === wantName) leaf.push(boxes[j]);
+            }
+            // Mail cannot produce two mailboxes at the same path -- siblings
+            // are unique and `/` is its own separator -- so the ambiguity
+            // branches are here because refusing costs nothing and resolving
+            // one would be a guess.
+            function ambiguousPath(hits) {
+                throw new Error(where + ' has ' + hits.length + ' mailboxes at the path "\(escapedMailbox)"; it is ambiguous and nothing was done');
             }
             if (exact.length === 1) return exact[0];
-            // Mail cannot produce two mailboxes at the same path -- siblings
-            // are unique and `/` is its own separator -- so this is here
-            // because refusing costs nothing and resolving it would be a guess.
-            if (exact.length > 1) {
-                throw new Error(where + ' has ' + exact.length + ' mailboxes at the path "\(escapedMailbox)"; it is ambiguous and nothing was done');
-            }
+            if (exact.length > 1) ambiguousPath(exact);
             if (leaf.length === 1) return leaf[0];
             if (leaf.length > 1) {
                 throw new Error(where + ' has ' + leaf.length + ' mailboxes named "\(escapedMailbox)": ' + pathsOf(leaf)
                     + '. Name the one you mean by its full path -- nothing was done');
             }
+            if (exactOutOfScope.length === 1) return exactOutOfScope[0];
+            if (exactOutOfScope.length > 1) ambiguousPath(exactOutOfScope);
             throw new Error(where + ' has no mailbox named "\(escapedMailbox)"; it has: ' + pathList(boxes));
         }
-        if (wantAcct !== null && ('' + wantAcct).toLowerCase() !== 'on my mac') {
+        if (wantAcct !== null && scopeFold(wantAcct) !== 'on my mac') {
             var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             for (var a = 0; a < accts.length; a++) {
-                if (accts[a].name.toLowerCase() === ('' + wantAcct).toLowerCase()) {
+                if (scopeFold(accts[a].name) === scopeFold(wantAcct)) {
                     var boxes = boundByNameOrThrow(accts[a].element.mailboxes, 'the mailbox list of account "' + accts[a].name + '"');
                     var hit = pick(boxes, 'account "' + accts[a].name + '"');
                     \(varName)Account = accts[a].name;
@@ -2447,10 +2619,11 @@ enum MailService {
         // Emitted by every branch below, so a scoped account walk reads the
         // same in all of them.
         let scopeDecl = """
+        \(scopeFoldJXA)
         var SEND_SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
         function sendScopeAllows(name) {
             if (SEND_SCOPE_ACCOUNTS === null) return true;
-            var n = ('' + name).toLowerCase();
+            var n = scopeFold(name);
             for (var s = 0; s < SEND_SCOPE_ACCOUNTS.length; s++) { if (SEND_SCOPE_ACCOUNTS[s] === n) return true; }
             return false;
         }
@@ -2499,7 +2672,7 @@ enum MailService {
             var senderAddr = (function() {
                 var accts = mail.accounts();
                 for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name().toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
+                    if (scopeFold(accts[i].name()) === scopeFold('\(escapedAccount)')) {
                         if (!sendScopeAllows(accts[i].name())) {
                             throw new Error('\(scopeSentinel)account "\(escapedAccount)" is outside the mail accounts this client may reach, so nothing was composed');
                         }
@@ -2562,9 +2735,14 @@ enum MailService {
     private static func listAccounts(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         let call = MailCall.forArguments(args, default: Budget.listAccounts, meta: ctx.meta)
-        if case .refuse(let message) = call.scope.accountTargets(requested: nil) {
-            return scopeViolationResult(message)
-        }
+        // It takes no `account` and no `mailbox`, so there is nothing to
+        // reconcile -- but it is a `mail_*` tool and both operator fields
+        // declare `applies_to: ["mail_*"]`, so the presence check governs it
+        // exactly as it governs every other one. It used to consult
+        // `mail_accounts` alone and never `mail_mailboxes`; relay's own
+        // presence check covered the difference, which is the dependency
+        // decision 4 exists to remove.
+        if let refusal = scopeRefusal(for: ctx, call: call, accountKeys: [], mailboxKeys: []) { return refusal }
         // `scopable: false`: there is no account, no mailbox and no limit to
         // pass, so "narrow the scope" would be advice the caller cannot follow.
         // `timeout_seconds` is not scope -- it says how long to wait, not what
@@ -2617,7 +2795,7 @@ enum MailService {
         // anywhere else is a string they got from here, so an unfiltered
         // listing is both a disclosure of the machine's real folder names and
         // the map a confined client would use to plan around its confinement.
-        if let refusal = scopeRefusal(forArguments: args, call: call, mailboxKeys: []) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
         // Naming an account is the only narrowing this tool offers, so once one
         // has been given there is nothing left to suggest.
         let (output, error) = runJXA(
@@ -2651,11 +2829,12 @@ enum MailService {
         // mid-walk cost the caller the whole listing including the accounts
         // already enumerated.
         let pathsOf = """
+        \(scopeFoldJXA)
         var SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
         var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
         function scopeAllows(list, value) {
             if (list === null) return true;
-            var v = ('' + value).toLowerCase();
+            var v = scopeFold(value);
             for (var i = 0; i < list.length; i++) { if (list[i] === v) return true; }
             return false;
         }
@@ -2701,7 +2880,7 @@ enum MailService {
             (function() {
                 var accts = boundByNameOrThrow(mail.accounts, 'the account list');
                 for (var i = 0; i < accts.length; i++) {
-                    if (accts[i].name.toLowerCase() === '\(escaped)'.toLowerCase()) {
+                    if (scopeFold(accts[i].name) === scopeFold('\(escaped)')) {
                         return JSON.stringify(pathsOf(accts[i].element.mailboxes));
                     }
                 }
@@ -2870,7 +3049,7 @@ enum MailService {
         let account = args?["account"]?.stringValue
         let call = MailCall.forArguments(args, default: Budget.getEmails, meta: ctx.meta)
         let mailbox = scopedMailboxArgument(args?["mailbox"]?.stringValue, default: "INBOX", call: call)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
 
         let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return targetError }
@@ -2923,7 +3102,7 @@ enum MailService {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let account = args?["account"]?.stringValue
         let call = MailCall.forArguments(args, default: Budget.getEmail, meta: ctx.meta)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
 
         // **One script, one bind, one fetch.** This used to be two osascript
         // spawns with a `findMessageJXA` in each: the first for the properties,
@@ -3415,7 +3594,7 @@ var mb = (function() {
     var boxes = [];
     var accts = boundByNameOrThrow(mail.accounts, 'the account list');
     for (var i = 0; i < accts.length; i++) {
-        if (('' + accts[i].name).toLowerCase() === '\(escapedAccount)'.toLowerCase()) { boxes = boundByNameOrReport(accts[i].element.mailboxes, accts[i].name); break; }
+        if (scopeFold(accts[i].name) === scopeFold('\(escapedAccount)')) { boxes = boundByNameOrReport(accts[i].element.mailboxes, accts[i].name); break; }
     }
     if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = boundByNameOrReport(mail.mailboxes, 'On My Mac');
     // The mailbox comes from a row this pass is following up, and a row is
@@ -3652,7 +3831,7 @@ JSON.stringify(out);
         let bodyScanLimit = min(max(args?["body_scan_limit"]?.intValue ?? 25, 0), maxBodyScanLimit)
         let call = MailCall.forArguments(args, default: Budget.search, meta: ctx.meta)
         let mailbox = scopedMailboxArgument(args?["mailbox"]?.stringValue, default: "all", call: call)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
 
         let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return targetError }
@@ -3873,12 +4052,51 @@ JSON.stringify(out);
         return count
     }
 
-    /// Turns the `attachments` argument into verified absolute paths.
-    private static func attachmentPaths(_ value: JSONValue?) -> (paths: [String], error: String?) {
+    /// Turns the `attachments` argument into verified absolute paths, confined
+    /// to `file_dirs`.
+    ///
+    /// **This is the read half of ADR-011 finding 1 and it was open.** An
+    /// attachment path is an absolute POSIX path that macMCP opens on the host
+    /// and puts, byte for byte, into a message that then leaves the machine.
+    /// Nothing scoped it: `file_dirs` (then `write_dirs`) governed
+    /// `destination` and `save_to` and no code path anywhere compared an
+    /// attachment path against anything. Reproduced through the live
+    /// `hermes-alice` write profile -- `mail_send {"attachments":
+    /// ["/tmp/zsec-secret.txt"]}` -- with the file's content arriving base64'd
+    /// in Alice's `.Sent` Maildir and decoding back to the secret. A write mail
+    /// profile could mail out any file Mail could read.
+    ///
+    /// The confinement is the same one the write side uses, in the same
+    /// direction of failure: a mediated call whose profile carries no
+    /// `file_dirs` may attach nothing at all (an access profile has no project
+    /// directory, relay derives nothing, so every use of the field refuses --
+    /// ADR-011's own logic for finding 1, run the other way), and a call that
+    /// has one is confined to it by `realPath`'s component-by-component
+    /// resolution, so a symlink inside an allowed directory cannot walk out of
+    /// it. An unmediated call -- macmcp on a bare stdio pipe, same-user local
+    /// access -- attaches whatever it always could.
+    ///
+    /// The order is deliberate: the scope is checked **before** the file is
+    /// stat'ed, so a refusal cannot be turned into an existence oracle for
+    /// paths outside the scope.
+    ///
+    /// The path handed to Mail is the tilde-expanded one rather than the
+    /// symlink-resolved one, matching `destination` and `save_to`: what is
+    /// resolved is what gets *checked*, and resolving what gets *used* would
+    /// silently rename an attachment reached through a symlink. ADR-011
+    /// decision 10 names the residual check-then-use race and why it is
+    /// accepted -- planting a symlink inside an allowed directory takes the
+    /// same-user access that already runs this process.
+    private static func attachmentPaths(_ value: JSONValue?, call: MailCall) -> (paths: [String], failure: MCPCallResult?) {
         guard let raw = value?.stringsValue, !raw.isEmpty else { return ([], nil) }
         var paths: [String] = []
         var missing: [String] = []
         for entry in raw {
+            switch call.scope.readableAttachment(entry) {
+            case .unscoped, .use: break
+            case .refuse(let message): return ([], scopeViolationResult(message))
+            case .misconfigured(let message): return ([], errorResult(message))
+            }
             let expanded = (entry as NSString).expandingTildeInPath
             var isDirectory: ObjCBool = false
             if FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory), !isDirectory.boolValue {
@@ -3888,7 +4106,7 @@ JSON.stringify(out);
             }
         }
         if !missing.isEmpty {
-            return ([], "attachment not found: \(missing.joined(separator: ", "))")
+            return ([], errorResult("attachment not found: \(missing.joined(separator: ", "))"))
         }
         return (paths, nil)
     }
@@ -4525,8 +4743,12 @@ JSON.stringify(out);
             return errorResult("body or html_body is required")
         }
 
-        let (attachments, attachmentError) = attachmentPaths(args?["attachments"])
-        if let attachmentError { return errorResult(attachmentError) }
+        // Before `mail.OutgoingMessage` exists, for the same reason the sender
+        // is validated before it: a request that is going to be refused must
+        // compose nothing at all, or Mail is left holding a message it will
+        // autosave into Drafts behind the caller's back.
+        let (attachments, attachmentFailure) = attachmentPaths(args?["attachments"], call: call)
+        if let attachmentFailure { return attachmentFailure }
 
         // `html content` and `content` are the same underlying body, and the
         // HTML wins when both are set, so only one is sent. Mail generates the
@@ -4776,7 +4998,7 @@ JSON.stringify(out);
         // of what `mail_accounts` governs here, and a `from` whose owning
         // account is out of scope is refused inside `senderJXA`, where which
         // account owns an address is answerable.
-        if let refusal = scopeRefusal(forArguments: args, call: call, mailboxKeys: []) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
         invalidateSourceCache()
         // `disposesMessage: true`: after `send()` Mail has let go of the
         // compose message, which is the one state in which removing a leftover
@@ -4931,7 +5153,7 @@ var savedDraft = (function() {
     private static func createDraft(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         let call = MailCall.forArguments(args, default: Budget.createDraft, meta: ctx.meta)
-        if let refusal = scopeRefusal(forArguments: args, call: call, mailboxKeys: []) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
         invalidateSourceCache()
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
@@ -5740,14 +5962,14 @@ var savedDraft = (function() {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let overwrite = args?["overwrite"]?.boolValue ?? false
         let call = MailCall.forArguments(args, default: Budget.saveAttachment, meta: ctx.meta)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
 
         // **ADR-011 finding 1, and the one place in macMCP where the threat is
         // escalation rather than exfiltration.** `destination` is an arbitrary
         // absolute path, so a mail-only remote client held a filesystem write
         // on the host -- `~/.zshrc`, `~/Library/LaunchAgents/*.plist` -- from
         // inside a grant whose whole premise was that it never touches the
-        // host filesystem. `write_dirs` is `source: "project_path"`, so an
+        // host filesystem. `file_dirs` is `source: "project_path"`, so an
         // access profile (which has no path) gets no value for it and this
         // tool is unusable to one **by construction**: it requires
         // `destination`, and there is nowhere it may write.
@@ -5757,6 +5979,7 @@ var savedDraft = (function() {
         switch call.scope.writeDestination(destinationArg) {
         case .unscoped, .use: break
         case .refuse(let message): return scopeViolationResult(message)
+        case .misconfigured(let message): return errorResult(message)
         }
 
         let (data, expectedSize, _, fidelity, fetchError) = fetchSource(
@@ -5927,15 +6150,18 @@ var savedDraft = (function() {
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let call = MailCall.forArguments(args, default: Budget.getSource, meta: ctx.meta)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
-        // `write_dirs` governs the *parameter*, not the tool. Unlike
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
+        // `file_dirs` governs the *parameter*, not the tool. Unlike
         // `mail_save_attachment`, whose `destination` is required, this one
         // works perfectly well inline -- so a client with no write scope loses
         // `save_to` and keeps the tool. Checked before the fetch so a refusal
         // does not first download the message.
-        if let saveTo = args?["save_to"]?.stringValue,
-           case .refuse(let message) = call.scope.writeDestination(saveTo) {
-            return scopeViolationResult(message)
+        if let saveTo = args?["save_to"]?.stringValue {
+            switch call.scope.writeDestination(saveTo) {
+            case .unscoped, .use: break
+            case .refuse(let message): return scopeViolationResult(message)
+            case .misconfigured(let message): return errorResult(message)
+            }
         }
         let (data, expectedSize, _, fidelity, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
@@ -6293,7 +6519,7 @@ var savedDraft = (function() {
         // because a leaf name and a defaulted `target_account` both sit
         // between the string the caller wrote and the mailbox it names.
         if let refusal = scopeRefusal(
-            forArguments: args,
+            for: ctx,
             call: call,
             accountKeys: ["account", "target_account"],
             mailboxKeys: ["source_mailbox", "target_mailbox"]
@@ -6397,7 +6623,7 @@ var savedDraft = (function() {
 
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let call = MailCall.forArguments(args, default: Budget.markRead, meta: ctx.meta)
-        if let refusal = scopeRefusal(forArguments: args, call: call) { return refusal }
+        if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
         invalidateSourceCache()
         let script = """
         var mail = Application('Mail');
@@ -6453,7 +6679,7 @@ var savedDraft = (function() {
                 "html_body": stringProp("HTML email body. Sent as a real text/html message, so tables, headings and links render. Takes precedence over body when both are given (Mail generates its own plain-text alternative)"),
                 "cc": stringOrStringArrayProp("CC recipient address(es), same forms as `to`"),
                 "bcc": stringOrStringArrayProp("BCC recipient address(es), same forms as `to`"),
-                "attachments": stringArrayProp("Absolute POSIX paths of files to attach, e.g. [\"/Users/me/Budget.pdf\"]. Attached after the body so they appear at the end of the message"),
+                "attachments": stringArrayProp("Absolute POSIX paths of files to attach, e.g. [\"/Users/me/Budget.pdf\"]. Attached after the body so they appear at the end of the message. Each path is read off this host and its bytes leave the machine in the message, so it is confined to the file_dirs of the calling client's resource scope; a client whose scope carries no file_dirs may compose and send but may not attach a file from this host, and an out-of-scope path is refused with nothing composed"),
                 "from": stringProp("Sender email address (overrides account lookup). Must be an address one of Mail's accounts sends as; an address no account owns is refused rather than substituted, because Mail's own behaviour is to send from the default account instead. The address the message actually went out as is reported back as `from`"),
                 "account": stringProp("Account name to \(action) (uses default account if omitted)"),
                 "timeout_seconds": timeoutProp(budget, mutating: true)

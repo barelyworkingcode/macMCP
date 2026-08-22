@@ -39,16 +39,16 @@ final class ContextEnumerateDispatchTests: StdioServerTestCase {
         XCTAssertNil(response["result"])
     }
 
-    /// `write_dirs` is declared in `contextSchema` but not `enumerable: true`
+    /// `file_dirs` is declared in `contextSchema` but not `enumerable: true`
     /// -- it is `source: "project_path"`, which relay derives and an operator
     /// never picks from a list. This is the one the task names explicitly:
-    /// "write_dirs must be refused this way."
+    /// "file_dirs must be refused this way."
     func testANonEnumerableFieldIsRefusedAsInvalidParams() throws {
-        let response = try send(method: "context/enumerate", params: ["field": "write_dirs"])
+        let response = try send(method: "context/enumerate", params: ["field": "file_dirs"])
         let error = try XCTUnwrap(response["error"] as? [String: Any])
         XCTAssertEqual(error["code"] as? Int, -32602)
         let message = try XCTUnwrap(error["message"] as? String)
-        XCTAssertTrue(message.contains("write_dirs"), message)
+        XCTAssertTrue(message.contains("file_dirs"), message)
         XCTAssertNil(response["result"])
     }
 
@@ -56,7 +56,7 @@ final class ContextEnumerateDispatchTests: StdioServerTestCase {
 
     /// Not a `context/enumerate` case, but the fact this dispatch and
     /// `initialize`'s `contextSchema` are reading the *same* declaration is
-    /// exactly what keeps `write_dirs`'s refusal above from silently going
+    /// exactly what keeps `file_dirs`'s refusal above from silently going
     /// stale if the schema changes shape.
     func testInitializeStillDeclaresTheEnumerableFieldsThisDispatchHonours() throws {
         let response = try send(method: "initialize", params: [:])
@@ -65,7 +65,7 @@ final class ContextEnumerateDispatchTests: StdioServerTestCase {
         let schema = try XCTUnwrap(serverInfo["contextSchema"] as? [String: Any])
         let mailAccounts = try XCTUnwrap(schema["mail_accounts"] as? [String: Any])
         XCTAssertEqual(mailAccounts["enumerable"] as? Bool, true)
-        let writeDirs = try XCTUnwrap(schema["write_dirs"] as? [String: Any])
-        XCTAssertNil(writeDirs["enumerable"], "write_dirs must stay non-enumerable for the refusal test above to mean anything")
+        let fileDirs = try XCTUnwrap(schema["file_dirs"] as? [String: Any])
+        XCTAssertNil(fileDirs["enumerable"], "file_dirs must stay non-enumerable for the refusal test above to mean anything")
     }
 }

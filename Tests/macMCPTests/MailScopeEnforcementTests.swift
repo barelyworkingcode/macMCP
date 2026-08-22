@@ -344,23 +344,52 @@ final class MailScopeEnforcementTests: XCTestCase {
         XCTAssertTrue(message.contains("Alice:Archive"), message)
     }
 
-    func testALeafNameCannotReachAMailboxOutOfScope() throws {
+    func testALeafNameResolvesInsideTheScopeAsItDoesForAScan() throws {
         // Bob holds `Archive` and `Projects/Archive`. Scoped to the nested
-        // one, the bare name `Archive` is an exact path match for the
-        // top-level mailbox — which resolves, and is then refused by identity
-        // rather than quietly filed into the one the client may reach. Filing
-        // into a mailbox the caller did not name is the failure this whole
-        // path-based resolution exists to prevent; so is filing into one they
-        // may not touch.
+        // one, `Archive` is the leaf name of exactly one mailbox this client
+        // may reach, and that is the one it means — the same two-step, in the
+        // same order, that a scan resolves `mailbox: "Archive"` by, because
+        // the scope filters the mailboxes before the name is matched against
+        // them.
+        //
+        // It used to resolve the top-level `Bob:Archive` instead and refuse
+        // naming it: an exact path anywhere beat a leaf name in scope. Three
+        // things were wrong with that at once. `mailboxTargets` had already
+        // accepted `Archive` as a name this client may use (it is the leaf of
+        // an allowed path), so Swift said yes and the script said no. The
+        // refusal named `Bob:Archive`, a mailbox the caller had not asked
+        // about and cannot see. And the same string read one mailbox through
+        // `mail_get_emails` and refused through `mail_move`, which is the one
+        // thing a mailbox argument must never do.
         let (result, moves) = try move(
             messageId: "100",
             targetMailbox: "Archive",
             scopeAccounts: ["Bob"],
             scopeMailboxes: ["INBOX", "Projects/Archive"]
         )
+        XCTAssertEqual(moves.count, 1, "the one Archive this client may reach")
+        XCTAssertEqual(result["mailbox"] as? String, "Projects/Archive")
+        XCTAssertEqual(result["account"] as? String, "Bob")
+    }
+
+    func testAnExactOutOfScopePathIsRefusedNamingWhatTheCallerAsked() throws {
+        // The other half of the same rule. Scoped to the top-level `Archive`,
+        // `Projects/Archive` is an exact path no in-scope mailbox carries, so
+        // it resolves last — deliberately — and the refusal names the mailbox
+        // the caller wrote rather than claiming it does not exist, which would
+        // be untrue and indistinguishable from a typo.
+        let (result, moves) = try move(
+            messageId: "100",
+            targetMailbox: "Projects/Archive",
+            scopeAccounts: ["Bob"],
+            scopeMailboxes: ["INBOX", "Archive"]
+        )
         XCTAssertEqual(moves.count, 0, "nothing may have been moved")
         XCTAssertTrue(refusal(result).violation)
-        XCTAssertTrue(refusal(result).message.contains("Bob:Archive"), refusal(result).message)
+        XCTAssertTrue(
+            refusal(result).message.contains("Bob:Projects/Archive"),
+            refusal(result).message
+        )
     }
 
     func testAMailboxListingInAFailedMoveNamesOnlyWhatIsInScope() throws {

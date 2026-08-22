@@ -25,9 +25,25 @@ struct MCPCallContext {
     let arguments: JSONObject?
     let meta: JSONObject?
 
-    init(arguments: JSONObject? = nil, meta: JSONObject? = nil) {
+    /// The name this call was dispatched under.
+    ///
+    /// A handler obviously knows which tool it is. What it cannot otherwise
+    /// know is the *string* relay and `mailContextSchema` both use to talk
+    /// about it, and that string is what a `scope: "restrict"` field's
+    /// `applies_to` globs are matched against (`restrictFieldsGoverning`). So
+    /// the presence check ADR-011 decision 4 requires can be driven by the
+    /// declaration rather than by a list re-typed at every handler -- which is
+    /// how four tools ended up checking a field they were declared to be
+    /// governed by and did not consult.
+    ///
+    /// Defaulted so every existing construction, in `main.swift` and in the
+    /// tests alike, keeps compiling; the registry always supplies it.
+    let toolName: String
+
+    init(arguments: JSONObject? = nil, meta: JSONObject? = nil, toolName: String = "") {
         self.arguments = arguments
         self.meta = meta
+        self.toolName = toolName
     }
 }
 
@@ -58,7 +74,7 @@ class ToolRegistry {
         guard let reg = registrations[name] else {
             return errorResult("unknown tool: \(name)")
         }
-        return reg.handler(MCPCallContext(arguments: arguments, meta: meta))
+        return reg.handler(MCPCallContext(arguments: arguments, meta: meta, toolName: name))
     }
 }
 

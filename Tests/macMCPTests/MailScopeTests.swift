@@ -23,10 +23,10 @@ final class MailScopeTests: XCTestCase {
         XCTAssertFalse(scope.isScoped)
         XCTAssertNil(scope.mailAccounts)
         XCTAssertNil(scope.mailMailboxes)
-        XCTAssertNil(scope.writeDirs)
+        XCTAssertNil(scope.fileDirs)
         XCTAssertEqual(scope.accountsAccess, .unscoped)
         XCTAssertEqual(scope.mailboxesAccess, .unscoped)
-        XCTAssertEqual(scope.writeDirsAccess, .unscoped)
+        XCTAssertEqual(scope.fileDirsAccess, .unscoped)
     }
 
     func testMetaPresentWithNoneOfTheThreeKeysIsGovernedAndRefuses() {
@@ -45,7 +45,7 @@ final class MailScopeTests: XCTestCase {
         XCTAssertTrue(scope.isScoped)
         XCTAssertEqual(scope.accountsAccess, .refuse)
         XCTAssertEqual(scope.mailboxesAccess, .refuse)
-        XCTAssertEqual(scope.writeDirsAccess, .refuse)
+        XCTAssertEqual(scope.fileDirsAccess, .refuse)
     }
 
     func testEmptyMetaObjectIsGovernedToo() {
@@ -78,12 +78,12 @@ final class MailScopeTests: XCTestCase {
         let scope = MailScope.parse([
             "mail_accounts": .array([.string("Bob")]),
             "mail_mailboxes": .array([.string("INBOX"), .string("Archive")]),
-            "write_dirs": .array([.string("/tmp/project")])
+            "file_dirs": .array([.string("/tmp/project")])
         ])
         XCTAssertTrue(scope.isScoped)
         XCTAssertEqual(scope.accountsAccess, .allowed(["Bob"]))
         XCTAssertEqual(scope.mailboxesAccess, .allowed(["INBOX", "Archive"]))
-        XCTAssertEqual(scope.writeDirsAccess, .allowed(["/tmp/project"]))
+        XCTAssertEqual(scope.fileDirsAccess, .allowed(["/tmp/project"]))
     }
 
     // MARK: - Scoped, but this field refuses
@@ -99,14 +99,14 @@ final class MailScopeTests: XCTestCase {
     }
 
     func testAFieldAbsentFromAScopedMetaRefusesRatherThanFallingBackToUnrestricted() {
-        // write_dirs is the only field a relay-derived local project always
+        // file_dirs is the only field a relay-derived local project always
         // gets (source: project_path); mail_accounts has no reason to be set
         // for a profile that never touches mail scope through the operator
         // surface. That must refuse mail_accounts-governed tools, not treat
         // the call as though no scope were in play.
-        let scope = MailScope.parse(["write_dirs": .array([.string("/tmp/project")])])
+        let scope = MailScope.parse(["file_dirs": .array([.string("/tmp/project")])])
         XCTAssertTrue(scope.isScoped)
-        XCTAssertEqual(scope.writeDirsAccess, .allowed(["/tmp/project"]))
+        XCTAssertEqual(scope.fileDirsAccess, .allowed(["/tmp/project"]))
         XCTAssertEqual(scope.accountsAccess, .refuse)
         XCTAssertEqual(scope.mailboxesAccess, .refuse)
     }
@@ -299,15 +299,15 @@ final class MailScopeTests: XCTestCase {
             "mail_accounts": .array([.string("Bob")]),
             "mail_mailboxes": .array([.string("INBOX")])
         ])
-        XCTAssertNil(MailService.scopeRefusal(forArguments: ["message_id": .int(1)], call: call))
-        XCTAssertNil(MailService.scopeRefusal(forArguments: ["account": .string("Bob")], call: call))
+        XCTAssertNil(MailService.scopeRefusal(for: MCPCallContext(arguments: ["message_id": .int(1)], toolName: "mail_get_email"), call: call))
+        XCTAssertNil(MailService.scopeRefusal(for: MCPCallContext(arguments: ["account": .string("Bob")], toolName: "mail_get_email"), call: call))
         XCTAssertEqual(
-            MailService.scopeRefusal(forArguments: ["account": .string("Alice")], call: call)?
+            MailService.scopeRefusal(for: MCPCallContext(arguments: ["account": .string("Alice")], toolName: "mail_get_email"), call: call)?
                 .meta?["scope_violation"],
             .bool(true)
         )
         XCTAssertEqual(
-            MailService.scopeRefusal(forArguments: ["mailbox": .string("Archive")], call: call)?
+            MailService.scopeRefusal(for: MCPCallContext(arguments: ["mailbox": .string("Archive")], toolName: "mail_get_email"), call: call)?
                 .meta?["scope_violation"],
             .bool(true)
         )
@@ -315,7 +315,7 @@ final class MailScopeTests: XCTestCase {
         // checked.
         XCTAssertEqual(
             MailService.scopeRefusal(
-                forArguments: ["target_mailbox": .string("Archive")],
+                for: MCPCallContext(arguments: ["target_mailbox": .string("Archive")], toolName: "mail_move"),
                 call: call,
                 accountKeys: ["account", "target_account"],
                 mailboxKeys: ["source_mailbox", "target_mailbox"]
@@ -354,38 +354,38 @@ final class MailScopeTests: XCTestCase {
         XCTAssertNil(MailService.scanFailure(outcome, targets: ["Bob"], mailbox: "all", scope: scope))
     }
 
-    // MARK: - write_dirs
+    // MARK: - file_dirs
 
-    func testWriteDirsUnscopedIsTodaysBehaviour() {
+    func testFileDirsUnscopedIsTodaysBehaviour() {
         XCTAssertEqual(MailScope.none.writeDestination("/tmp/anything"), .unscoped)
     }
 
-    func testAMediatedCallWithNoWriteDirsMayNotWriteAtAll() {
+    func testAMediatedCallWithNoFileDirsMayNotWriteAtAll() {
         // ADR-011 finding 1, the escalation one: `mail_save_attachment` takes
         // a required absolute `destination`, so a mail-only remote client held
         // a filesystem write on the host -- `~/.zshrc`,
         // `~/Library/LaunchAgents/*.plist` -- from inside a grant whose whole
-        // premise was that it never touches the host filesystem. `write_dirs`
+        // premise was that it never touches the host filesystem. `file_dirs`
         // is `source: "project_path"` and an access profile has no path, so it
         // gets no value and the tool is unusable to one by construction.
         let scope = MailScope.parse(["mail_accounts": .array([.string("Bob")])])
         guard case .refuse(let message) = scope.writeDestination("/tmp/x") else {
-            return XCTFail("absent write_dirs must refuse, not mean anywhere")
+            return XCTFail("absent file_dirs must refuse, not mean anywhere")
         }
         XCTAssertTrue(message.contains("may not write files"), message)
     }
 
-    func testAnEmptyWriteDirsListIsARefusalAndNotNoRestriction() {
+    func testAnEmptyFileDirsListIsARefusalAndNotNoRestriction() {
         // fsMCP's `if (allowedDirs.length === 0) return null; // no
         // restrictions` (finding 8) is the shape this must never grow.
-        guard case .refuse = MailScope.parse(["write_dirs": .array([])]).writeDestination("/etc/passwd") else {
+        guard case .refuse = MailScope.parse(["file_dirs": .array([])]).writeDestination("/etc/passwd") else {
             return XCTFail("an empty list grants nothing")
         }
     }
 
     func testAPathInsideAnAllowedDirectoryIsAccepted() throws {
         let root = try temporaryDirectory()
-        let scope = MailScope.parse(["write_dirs": .array([.string(root.path)])])
+        let scope = MailScope.parse(["file_dirs": .array([.string(root.path)])])
         XCTAssertEqual(scope.writeDestination(root.path), .use(root.path))
         let inside = root.appendingPathComponent("sub/file.pdf").path
         XCTAssertEqual(scope.writeDestination(inside), .use(inside))
@@ -394,7 +394,7 @@ final class MailScopeTests: XCTestCase {
     func testASiblingWithTheSamePrefixIsNotInside() throws {
         // The trailing-separator rule: `/foo` must not match `/foobar`.
         let root = try temporaryDirectory()
-        let scope = MailScope.parse(["write_dirs": .array([.string(root.path)])])
+        let scope = MailScope.parse(["file_dirs": .array([.string(root.path)])])
         guard case .refuse = scope.writeDestination(root.path + "bar/file.txt") else {
             return XCTFail("/foo must not admit /foobar")
         }
@@ -402,7 +402,7 @@ final class MailScopeTests: XCTestCase {
 
     func testDotDotCannotClimbOut() throws {
         let root = try temporaryDirectory()
-        let scope = MailScope.parse(["write_dirs": .array([.string(root.path)])])
+        let scope = MailScope.parse(["file_dirs": .array([.string(root.path)])])
         guard case .refuse = scope.writeDestination(root.path + "/../escaped.txt") else {
             return XCTFail("`..` must be resolved before the comparison, not after")
         }
@@ -413,14 +413,14 @@ final class MailScopeTests: XCTestCase {
         let outside = try temporaryDirectory()
         let link = root.appendingPathComponent("way-out")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
-        let scope = MailScope.parse(["write_dirs": .array([.string(root.path)])])
+        let scope = MailScope.parse(["file_dirs": .array([.string(root.path)])])
         guard case .refuse = scope.writeDestination(link.appendingPathComponent("f.txt").path) else {
             return XCTFail("a symlink out of the allowed directory is out of it")
         }
     }
 
     func testARelativePathIsRefusedRatherThanResolvedAgainstWhateverCwdIs() {
-        let scope = MailScope.parse(["write_dirs": .array([.string("/tmp")])])
+        let scope = MailScope.parse(["file_dirs": .array([.string("/tmp")])])
         guard case .refuse(let message) = scope.writeDestination("notes.txt") else {
             return XCTFail("a relative path has no meaning to a caller on another machine")
         }

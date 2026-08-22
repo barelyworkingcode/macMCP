@@ -24,18 +24,36 @@ import Foundation
 /// States 1 and 2 look identical if a field's absence is represented the
 /// same way whether or not anything else in `_meta` was scoped -- which is
 /// exactly the mistake this type exists to make structurally impossible.
-/// `mailAccounts` / `mailMailboxes` / `writeDirs` being `nil` means only "this
+/// `mailAccounts` / `mailMailboxes` / `fileDirs` being `nil` means only "this
 /// field's key was not present in `_meta`"; whether that is state 1 or state
 /// 2 depends on whether the call was mediated at all, which is what
 /// `isScoped` answers, and `access(for:)` (or the three named wrappers below
 /// it) is what an enforcer should actually call rather than re-deriving the
 /// same branch on `isScoped` at every call site.
 ///
-/// The three field names and shapes are exactly ADR-011's worked
-/// `contextSchema` (see `main.swift`'s `initialize` handler): `mail_accounts`
-/// and `mail_mailboxes` are operator-set and apply to `mail_*`; `write_dirs`
-/// is derived by relay from a project's own path (`source: "project_path"`)
-/// and applies only to `mail_save_attachment` and `mail_get_source`.
+/// The three field names and shapes are ADR-011's worked `contextSchema` (see
+/// `ContextSchema.swift`, declared in `main.swift`'s `initialize` handler):
+/// `mail_accounts` and `mail_mailboxes` are operator-set and apply to
+/// `mail_*`; `file_dirs` is derived by relay from a project's own path
+/// (`source: "project_path"`).
+///
+/// **`file_dirs` is ADR-011's `write_dirs`, renamed because it was only ever
+/// half the axis.** It governed `mail_save_attachment`'s `destination` and
+/// `mail_get_source`'s `save_to` -- the two places macMCP writes a file --
+/// while `mail_send` and `mail_create_draft` took `attachments: [absolute
+/// POSIX paths]` and *read* whatever was named straight off the host into an
+/// outbound message, scoped by nothing at all. That is ADR-011 finding 1 on
+/// the read side and worse: finding 1 was an arbitrary host write, this was an
+/// arbitrary host read wired directly to a channel that leaves the machine. A
+/// write mail profile could mail out any file Mail could open, and did:
+/// `mail_send {"attachments": ["/tmp/zsec-secret.txt"]}` through the live
+/// `hermes-alice` profile arrived base64'd in Alice's Sent Maildir.
+///
+/// One axis rather than two (ADR-011 constraint 3): the field is the client's
+/// **filesystem foothold on this host**, in both directions, and an operator
+/// who has decided which directories a client may touch has answered both
+/// questions at once. Two lists would be two chances to get it wrong for one
+/// decision, and no one has named a case wanting read here and write there.
 struct MailScope: Equatable {
     /// `nil` means the request's `_meta` had no `mail_accounts` key at all.
     /// A present-but-empty array (`[]`) is a distinct, equally-refusing state
@@ -48,8 +66,8 @@ struct MailScope: Equatable {
     /// Same contract as `mailAccounts`, for `mail_mailboxes`.
     let mailMailboxes: [String]?
 
-    /// Same contract as `mailAccounts`, for `write_dirs`.
-    let writeDirs: [String]?
+    /// Same contract as `mailAccounts`, for `file_dirs`.
+    let fileDirs: [String]?
 
     /// Whether this call was **mediated** -- whether `_meta` was present at
     /// all -- which is what makes it governed.
@@ -85,11 +103,11 @@ struct MailScope: Equatable {
 
     /// No `_meta` at all: the "nobody mediated this call" state. Every mail
     /// tool call macMCP has ever served over a bare stdio pipe falls here.
-    static let none = MailScope(mailAccounts: nil, mailMailboxes: nil, writeDirs: nil, isScopedFlag: false)
+    static let none = MailScope(mailAccounts: nil, mailMailboxes: nil, fileDirs: nil, isScopedFlag: false)
 
     /// The answer to "is this call scoped at all?", and a distinct question
     /// from "what does `mail_accounts` allow?" on purpose: a call can be
-    /// scoped by `write_dirs` alone (a local project's project-path bound,
+    /// scoped by `file_dirs` alone (a local project's project-path bound,
     /// auto-derived with no operator action) while carrying no
     /// `mail_accounts` -- and whether that combination should refuse
     /// `mail_search` is a per-tool `applies_to` question for the enforcer,
@@ -123,7 +141,7 @@ struct MailScope: Equatable {
 
     var accountsAccess: Access { access(for: mailAccounts) }
     var mailboxesAccess: Access { access(for: mailMailboxes) }
-    var writeDirsAccess: Access { access(for: writeDirs) }
+    var fileDirsAccess: Access { access(for: fileDirs) }
 
     /// Parses a scope out of the `_meta` object a `tools/call` request
     /// carried, per `MCPCallContext.meta`.
@@ -140,7 +158,7 @@ struct MailScope: Equatable {
         return MailScope(
             mailAccounts: meta["mail_accounts"]?.stringsValue,
             mailMailboxes: meta["mail_mailboxes"]?.stringsValue,
-            writeDirs: meta["write_dirs"]?.stringsValue,
+            fileDirs: meta["file_dirs"]?.stringsValue,
             isScopedFlag: true
         )
     }
@@ -171,21 +189,61 @@ extension MailScope {
         case use(T)
         /// Refuse, with this sentence. Always a scope violation.
         case refuse(String)
+        /// Refuse, with this sentence, because the *scope itself* cannot be
+        /// applied -- not because the caller reached outside it.
+        ///
+        /// ADR-011 decision 11 draws this line for a scope naming a mailbox
+        /// that does not exist, and the reason is the same here: a violation
+        /// is a client probing a boundary and belongs in alerting, while a
+        /// `file_dirs` entry that is not an absolute path is an operator
+        /// mistake and belongs in the editor. Conflating them fills a security
+        /// signal with configuration errors. So this maps to `errorResult`
+        /// where `.refuse` maps to `scopeViolationResult`.
+        case misconfigured(String)
     }
 
-    /// Case-insensitive membership, which is how every mailbox and account
-    /// name a caller supplies is matched everywhere else in `MailService`.
+    /// **The one spelling every scope comparison is made in: NFC, lowercased.**
     ///
-    /// The one thing case-insensitivity can be wrong about is two mailboxes in
-    /// one account whose paths differ only in case, where allowing one would
-    /// admit the other. That is narrow -- same account, and Mail has to have
-    /// been made to hold both -- and the alternative is worse: a scope that
-    /// resolved names by a different rule from the one every tool resolves
-    /// arguments by is how an operator ends up allowing a mailbox the client
-    /// cannot reach, which is constraint 2 defeating constraint 1.
+    /// Case-insensitivity is how every mailbox and account name a caller
+    /// supplies is matched everywhere else in `MailService`. The one thing it
+    /// can be wrong about is two mailboxes in one account whose paths differ
+    /// only in case, where allowing one would admit the other. That is narrow
+    /// -- same account, and Mail has to have been made to hold both -- and the
+    /// alternative is worse: a scope that resolved names by a different rule
+    /// from the one every tool resolves arguments by is how an operator ends
+    /// up allowing a mailbox the client cannot reach, which is constraint 2
+    /// defeating constraint 1.
+    ///
+    /// **Normalisation is the same argument, and it had the same bug in the
+    /// opposite direction.** Swift's `==` on `String` compares by *canonical
+    /// equivalence*, so `"Ã©"` spelled NFC (U+00E9) and NFD (U+0065 U+0301) are
+    /// one string here; JavaScript's `===` compares UTF-16 code units, so in
+    /// every generated script they are two. A scope naming an accented or
+    /// Hebrew mailbox in one spelling and a Mail that reports the other
+    /// therefore passed the Swift front door and was rejected by every JS
+    /// seam behind it: the *correct* scope silently reached nothing, with no
+    /// violation logged and nothing anywhere saying why. It fails closed,
+    /// which is why it is a correctness bug rather than a hole, but a
+    /// confinement that cannot express the names the machine actually holds is
+    /// not a confinement an operator can use.
+    ///
+    /// So both sides fold to one form, at one boundary, and this is it. NFC
+    /// because that is what `precomposedStringWithCanonicalMapping` and
+    /// JavaScript's `normalize('NFC')` both produce, and it is re-applied
+    /// after the case fold because lowercasing is not guaranteed to preserve
+    /// the form. Every JS comparison calls `scopeFold`, whose body is this
+    /// function transliterated (`MailService.scopeFoldJXA`), and every scope
+    /// array reaching a script is folded here before it is emitted.
+    static func fold(_ value: String) -> String {
+        value.precomposedStringWithCanonicalMapping
+            .lowercased()
+            .precomposedStringWithCanonicalMapping
+    }
+
+    /// Membership under `fold`.
     static func names(_ value: String, oneOf allowed: [String]) -> Bool {
-        let needle = value.lowercased()
-        return allowed.contains { $0.lowercased() == needle }
+        let needle = fold(value)
+        return allowed.contains { fold($0) == needle }
     }
 
     /// The scan targets for an `account` argument.
@@ -250,43 +308,137 @@ extension MailScope {
         }
     }
 
-    /// Whether a filesystem destination is one this call may write to
-    /// (`write_dirs`, whose `applies_to` names exactly `mail_save_attachment`
-    /// and `mail_get_source`).
-    ///
-    /// The comparison is fsMCP's `validatePath`, deliberately: symlinks and
-    /// `..` resolved on both sides before comparing, and a trailing separator
-    /// on the prefix so `/foo` does not match `/foobar`. A path that does not
-    /// exist yet -- the normal case, since `mail_save_attachment` creates its
-    /// destination -- is standardised without symlink resolution, which is the
-    /// most that can be said about a path with nothing at the end of it.
+    /// Which direction a path is being confined in. The bound is one list
+    /// (`file_dirs`); only the sentence a refusal is written in differs, and
+    /// it has to, because "this client may not write files" is useless advice
+    /// to a caller that was trying to attach one.
+    enum FileUse {
+        /// `mail_save_attachment`'s `destination`, `mail_get_source`'s
+        /// `save_to`: macMCP creates a file here.
+        case write
+        /// `mail_send` / `mail_create_draft`'s `attachments`: macMCP opens a
+        /// file here and puts its bytes into a message.
+        case read
+    }
+
+    /// Whether a filesystem path is one this call may write to
+    /// (`mail_save_attachment`'s `destination`, `mail_get_source`'s
+    /// `save_to`).
     func writeDestination(_ path: String) -> Decision<String> {
+        confine(path, for: .write)
+    }
+
+    /// Whether a filesystem path is one this call may read a file out of
+    /// (`mail_send` / `mail_create_draft`'s `attachments`).
+    ///
+    /// **A client with no `file_dirs` may attach nothing at all.** This is
+    /// ADR-011's own reasoning for finding 1, run in the other direction: an
+    /// access profile has no host directory, relay derives nothing, so every
+    /// use of the field refuses -- and that is the intended outcome, not a
+    /// gap. Reading a file to mail it away is a filesystem foothold whether
+    /// the bytes end on disk or in a message.
+    func readableAttachment(_ path: String) -> Decision<String> {
+        confine(path, for: .read)
+    }
+
+    /// The one containment check.
+    ///
+    /// The comparison follows fsMCP's `validatePath` in shape -- symlinks and
+    /// `..` resolved on both sides before comparing, and a trailing separator
+    /// on the prefix so `/foo` does not match `/foobar` -- and is deliberately
+    /// stronger in the one place that one is wrong (see `realPath`). A path
+    /// that does not exist yet -- the normal case for a `destination`, since
+    /// `mail_save_attachment` is documented to create it -- is resolved
+    /// component by component with the not-yet-existing tail carried
+    /// lexically, which is the most that can be said about a path with
+    /// nothing at the end of it.
+    ///
+    /// **The bound itself is checked, and a bound that is not an absolute
+    /// path is refused rather than resolved.** `realPath` walks components
+    /// from a `/` seed, so it answers `/` for `"."`, for `""` and for `".."`
+    /// alike -- and `/` is a prefix of every absolute path, so a single such
+    /// entry turned the whole check into a no-op that reported success.
+    /// Measured over stdio: `file_dirs: ["."]` let `mail_get_source` write a
+    /// message to `/tmp/zoutside/…`. A bare JSON string reaches
+    /// `stringsValue` as `[""]`, so `"file_dirs": ""` was one of the
+    /// spellings. Relay cannot currently produce any of them -- a profile
+    /// cannot supply a `project_path` field and a local project's path is
+    /// validated absolute -- and that is exactly why it is checked here:
+    /// macMCP must not be relying on the value being well formed by the time
+    /// it arrives.
+    ///
+    /// A bad entry is `.misconfigured` rather than `.refuse`: it is an
+    /// operator mistake, not a client probing a boundary, and ADR-011
+    /// decision 11 keeps those two apart so a security signal does not fill
+    /// up with configuration errors. Every entry is checked, not just the
+    /// ones reached before a match, so `["/valid", "."]` is refused rather
+    /// than quietly working for paths under `/valid` and being a no-op for
+    /// everything else.
+    private func confine(_ path: String, for use: FileUse) -> Decision<String> {
         let expanded = (path as NSString).expandingTildeInPath
-        switch writeDirsAccess {
+        switch fileDirsAccess {
         case .unscoped:
             return .unscoped
         case .refuse:
-            return .refuse(
-                "this client may not write files: its access profile carries no `write_dirs`, "
-                + "and an absent or empty scope is a refusal rather than \"anywhere\". "
-                + "An access profile has no project directory to derive one from, so "
-                + "mail_save_attachment is unavailable to it and mail_get_source works "
-                + "without save_to."
-            )
+            switch use {
+            case .write:
+                return .refuse(
+                    "this client may not write files: its access profile carries no `file_dirs`, "
+                    + "and an absent or empty scope is a refusal rather than \"anywhere\". "
+                    + "An access profile has no project directory to derive one from, so "
+                    + "mail_save_attachment is unavailable to it and mail_get_source works "
+                    + "without save_to."
+                )
+            case .read:
+                return .refuse(
+                    "this client may not attach files from this host: its access profile carries "
+                    + "no `file_dirs`, and an absent or empty scope is a refusal rather than "
+                    + "\"anywhere\". An access profile has no project directory to derive one from, "
+                    + "so it may compose and send mail but may not read a file off this machine to "
+                    + "put in it. Omit `attachments`."
+                )
+            }
         case .allowed(let dirs):
-            guard expanded.hasPrefix("/") else {
+            var roots: [String] = []
+            for dir in dirs {
+                guard let root = MailScope.realPath((dir as NSString).expandingTildeInPath) else {
+                    return .misconfigured(
+                        "the directory scope this call carries is not usable: `file_dirs` entry "
+                        + "\"\(dir)\" is not an absolute path, so there is no directory it names. "
+                        + "Nothing was read or written. This is a configuration mistake rather than "
+                        + "a refusal: the access profile making this call needs file_dirs set to "
+                        + "absolute directory paths."
+                    )
+                }
+                guard root != "/" else {
+                    return .misconfigured(
+                        "the directory scope this call carries is not usable: `file_dirs` entry "
+                        + "\"\(dir)\" resolves to the filesystem root, which bounds nothing -- "
+                        + "every absolute path is inside it. Nothing was read or written. Name the "
+                        + "directories this client may reach instead."
+                    )
+                }
+                roots.append(root)
+            }
+            guard let resolved = MailScope.realPath(expanded) else {
                 return .refuse("path \"\(path)\" must be absolute")
             }
-            let resolved = MailScope.realPath(expanded)
-            for dir in dirs {
-                let root = MailScope.realPath((dir as NSString).expandingTildeInPath)
+            for root in roots {
                 let prefix = root.hasSuffix("/") ? root : root + "/"
                 if resolved == root || resolved.hasPrefix(prefix) { return .use(expanded) }
             }
-            return .refuse(
-                "path \"\(path)\" is outside the directories this client may write into: "
-                + dirs.joined(separator: ", ")
-            )
+            switch use {
+            case .write:
+                return .refuse(
+                    "path \"\(path)\" is outside the directories this client may write into: "
+                    + dirs.joined(separator: ", ")
+                )
+            case .read:
+                return .refuse(
+                    "path \"\(path)\" is outside the directories this client may read files from: "
+                    + dirs.joined(separator: ", ")
+                )
+            }
         }
     }
 
@@ -303,12 +455,22 @@ extension MailScope {
     /// Unscoped is its own value rather than the empty string, and the three
     /// fields are separated, so no two different scopes can spell the same
     /// fingerprint by rearranging their contents.
+    /// **Each value is length-prefixed rather than joined with a separator.**
+    /// A `,` join makes `["a,b"]` and `["a","b"]` spell the same fingerprint,
+    /// and a mailbox path may contain a comma (Mail's own separator is `/`,
+    /// which is no safer -- a path contains those by construction). There is
+    /// no character that cannot occur in a value, so no separator can be
+    /// chosen; a byte count in front of each value makes the encoding
+    /// unambiguous whatever the values are. The collision is not academic: it
+    /// is one process serving profile A bytes that were fetched under
+    /// profile B, which is the exact bypass this key exists to prevent.
     var cacheFingerprint: String {
         guard isScoped else { return "u" }
         func part(_ values: [String]?) -> String {
-            values.map { $0.map { $0.lowercased() }.sorted().joined(separator: ",") } ?? "-"
+            guard let values else { return "-" }
+            return values.map(MailScope.fold).sorted().map { "\($0.utf8.count):\($0)" }.joined()
         }
-        return "s[\(part(mailAccounts))][\(part(mailMailboxes))][\(part(writeDirs))]"
+        return "s[\(part(mailAccounts))][\(part(mailMailboxes))][\(part(fileDirs))]"
     }
 
     /// The path with every symlink and every `..` resolved, component by
@@ -334,7 +496,17 @@ extension MailScope {
     /// `a/b`, which is a different directory when `link` points elsewhere.
     /// Each component is appended and then resolved, so `..` is applied to
     /// where the path really is by then.
-    private static func realPath(_ path: String) -> String {
+    ///
+    /// **It answers `nil` for anything that is not already absolute**, rather
+    /// than resolving it against the `/` it seeds. Seeding `/` is right for an
+    /// absolute path and is how the walk starts, but it silently turned `"."`,
+    /// `""` and `".."` into `/` -- a prefix of every absolute path there is --
+    /// so a `file_dirs` entry spelled any of those was a bound that bounded
+    /// nothing while still reporting a confinement. Returning `nil` makes the
+    /// anchoring structural: there is nothing for a caller to remember to
+    /// check, because the function cannot answer for a path it cannot anchor.
+    private static func realPath(_ path: String) -> String? {
+        guard path.hasPrefix("/") else { return nil }
         let manager = FileManager.default
         var resolved = "/"
         for component in (path as NSString).pathComponents {
