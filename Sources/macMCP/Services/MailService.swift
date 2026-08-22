@@ -2346,7 +2346,7 @@ enum MailService {
     }
 
     private static func getEmail(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
@@ -5089,7 +5089,7 @@ var savedDraft = (function() {
     }
 
     private static func saveAttachment(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         guard let destinationArg = args?["destination"]?.stringValue else {
@@ -5260,7 +5260,7 @@ var savedDraft = (function() {
     }
 
     private static func getSource(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
@@ -5580,7 +5580,7 @@ var savedDraft = (function() {
     }
 
     private static func moveEmail(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         guard let targetMailbox = args?["target_mailbox"]?.stringValue else {
@@ -5664,7 +5664,7 @@ var savedDraft = (function() {
     }
 
     private static func markRead(_ args: JSONObject?) -> MCPCallResult {
-        guard let messageId = args?["message_id"]?.stringValue else {
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
             return errorResult("message_id is required")
         }
         guard let read = args?["read"]?.boolValue else {
@@ -5792,7 +5792,7 @@ var savedDraft = (function() {
                 description: "Get full email by message ID, including the list of attachments (name, part_path, size, mime_type, mime_type_source, listed_by_mail). The attachments list is read out of the message's own source and is the SAME list mail_save_attachment selects from, in the same order: index N there is entry N here, and every name here works as attachment_name. name is the filename the message declares; when Mail.app displays a different one for the same part — it mangles a non-ASCII filename, strips a \"/\", and invents \"Mail Attachment\" for a part that has none — that appears beside it as mail_name, which is a label rather than a handle. part_path is the part's position in the message (\"2\", \"1.2\") and is the exact handle mail_save_attachment takes. mime_type is the Content-Type the message itself declares, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. inline_parts lists parts the message displays inside its body (a logo, a pasted image) — they are deliberately not attachments and do not count towards has_attachments, and mail_save_attachment writes one only when asked for it by part_path. attachments_mail_lists_only holds anything Mail claims for the message that is not in its source, which has no bytes behind it and cannot be saved. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. listed_by_mail says whether Mail's own attachment list has the part, matched to it by MIME part path rather than by filename; false is common and not a fault, because Mail's list can stay empty for good for a message first read while it was still arriving. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. structure reports what the MIME reader made of the source: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), and the attachment list is then short by whatever those parts contain rather than complete — a short list and a message with fewer attachments look identical without it. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
+                        "message_id": stringOrIntProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
                         "account": stringProp("Account name from results (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "timeout_seconds": timeoutProp(Budget.getEmail)
@@ -5860,7 +5860,7 @@ var savedDraft = (function() {
                 description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Selects out of exactly the list mail_get_email reports in attachments — same membership, same order, same names — so index is an index into that list and attachment_name is one of its name values. Saves every attachment in it when none of part_path, attachment_name or index is given. Inline parts (a logo, a pasted image the message displays in its body) are never in that list and are never saved by default; mail_get_email reports them separately under inline_parts, and part_path — the part's position in the message, e.g. \"2\" or \"1.2\" — is the exact handle that reaches one, or any other single part. Each saved entry reports part_path too. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message, including when a multipart message stops before the \"--boundary--\" line that closes it (fidelity.complete_basis \"unterminated\"), which catches a fragment that the byte count alone cannot — Mail's size is quoted in units it does not name, and the slack in reading it as wire bytes is worth ~1.3% of a large message. Note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
+                        "message_id": stringOrIntProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "destination": stringProp("Absolute POSIX path: a directory to save into (created if missing), or a full file path when saving a single attachment"),
                         "attachment_name": stringProp("Name of the attachment to save, as reported by mail_get_email in attachments[].name — the name the message itself declares (exact match preferred, substring accepted). Not mail_name, which is what Mail.app displays for the same part and can differ from what the message says"),
                         "index": intProp("Zero-based index into mail_get_email's attachments list, as an alternative to attachment_name. Never selects an inline part"),
@@ -5883,7 +5883,7 @@ var savedDraft = (function() {
                 description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message — and complete_basis says what that rests on: \"bytes\" when the bytes reach message_size on their own, \"wire\" when they only reach it once each LF is counted as the CRLF it stood for (right for a server-side message, but a local draft is sized in LF units, so the note then says how many bytes would still be missing under that reading), \"wire+terminated\" when that reading is confirmed by the message being a multipart that ends with the \"--boundary--\" line closing it — which no fragment carries, whatever its bytes add up to — \"unterminated\" for a multipart on the wire reading that does NOT end where it says it ends, which is NOT complete, \"short\" for a fragment, \"unchecked\" when Mail would not report a size, \"none\" for no bytes at all. message_size is Mail's own size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
+                        "message_id": stringOrIntProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
@@ -5904,7 +5904,7 @@ var savedDraft = (function() {
                 description: "Move an email to a different mailbox of the same account. Searches all accounts when account omitted, and the destination is resolved inside whichever account the message was found in — pass target_account to move it to a different account instead. Returns where the message landed and whether that was confirmed by reading it back",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
                         "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "target_mailbox": stringProp("Destination mailbox, resolved within the message's own account. A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. If two mailboxes in the account carry the name and neither is at the root, the move is refused and both paths are named rather than one being guessed at"),
                         "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
@@ -5924,7 +5924,7 @@ var savedDraft = (function() {
                 description: "Mark an email as read or unread. Searches all accounts when account omitted. The result is read back off the message rather than restated from the request: it names the message (numeric and RFC ids), the account and mailbox it was found in, and the read state Mail reports afterwards. If Mail does not agree the flag was set, that is an error rather than a success sentence",
                 inputSchema: schema(
                     properties: [
-                        "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
                         "account": stringProp("Account name"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),

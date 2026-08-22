@@ -71,6 +71,38 @@ enum JSONValue: Codable, Equatable {
         return nil
     }
 
+    /// A string, or the nearest thing to one, for an argument whose value is an
+    /// identifier rather than prose.
+    ///
+    /// A message id looks like a number and models write it like one. The schema
+    /// says `string`, and a client that emits `"message_id": 63926` unquoted --
+    /// which several do, LM Studio among them -- was answered with
+    /// `message_id is required`: a message about a missing argument, for an
+    /// argument that was right there. The two renderings identify the same
+    /// message, so both are read.
+    ///
+    /// The second rendering is a client bug rather than a model one: the value
+    /// arrives already quoted and is quoted again, so the decoded string is
+    /// `"63926"` with the quote characters *in* it. Those are stripped, because
+    /// no id here can begin and end with a quote -- an RFC Message-ID is
+    /// delimited by angle brackets.
+    var coercedStringValue: String? {
+        switch self {
+        case .string(var s):
+            while s.count >= 2 && s.hasPrefix("\"") && s.hasSuffix("\"") {
+                s = String(s.dropFirst().dropLast())
+            }
+            return s
+        case .int(let i): return String(i)
+        case .double(let d):
+            // A whole number that arrived as a double is an id, not a
+            // measurement: 63926.0 must not become "63926.0".
+            if d.isFinite, d == d.rounded(.towardZero) { return String(Int(d)) }
+            return d.isFinite ? String(d) : nil
+        default: return nil
+        }
+    }
+
     var intValue: Int? {
         if case .int(let i) = self { return i }
         return nil

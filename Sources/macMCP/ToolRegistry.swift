@@ -45,6 +45,17 @@ func stringProp(_ description: String) -> JSONValue {
     .object(["type": .string("string"), "description": .string(description)])
 }
 
+/// An identifier that a model may write as a bare number. The schema accepts
+/// both renderings, and `coercedStringValue` reads either as a string. Declaring
+/// it `string` alone made a client sending `63926` fail schema validation
+/// before the call was ever made.
+func stringOrIntProp(_ description: String) -> JSONValue {
+    .object([
+        "type": .array([.string("string"), .string("integer")]),
+        "description": .string(description)
+    ])
+}
+
 func intProp(_ description: String) -> JSONValue {
     .object(["type": .string("integer"), "description": .string(description)])
 }
@@ -70,6 +81,12 @@ func stringOrStringArrayProp(_ description: String) -> JSONValue {
         "items": .object(["type": .string("string")]),
         "description": .string(description)
     ])
+}
+
+/// A number that need not be whole -- hours, coordinates, durations. `intProp`
+/// is the right choice for a count; this is for a quantity.
+func numberProp(_ description: String) -> JSONValue {
+    .object(["type": .string("number"), "description": .string(description)])
 }
 
 func enumProp(_ description: String, values: [String]) -> JSONValue {

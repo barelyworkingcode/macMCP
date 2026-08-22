@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools across 11 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 47 tools across 13 services. No external dependencies.
 
 ## Tools
 
@@ -64,12 +64,15 @@ Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools acro
 | `mail_create_draft` | Create an email draft (does not send) |
 | `mail_move` | Move an email to another mailbox |
 | `mail_mark_read` | Mark as read/unread |
+| `mail_get_source` | Get a message's raw RFC 822 source |
+| `mail_save_attachment` | Save an attachment to disk |
 
 ### Messages
 | Tool | Description |
 |------|-------------|
 | `messages_list_chats` | List recent conversations |
 | `messages_get_chat` | Get messages from a chat |
+| `messages_search` | Search messages by text and/or contact |
 | `messages_send` | Send an iMessage |
 
 ### Shortcuts
@@ -89,6 +92,16 @@ Standalone Swift MCP server exposing macOS-native tools via stdio. 42 tools acro
 | `weather_current` | Current conditions for a location |
 | `weather_forecast` | Daily forecast |
 | `weather_hourly` | Hourly forecast |
+
+### Web
+| Tool | Description |
+|------|-------------|
+| `web_fetch` | Fetch an http/https URL (GET, 1 MB cap) |
+
+### System
+| Tool | Description |
+|------|-------------|
+| `permissions_check` | Report the state of every macOS permission these tools need |
 
 ## Requirements
 
@@ -149,11 +162,13 @@ Add to your MCP client config (e.g. `claude_desktop_config.json`):
 
 ## Related Projects
 
-macMCP is part of a trio of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 42 tools -- scoped by per-token permissions so different projects can have different access levels.
+macMCP is part of a set of projects that combine to give LLMs secure access to macOS. Each works independently, but together they form a complete stack: **Eve** provides the LLM chat interface, **Relay** handles orchestration and security, and **macMCP** exposes native macOS capabilities. Register macMCP with Relay, and any MCP client (including Eve) gains access to its 47 tools -- scoped by per-token permissions so different projects can have different access levels.
 
 - **[Relay](https://github.com/barelyworkingcode/relay)** -- MCP orchestrator for macOS. macMCP self-registers with Relay via `relay mcp register`, and Relay proxies its tools through a single token-authenticated connection with per-tool permissions.
 - **[fsMCP](https://github.com/barelyworkingcode/fsmcp)** -- Cross-platform file system MCP server (read, write, edit, glob, grep, bash). Complements macMCP's macOS-native tools with file manipulation capabilities.
 - **[Eve](https://github.com/barelyworkingcode/eve)** -- Multi-provider LLM web interface with projects, file editing, and terminal. When both Eve and macMCP register with Relay, LLM sessions gain access to macOS-native tools.
+- **[relayLLM](https://github.com/barelyworkingcode/relayLLM)** -- LLM engine service.
+- **[relayScheduler](https://github.com/barelyworkingcode/relayScheduler)** -- Task scheduler for automated LLM prompts.
 
 ## Acknowledgements
 
