@@ -60,6 +60,47 @@ final class MailMessageCheckTests: XCTestCase {
         )
     }
 
+    // MARK: - What the MIME reader could and could not read
+
+    /// A message nested deeper than the reader descends yields a *shorter*
+    /// attachment list, and a short list is indistinguishable from a message
+    /// with fewer attachments. `structure` is what separates the two, on the
+    /// same footing as `fidelity` beside it (#R3-1).
+    func testAMessageTooDeeplyNestedToReadInFullSaysSoInTheResult() throws {
+        var text = ""
+        for level in 1...MIME.maxDepth {
+            text += "Content-Type: multipart/mixed; boundary=\"B\(level)\"\r\n\r\n--B\(level)\r\n"
+        }
+        text += "Content-Type: application/octet-stream\r\n"
+        text += "Content-Disposition: attachment; filename=\"deep.bin\"\r\n\r\ndeep\r\n"
+        for level in stride(from: MIME.maxDepth, through: 1, by: -1) { text += "--B\(level)--\r\n" }
+        let deep = Data(text.utf8)
+
+        let payload = MailService.messageChecked(
+            ["id": "429", "subject": "probe", "body": "b"],
+            listedByMail: [],
+            source: deep,
+            fidelity: MailService.sourceFidelity(deep, expectedSize: deep.count)
+        )
+        let structure = try XCTUnwrap(payload["structure"] as? [String: Any], "nothing said the parse stopped short")
+        XCTAssertEqual(structure["parsed_complete"] as? Bool, false)
+        XCTAssertEqual(structure["max_depth"] as? Int, MIME.maxDepth)
+        XCTAssertTrue(try XCTUnwrap(structure["note"] as? String).contains("not in this result"))
+        // And the list really is short, which is the point.
+        XCTAssertEqual(payload["has_attachments"] as? Bool, false)
+    }
+
+    func testAnOrdinaryMessageReportsItsStructureToo() throws {
+        // Reported whether or not anything went wrong: a field that appears only
+        // on failure is one a caller never learns to read.
+        let payload = checked(body: "plain part", complete: true)
+        let structure = try XCTUnwrap(payload["structure"] as? [String: Any])
+        XCTAssertEqual(structure["parsed_complete"] as? Bool, true)
+        XCTAssertEqual(structure["parts"] as? Int, 4, "the root and its three parts")
+        XCTAssertEqual(structure["depth"] as? Int, 2)
+        XCTAssertNil(structure["note"])
+    }
+
     // MARK: - A negative from an incomplete fetch is not reported
 
     func testAnEmptyBodyAndEmptyAttachmentListAreOmittedRatherThanReported() throws {
@@ -158,17 +199,30 @@ final class MailMessageCheckTests: XCTestCase {
         let source = Data((["Subject: two", "MIME-Version: 1.0", "Content-Type: multipart/mixed; boundary=\"B\"", "", ""].joined(separator: "\n") + part + part + "--B--\n").utf8)
         XCTAssertEqual(MIME.attachments(of: MIME.parse(source)).count, 2, "the fixture itself")
 
-        // Mail listed one of the two, so exactly one is missing.
-        let extras = MailService.attachmentsMailDidNotList([["name": "data.csv"]], source: source)
-        XCTAssertEqual(extras.count, 1)
-        XCTAssertEqual(extras.first?["name"] as? String, "data.csv")
+        func listedFlags(_ rows: [[String: Any]]) -> [Bool] {
+            let list = MailService.attachmentList(of: MIME.parse(source))
+            return MailService
+                .reconcileWithMail(list.attachments + list.inlineParts, listedByMail: rows)
+                .entries
+                .map(\.listedByMail)
+        }
 
-        // And when Mail listed both, nothing is added.
+        // Two parts sharing a filename are two entries, always — never one part
+        // reported twice, and never two collapsed into one. Mail listed one of
+        // the pair, so exactly one entry says so; each row claims at most one
+        // part.
+        XCTAssertEqual(listedFlags([["name": "data.csv"]]), [true, false])
+
+        // And when Mail listed both, both are accounted for and nothing is left
+        // over.
+        XCTAssertEqual(listedFlags([["name": "data.csv"], ["name": "DATA.CSV"]]), [true, true])
+
+        let list = MailService.attachmentList(of: MIME.parse(source))
         XCTAssertEqual(
-            MailService.attachmentsMailDidNotList(
-                [["name": "data.csv"], ["name": "DATA.CSV"]],
-                source: source
-            ).count,
+            MailService.reconcileWithMail(
+                list.attachments,
+                listedByMail: [["name": "data.csv"], ["name": "DATA.CSV"]]
+            ).unlocated.count,
             0
         )
     }

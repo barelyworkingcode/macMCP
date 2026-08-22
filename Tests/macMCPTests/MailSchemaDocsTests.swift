@@ -57,6 +57,85 @@ final class MailSchemaDocsTests: XCTestCase {
         )
     }
 
+    /// A message can nest multipart parts as deep as its sender likes. macMCP
+    /// stops descending at `MIME.maxDepth`, which makes the attachment list
+    /// short rather than wrong — and short is indistinguishable from "this
+    /// message has fewer attachments" unless the schema says the field exists
+    /// and what it means (#R3-1).
+    func testTheAttachmentToolsSayWhenAMessageWasNotReadInFull() throws {
+        for tool in ["mail_get_email", "mail_save_attachment"] {
+            assertMentions(
+                try description(of: tool),
+                anyOf: ["parsed_complete"],
+                "\(tool) reporting a message it could not parse in full"
+            )
+        }
+    }
+
+    /// Every mail tool is bounded by one wall-clock budget for the whole call,
+    /// and every one of them lets the caller change it. That has to be in the
+    /// schema twice over: a caller whose request comes back short needs to know
+    /// there is a knob, and a caller on a machine where Mail is busy needs to
+    /// know the default was measured somewhere quieter — the same script has
+    /// been measured at 2.16s alone and 17.58s with another client driving Mail.
+    func testEveryMailToolDocumentsItsTimeBudgetAndItsDefault() throws {
+        let defaults: [String: TimeInterval] = [
+            "mail_list_accounts": MailService.Budget.listAccounts,
+            "mail_list_mailboxes": MailService.Budget.listMailboxes,
+            "mail_get_emails": MailService.Budget.getEmails,
+            "mail_get_email": MailService.Budget.getEmail,
+            "mail_search": MailService.Budget.search,
+            "mail_send": MailService.Budget.send,
+            "mail_create_draft": MailService.Budget.createDraft,
+            "mail_save_attachment": MailService.Budget.saveAttachment,
+            "mail_get_source": MailService.Budget.getSource,
+            "mail_move": MailService.Budget.move,
+            "mail_mark_read": MailService.Budget.markRead,
+        ]
+        XCTAssertEqual(Set(defaults.keys), Set(tools.keys), "a mail tool with no budget documented")
+
+        for (tool, fallback) in defaults {
+            let text = try property("timeout_seconds", of: tool)
+            XCTAssertTrue(
+                text.contains("\(Int(fallback))"),
+                "\(tool) does not say its own default of \(Int(fallback))s: \(text)"
+            )
+            XCTAssertTrue(
+                text.contains("\(Int(MailCall.maxCallerBudget))"),
+                "\(tool) does not say how far the budget can be raised: \(text)"
+            )
+            assertMentions(
+                text, anyOf: ["seconds"], "\(tool)'s budget being in seconds"
+            )
+        }
+    }
+
+    /// What running out of budget means is not the same for a read and for a
+    /// tool that changes something. A read hands back what it read. A send can
+    /// have the budget fire after Mail has already acted, so "nothing happened"
+    /// is exactly what a caller must not infer — that is the difference between
+    /// a safe retry and sending twice.
+    func testOnlyTheReadsPromiseThatRunningOutCostsNothing() throws {
+        for tool in ["mail_send", "mail_create_draft", "mail_move", "mail_mark_read"] {
+            let text = try property("timeout_seconds", of: tool)
+            XCTAssertFalse(
+                text.contains("not an error"),
+                "\(tool) changes something; it cannot promise the budget firing is free: \(text)"
+            )
+            assertMentions(
+                text, anyOf: ["before retrying", "already acted"],
+                "\(tool) warning that Mail may have acted already"
+            )
+        }
+        for tool in ["mail_get_emails", "mail_search", "mail_get_email", "mail_get_source"] {
+            assertMentions(
+                try property("timeout_seconds", of: tool),
+                anyOf: ["not an error"],
+                "\(tool) saying a short read is still a result"
+            )
+        }
+    }
+
     func testListMailboxesNamesMailsOwnLocalMailboxes() throws {
         // They are scanned and their rows come back labelled `On My Mac:...`,
         // so a listing that does not name them hands a caller a mailbox they
@@ -150,5 +229,119 @@ final class MailSchemaDocsTests: XCTestCase {
         XCTAssertTrue(text.contains("omitted"), text)
         XCTAssertTrue(text.contains("has_attachments"), text)
         XCTAssertTrue(text.contains("listed_by_mail"), "the reconciled list: \(text)")
+    }
+
+    // MARK: - The two tools share one attachment namespace (#R2-2, #R4-4)
+
+    func testBothAttachmentToolsSayTheyAreTalkingAboutTheSameList() throws {
+        // The defect a caller met first was a documented promise that was not
+        // true: `attachment_name` said "as reported by mail_get_email" while
+        // mail_save_attachment selected out of a different list, under different
+        // names, in a different order. Now that they really are one list, both
+        // descriptions have to say so — a caller who does not know they agree
+        // has no reason to copy a name from one into the other.
+        let get = try description(of: "mail_get_email")
+        let save = try description(of: "mail_save_attachment")
+        for text in [get, save] {
+            assertMentions(
+                text,
+                anyOf: ["same list", "SAME list", "exactly the list mail_get_email reports"],
+                "the two tools agreeing"
+            )
+            XCTAssertTrue(text.contains("part_path"), "the exact handle: \(text)")
+            XCTAssertTrue(text.contains("inline"), "what is deliberately not an attachment: \(text)")
+        }
+
+        // And `attachment_name` names which of the two names is the handle,
+        // since mail_get_email now reports both.
+        let name = try property("attachment_name", of: "mail_save_attachment")
+        XCTAssertTrue(name.contains("mail_name"), name)
+
+        let path = try property("part_path", of: "mail_save_attachment")
+        assertMentions(path, anyOf: ["inline"], "the one way to reach an inline part")
+    }
+
+    /// A mailbox that changes under a scan no longer costs the caller the
+    /// mailbox — its rows are re-read one message at a time instead. That is a
+    /// different answer with different fields in it, and the fields are only
+    /// legible if the schema names them: `changed_mailboxes` says where it
+    /// happened, `rows_reverified` / `rows_dropped` say what it cost, and for a
+    /// search it is also why `scan_complete` is false.
+    func testTheScanToolsSayWhatAChangedMailboxMeansForTheAnswer() throws {
+        for tool in ["mail_get_emails", "mail_search"] {
+            let text = try description(of: tool)
+            XCTAssertTrue(text.contains("changed_mailboxes"), "\(tool): \(text)")
+            XCTAssertTrue(text.contains("rows_reverified"), "\(tool): \(text)")
+            XCTAssertTrue(text.contains("rows_dropped"), "\(tool): \(text)")
+            assertMentions(
+                text,
+                anyOf: ["re-read", "reread", "read message by message"],
+                "\(tool) saying the rows were re-read rather than discarded"
+            )
+            // `skipped_mailboxes` now carries a reason per entry, which is the
+            // difference between a mailbox that is gone and one Mail was busy.
+            XCTAssertTrue(text.contains("skipped_mailboxes"), "\(tool): \(text)")
+        }
+
+        // And the body pass reports its own coverage, because it is a second
+        // scan of the same scope and can fall short where the first did not.
+        let search = try description(of: "mail_search")
+        XCTAssertTrue(search.contains("body_scan_complete"), search)
+        assertMentions(
+            search,
+            anyOf: ["body_scan_skipped_mailboxes", "body_scan_note", "second pass's own coverage"],
+            "the body pass's own coverage"
+        )
+    }
+
+    /// The body pass reads fewer bodies than asked for whenever the newest
+    /// messages in scope are ones it will not read again, and that used to be
+    /// invisible: `bodies_read: 0` beside `body_matches: 0` reads as "none of
+    /// them matched". A caller cannot ask for more without knowing which of the
+    /// two happened.
+    func testTheSearchSchemaSaysWhatAShortBodyPassLooksLike() throws {
+        let text = try description(of: "mail_search")
+        XCTAssertTrue(text.contains("body_scan_shortfall"), text)
+        assertMentions(
+            text,
+            anyOf: ["wider", "widen"],
+            "the sweep being wider than body_scan_limit"
+        )
+    }
+
+    /// `body_check` costs a full download of the saved draft to report an
+    /// answer that has been the same every time it has been measured. It is
+    /// behind an argument now, so both the argument and what the default means
+    /// have to be legible.
+    func testTheDraftSchemaSaysBodyCheckIsNotMeasuredByDefault() throws {
+        let text = try description(of: "mail_create_draft")
+        XCTAssertTrue(text.contains("body_check"), text)
+        XCTAssertTrue(text.contains("verify_body"), text)
+        assertMentions(text, anyOf: ["null"], "the default being null rather than false")
+        let arg = try property("verify_body", of: "mail_create_draft")
+        assertMentions(arg, anyOf: ["default: false", "off by default"], "the default")
+    }
+
+    /// A multipart that stops before the delimiter closing it is a fragment
+    /// whatever its byte count says, and both tools that read a source act on
+    /// that -- one reports it, the other refuses.
+    func testTheSourceToolsNameTheStructuralCompletenessCheck() throws {
+        let source = try description(of: "mail_get_source")
+        XCTAssertTrue(source.contains("wire+terminated"), source)
+        XCTAssertTrue(source.contains("unterminated"), source)
+        let save = try description(of: "mail_save_attachment")
+        assertMentions(
+            save,
+            anyOf: ["unterminated", "--boundary--"],
+            "mail_save_attachment refusing a multipart that stops short of its own end"
+        )
+    }
+
+    /// `mail_mark_read` reports what Mail says afterwards, not what was asked
+    /// for, and names the message it happened to.
+    func testTheMarkReadSchemaSaysTheAnswerIsReadBack() throws {
+        let text = try description(of: "mail_mark_read")
+        assertMentions(text, anyOf: ["read back", "read-back"], "the read-back")
+        assertMentions(text, anyOf: ["error"], "a flag Mail did not take being an error")
     }
 }

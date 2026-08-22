@@ -118,6 +118,38 @@ enum PermissionsService {
         boundedStatus(timeout: timeout) { probeAutomation(bundleID: bundleID) }
     }
 
+    /// How many probes may be blocked at once before the answer is taken as
+    /// read.
+    ///
+    /// A probe that overruns its deadline does not stop: it is sitting inside
+    /// `AEDeterminePermissionToAutomateTarget`, which returns only once the
+    /// consent prompt is answered -- 12s in one measurement, 73s in another,
+    /// and still blocked 20s after the script that raised the prompt had been
+    /// killed. So the thread it is on is spoken for until then, and a caller
+    /// that keeps asking keeps starting more.
+    ///
+    /// Past a handful there is nothing left to learn. A probe already blocked
+    /// **is** the evidence that a decision is outstanding, which is what
+    /// `.checkBlocked` says; starting an n-th one cannot say anything the first
+    /// did not, and the only thing it adds is another stuck thread. Four is
+    /// small enough to bound the damage and more than enough to survive an
+    /// unlucky overlap of two calls with a prompt that answers in between.
+    static let maxConcurrentProbes = 4
+
+    /// Guards `blockedProbes`. Probes run on their own threads, so the count is
+    /// genuinely shared.
+    private static let probeLock = NSLock()
+    /// Probes started and not yet returned.
+    private static var blockedProbes = 0
+
+    /// Probes currently stuck inside the TCC check. Exposed for the test that
+    /// asserts the cap, which otherwise has no way to see it.
+    static var probesInFlight: Int {
+        probeLock.lock()
+        defer { probeLock.unlock() }
+        return blockedProbes
+    }
+
     /// Runs `probe` with a deadline, reporting `.checkBlocked` if it overruns.
     ///
     /// Split out, and not private, so the bound can be tested with a probe that
@@ -125,24 +157,67 @@ enum PermissionsService {
     /// demand -- it needs an unanswered consent prompt on screen -- and a
     /// property that only reproduces under a condition a test cannot create is
     /// exactly the sort that quietly stops holding.
+    ///
+    /// **The probe gets a thread of its own, not a `DispatchQueue.global`
+    /// one.** The deadline firing does not cancel the work; it only stops
+    /// *waiting* for it, and what is left behind is a block sitting inside a
+    /// synchronous C call for as long as a consent prompt stays on screen.
+    /// libdispatch's global pool is bounded -- 64 threads -- and it is not
+    /// macMCP's to spend: `WebService`, `WeatherService`, `LocationService` and
+    /// the EventKit services all have their completions delivered through it
+    /// while the main RunLoop is being pumped, so enough abandoned probes would
+    /// hang tools that have nothing to do with Mail. A dedicated `Thread` is
+    /// leaked instead of a pooled worker, and `maxConcurrentProbes` bounds how
+    /// many of those there can be.
+    ///
+    /// The result is handed over under a lock rather than through a bare
+    /// `var`. On the deadline path the writer is still running when the reader
+    /// has moved on, so an unsynchronised field is a data race whether or not
+    /// anything reads it afterwards.
     static func boundedStatus(
         timeout: TimeInterval,
         probe: @escaping @Sendable () -> AutomationStatus
     ) -> AutomationStatus {
+        probeLock.lock()
+        let alreadyBlocked = blockedProbes
+        probeLock.unlock()
+        // Every probe this process has started is still waiting on the same
+        // prompt, so a new one would wait on it too. Answer with what they
+        // already established.
+        if alreadyBlocked >= maxConcurrentProbes { return .checkBlocked }
+
         // A semaphore is safe here, unlike elsewhere in this codebase: the work
         // is one synchronous C call, not a framework callback that would be
         // delivered on the main RunLoop this thread is blocking.
-        final class Box: @unchecked Sendable { var value: AutomationStatus = .unknown(0) }
+        final class Box: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: AutomationStatus?
+            func set(_ status: AutomationStatus) {
+                lock.lock(); value = status; lock.unlock()
+            }
+            func get() -> AutomationStatus? {
+                lock.lock(); defer { lock.unlock() }; return value
+            }
+        }
         let box = Box()
         let done = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            box.value = probe()
+
+        probeLock.lock(); blockedProbes += 1; probeLock.unlock()
+        let worker = Thread {
+            let status = probe()
+            box.set(status)
+            probeLock.lock(); blockedProbes -= 1; probeLock.unlock()
             done.signal()
         }
+        worker.stackSize = 512 * 1024
+        worker.name = "macmcp.tcc-probe"
+        worker.start()
+
         guard done.wait(timeout: .now() + timeout) == .success else {
             return .checkBlocked
         }
-        return box.value
+        // The semaphore was signalled after the write, so the value is there.
+        return box.get() ?? .unknown(0)
     }
 
     private static func probeAutomation(bundleID: String) -> AutomationStatus {
