@@ -103,12 +103,47 @@ while let line = readLine(strippingNewline: true) {
         // MCP convention: `_meta` rides as a sibling of `name`/`arguments`
         // inside `params`. Relay injects `_meta.project_id` and, once a
         // caller's access profile declares one, resource-scope fields
-        // (mail_accounts, mail_mailboxes, write_dirs -- see contextSchema
+        // (mail_accounts, mail_mailboxes, file_dirs -- see contextSchema
         // below and MailScope). Absent stays absent rather than becoming an
         // empty object, because MailScope's whole contract depends on being
         // able to tell "no _meta at all" apart from "_meta present but a
         // scope field empty" (ADR-011 decision 4).
-        let meta = req.params?["_meta"]?.objectValue
+        //
+        // **A `_meta` that is present and is not an object is a malformed
+        // mediated call, and it refuses.** This used to read
+        // `req.params?["_meta"]?.objectValue`, which is `nil` for `null`, for
+        // an array, for a string and for a number alike -- indistinguishable
+        // from the key being absent, which is the one thing that means
+        // *nobody mediated this call*. So `"_meta": null` took the unmediated
+        // branch and was answered with every account, every mailbox and
+        // `mail_send`: the fail-open direction, on the single test ADR-011
+        // decision 4 says is macMCP's own rather than relay's. Relay always
+        // sends an object, so nothing reachable through relay produced it --
+        // which is exactly why it had to be closed here, since a check that
+        // only holds because of what the other side happens to send is one
+        // check and not two.
+        //
+        // The refusal is `-32602` (invalid params) rather than a tool result
+        // carrying `isError`, and it is made here rather than per tool,
+        // because what is malformed is the *request*: `_meta` is the channel
+        // that says a chokepoint handled this call, and a caller that cannot
+        // spell it has said nothing trustworthy about mediation for any of
+        // macMCP's tools, not only the mail ones.
+        var meta: JSONObject? = nil
+        if let rawMeta = req.params?["_meta"] {
+            guard let object = rawMeta.objectValue else {
+                respond(JSONRPCResponse(
+                    id: req.id,
+                    error: JSONRPCError(
+                        code: -32602,
+                        message: "params._meta must be an object; a `_meta` that is present but is not one "
+                            + "cannot be read as \"nobody mediated this call\", which is what its absence means"
+                    )
+                ))
+                break
+            }
+            meta = object
+        }
         let result = registry.call(name: name, arguments: arguments, meta: meta)
 
         let contentValues: [JSONValue] = result.content.map { c in
