@@ -84,22 +84,40 @@ final class MailCall {
     /// of them before telling the caller to go and approve a prompt.
     private(set) var refusal: String?
 
+    /// The resource scope the caller's `_meta` carried, parsed once for the
+    /// whole call. `.none` -- no scope in play -- for every call built
+    /// without one, which is every call in the suite today and every call
+    /// macMCP has ever served in production: nothing yet injects `_meta`
+    /// resource-scope fields. Nothing in this file reads it yet; it rides
+    /// here because `MailCall` is already the per-call state threaded to
+    /// every enforcement seam (`resolveTargets`, `fmInScope`,
+    /// `mailboxInAccountJXA`, `senderJXA`, ...), so a following change that
+    /// enforces it needs no new plumbing to reach it from a handler.
+    let scope: MailScope
+
     init(
         budget: TimeInterval,
         probe: @escaping () -> AutomationStatus = {
             PermissionsService.automationStatus(bundleID: MailService.mailBundleID)
-        }
+        },
+        scope: MailScope = .none
     ) {
         self.budget = budget
         self.deadline = Date().addingTimeInterval(budget)
         self.probe = probe
+        self.scope = scope
     }
 
     /// Builds the budget for one call, honouring `timeout_seconds` when the
-    /// caller set it.
-    static func forArguments(_ args: JSONObject?, default fallback: TimeInterval) -> MailCall {
-        guard let asked = args?["timeout_seconds"]?.intValue else { return MailCall(budget: fallback) }
-        return MailCall(budget: min(max(TimeInterval(asked), minCallerBudget), maxCallerBudget))
+    /// caller set it, and parses `meta` (a `tools/call` request's `_meta`,
+    /// via `MCPCallContext.meta`) into the scope this call carries.
+    /// `meta: nil` is the default so every existing call site -- and every
+    /// test building a `MailCall` or calling `forArguments` directly --
+    /// keeps compiling and behaving exactly as before.
+    static func forArguments(_ args: JSONObject?, default fallback: TimeInterval, meta: JSONObject? = nil) -> MailCall {
+        let scope = MailScope.parse(meta)
+        guard let asked = args?["timeout_seconds"]?.intValue else { return MailCall(budget: fallback, scope: scope) }
+        return MailCall(budget: min(max(TimeInterval(asked), minCallerBudget), maxCallerBudget), scope: scope)
     }
 
     /// The automation grant, read at most once for the whole call.
@@ -2168,7 +2186,7 @@ enum MailService {
         // pass, so "narrow the scope" would be advice the caller cannot follow.
         // `timeout_seconds` is not scope -- it says how long to wait, not what
         // to wait for.
-        let (names, error) = accountNames(scopable: false, call: MailCall.forArguments(args, default: Budget.listAccounts))
+        let (names, error) = accountNames(scopable: false, call: MailCall.forArguments(args, default: Budget.listAccounts, meta: ctx.meta))
         if let error { return errorResult(error) }
         return jsonResult(names)
     }
@@ -2217,7 +2235,7 @@ enum MailService {
             \(listMailboxesScriptJXA(account: account))
             """,
             scopable: account == nil,
-            call: MailCall.forArguments(args, default: Budget.listMailboxes)
+            call: MailCall.forArguments(args, default: Budget.listMailboxes, meta: ctx.meta)
         )
         if let error { return errorResult(error) }
         return textResult(output)
@@ -2303,7 +2321,7 @@ enum MailService {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let account = args?["account"]?.stringValue
-        let call = MailCall.forArguments(args, default: Budget.getEmails)
+        let call = MailCall.forArguments(args, default: Budget.getEmails, meta: ctx.meta)
 
         let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return errorResult(targetError) }
@@ -2355,7 +2373,7 @@ enum MailService {
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let account = args?["account"]?.stringValue
-        let call = MailCall.forArguments(args, default: Budget.getEmail)
+        let call = MailCall.forArguments(args, default: Budget.getEmail, meta: ctx.meta)
 
         // **One script, one bind, one fetch.** This used to be two osascript
         // spawns with a `findMessageJXA` in each: the first for the properties,
@@ -3072,7 +3090,7 @@ JSON.stringify(out);
         // Each body costs ~1.2s, so this stays small by default and is clamped at
         // both ends -- a negative value would trap in `prefix` below.
         let bodyScanLimit = min(max(args?["body_scan_limit"]?.intValue ?? 25, 0), maxBodyScanLimit)
-        let call = MailCall.forArguments(args, default: Budget.search)
+        let call = MailCall.forArguments(args, default: Budget.search, meta: ctx.meta)
 
         let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return errorResult(targetError) }
@@ -4180,7 +4198,7 @@ JSON.stringify(out);
         return composeEmail(args, visible: false, finalAction: """
         msg.send();
         result.status = 'sent';
-        """, disposesMessage: true, call: MailCall.forArguments(args, default: Budget.send))
+        """, disposesMessage: true, call: MailCall.forArguments(args, default: Budget.send, meta: ctx.meta))
     }
 
     /// After saving, the draft is looked up and its identifiers returned.
@@ -4327,7 +4345,7 @@ var savedDraft = (function() {
     private static func createDraft(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         invalidateSourceCache()
-        let call = MailCall.forArguments(args, default: Budget.createDraft)
+        let call = MailCall.forArguments(args, default: Budget.createDraft, meta: ctx.meta)
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
         let subject = args?["subject"]?.stringValue ?? ""
@@ -5110,7 +5128,7 @@ var savedDraft = (function() {
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
-            call: MailCall.forArguments(args, default: Budget.saveAttachment)
+            call: MailCall.forArguments(args, default: Budget.saveAttachment, meta: ctx.meta)
         )
         if let fetchError { return errorResult(fetchError) }
 
@@ -5277,7 +5295,7 @@ var savedDraft = (function() {
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
-            call: MailCall.forArguments(args, default: Budget.getSource)
+            call: MailCall.forArguments(args, default: Budget.getSource, meta: ctx.meta)
         )
         if let fetchError { return errorResult(fetchError) }
 
@@ -5617,7 +5635,7 @@ var savedDraft = (function() {
         let (output, error) = runJXA(
             script,
             retries: mutatingRetries,
-            call: MailCall.forArguments(args, default: Budget.move)
+            call: MailCall.forArguments(args, default: Budget.move, meta: ctx.meta)
         )
         if let error { return errorResult(error) }
         switch scriptPayload(output) {
@@ -5700,7 +5718,7 @@ var savedDraft = (function() {
         let (output, error) = runJXA(
             script,
             retries: mutatingRetries,
-            call: MailCall.forArguments(args, default: Budget.markRead)
+            call: MailCall.forArguments(args, default: Budget.markRead, meta: ctx.meta)
         )
         if let error { return errorResult(error) }
         var payload: [String: Any]
