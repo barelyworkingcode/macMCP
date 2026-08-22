@@ -197,6 +197,16 @@ private let calendarScopeFields: [ScopeField] = [
     )
 ]
 
+// **The contacts pair is enforced, as of the branch that added this note**, so
+// the staging warning above no longer applies to these two: `contact_accounts`
+// and `contact_groups` are read by `ContactsService.gate`, which every one of
+// the ten `contacts_*` tools goes through. What a value *means* is stated in
+// `ContactsScope.swift` and is one decision worth knowing from here: a card is
+// reachable when it is a member of a group in scope, because a card -- unlike a
+// message, which is always in a mailbox -- need not be in a group at all, and
+// the alternative reading would have let a profile naming one group read the
+// whole address book. The four calendar and reminder fields are still
+// declaration-only.
 private let contactsScopeFields: [ScopeField] = [
     ScopeField(
         name: "contact_accounts",
