@@ -72,6 +72,70 @@ final class MailSchemaDocsTests: XCTestCase {
         }
     }
 
+    /// Every mail tool is bounded by one wall-clock budget for the whole call,
+    /// and every one of them lets the caller change it. That has to be in the
+    /// schema twice over: a caller whose request comes back short needs to know
+    /// there is a knob, and a caller on a machine where Mail is busy needs to
+    /// know the default was measured somewhere quieter — the same script has
+    /// been measured at 2.16s alone and 17.58s with another client driving Mail.
+    func testEveryMailToolDocumentsItsTimeBudgetAndItsDefault() throws {
+        let defaults: [String: TimeInterval] = [
+            "mail_list_accounts": MailService.Budget.listAccounts,
+            "mail_list_mailboxes": MailService.Budget.listMailboxes,
+            "mail_get_emails": MailService.Budget.getEmails,
+            "mail_get_email": MailService.Budget.getEmail,
+            "mail_search": MailService.Budget.search,
+            "mail_send": MailService.Budget.send,
+            "mail_create_draft": MailService.Budget.createDraft,
+            "mail_save_attachment": MailService.Budget.saveAttachment,
+            "mail_get_source": MailService.Budget.getSource,
+            "mail_move": MailService.Budget.move,
+            "mail_mark_read": MailService.Budget.markRead,
+        ]
+        XCTAssertEqual(Set(defaults.keys), Set(tools.keys), "a mail tool with no budget documented")
+
+        for (tool, fallback) in defaults {
+            let text = try property("timeout_seconds", of: tool)
+            XCTAssertTrue(
+                text.contains("\(Int(fallback))"),
+                "\(tool) does not say its own default of \(Int(fallback))s: \(text)"
+            )
+            XCTAssertTrue(
+                text.contains("\(Int(MailCall.maxCallerBudget))"),
+                "\(tool) does not say how far the budget can be raised: \(text)"
+            )
+            assertMentions(
+                text, anyOf: ["seconds"], "\(tool)'s budget being in seconds"
+            )
+        }
+    }
+
+    /// What running out of budget means is not the same for a read and for a
+    /// tool that changes something. A read hands back what it read. A send can
+    /// have the budget fire after Mail has already acted, so "nothing happened"
+    /// is exactly what a caller must not infer — that is the difference between
+    /// a safe retry and sending twice.
+    func testOnlyTheReadsPromiseThatRunningOutCostsNothing() throws {
+        for tool in ["mail_send", "mail_create_draft", "mail_move", "mail_mark_read"] {
+            let text = try property("timeout_seconds", of: tool)
+            XCTAssertFalse(
+                text.contains("not an error"),
+                "\(tool) changes something; it cannot promise the budget firing is free: \(text)"
+            )
+            assertMentions(
+                text, anyOf: ["before retrying", "already acted"],
+                "\(tool) warning that Mail may have acted already"
+            )
+        }
+        for tool in ["mail_get_emails", "mail_search", "mail_get_email", "mail_get_source"] {
+            assertMentions(
+                try property("timeout_seconds", of: tool),
+                anyOf: ["not an error"],
+                "\(tool) saying a short read is still a result"
+            )
+        }
+    }
+
     func testListMailboxesNamesMailsOwnLocalMailboxes() throws {
         // They are scanned and their rows come back labelled `On My Mac:...`,
         // so a listing that does not name them hands a caller a mailbox they

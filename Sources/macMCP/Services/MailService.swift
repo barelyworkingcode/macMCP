@@ -1,5 +1,144 @@
 import Foundation
 
+/// The wall-clock budget one `tools/call` gets, plus the facts about the
+/// environment that hold for the whole of it.
+///
+/// **Why a call needs one.** Until this existed the only deadline in the
+/// service was on a single `osascript` spawn, and spawns compose. A scan runs
+/// one per account, `mail_search` runs two of those passes and then a body
+/// pass, and every one of them was handed the full 120s independently. Read
+/// off the code, the worst cases were `mail_get_emails` 406s at two accounts
+/// and 1398s at ten, `mail_get_email` 421s, `mail_move` 372s,
+/// `mail_create_draft` 308s, and `mail_search` with `search_body` about 1408s
+/// — 23.5 minutes. `main.swift` is a single synchronous `readLine()` loop, so
+/// nothing else is served for the duration: a client that gave up long ago
+/// leaves the server grinding with every other tool queued behind it.
+///
+/// So the budget belongs to the **call**. Every `runJXAData` beneath a handler
+/// is given `min(remaining, its own per-script ceiling)`, and running out
+/// degrades the way a scan already degrades — the accounts that were read come
+/// back, the rest are named as unread and `scan_complete` goes false — rather
+/// than turning into an error that throws away work already done.
+///
+/// **And why it is caller-visible.** Every default here was measured on a quiet
+/// machine, and Mail's Apple Event throughput is not isolated: the same script
+/// took 2.16s alone and 17.58s while another client was driving Mail, an 8.1x
+/// swing. A budget tuned on the quiet number fires on healthy calls under load,
+/// which is why the defaults carry a contention allowance and why
+/// `timeout_seconds` exists on every mail tool for the caller who knows their
+/// machine is the slow case.
+final class MailCall {
+    /// The smallest slice worth spawning a process for.
+    ///
+    /// A spawn costs ~150ms before the script runs at all, and the cheapest
+    /// real Mail script there is — `mail.accounts()` — measured ~0.3s, which
+    /// the 8.1x contention swing takes to ~2.4s. Below this a spawn is more
+    /// likely to be killed than answered, and killing it costs the 2s SIGKILL
+    /// backstop on top. So a step that cannot be given this much is not started;
+    /// it is reported as unread instead, which is an answer.
+    static let minimumSlice: TimeInterval = 2
+
+    /// How long the **first** spawn of a call gets when macOS has already said
+    /// the automation grant is not simply in place.
+    ///
+    /// The probe is taken before anything runs, so a `.pendingConsent`,
+    /// `.checkBlocked` or `.denied` answer is known in advance — but it is a
+    /// prediction, and the thing it predicts (that no Apple Event will get
+    /// through) is exactly the thing a spawn settles for certain. So the spawn
+    /// still happens: it either succeeds, which means the prediction was stale
+    /// and nothing was lost, or it establishes the diagnosis in about the time
+    /// a person who is looking at the consent prompt takes to click Allow.
+    /// Twenty seconds is that long. What must not happen is paying it again per
+    /// account — see `refusal`.
+    static let automationDoubtWindow: TimeInterval = 20
+
+    /// Bounds on a caller-supplied `timeout_seconds`.
+    ///
+    /// The floor is one `minimumSlice` plus the SIGKILL backstop and a spawn:
+    /// anything less cannot complete a single step, so accepting it would be
+    /// accepting a request to fail. The ceiling is deliberately well under the
+    /// worst cases this type was written to remove — a caller who genuinely
+    /// wants a 200-body search can ask for ten minutes, and asking is the
+    /// point: it is then a decision rather than an accident of how many
+    /// accounts are configured.
+    static let minCallerBudget: TimeInterval = 5
+    static let maxCallerBudget: TimeInterval = 600
+
+    /// The budget this call was given, in seconds. Kept for the wording: a
+    /// caller told "the budget ran out" needs to know what it was.
+    let budget: TimeInterval
+    let deadline: Date
+
+    private let probe: () -> AutomationStatus
+    private var takenAutomation: AutomationStatus?
+
+    /// A reason, established by a spawn that already ran, why no further Apple
+    /// Event in this call can succeed.
+    ///
+    /// Latched rather than re-derived because the thing it describes is a
+    /// property of the process and the moment, not of the script: once one
+    /// spawn has demonstrated that consent is outstanding or the grant is
+    /// refused, running the next account's script cannot do anything except
+    /// spend its slice finding out the same thing. A full-scope `mail_search`
+    /// is seven or more spawns, and without this it paid the wait on every one
+    /// of them before telling the caller to go and approve a prompt.
+    private(set) var refusal: String?
+
+    init(
+        budget: TimeInterval,
+        probe: @escaping () -> AutomationStatus = {
+            PermissionsService.automationStatus(bundleID: MailService.mailBundleID)
+        }
+    ) {
+        self.budget = budget
+        self.deadline = Date().addingTimeInterval(budget)
+        self.probe = probe
+    }
+
+    /// Builds the budget for one call, honouring `timeout_seconds` when the
+    /// caller set it.
+    static func forArguments(_ args: JSONObject?, default fallback: TimeInterval) -> MailCall {
+        guard let asked = args?["timeout_seconds"]?.intValue else { return MailCall(budget: fallback) }
+        return MailCall(budget: min(max(TimeInterval(asked), minCallerBudget), maxCallerBudget))
+    }
+
+    /// The automation grant, read at most once for the whole call.
+    ///
+    /// It used to be read once per spawn. That is a process-wide fact, not a
+    /// per-spawn one, and reading it is not always free: the check blocks while
+    /// a consent prompt is on screen (12s in one measurement, 73s in another),
+    /// so it is bounded at 2s — and a seven-spawn search paid that bound seven
+    /// times over.
+    func automation() -> AutomationStatus {
+        if let takenAutomation { return takenAutomation }
+        let status = probe()
+        takenAutomation = status
+        return status
+    }
+
+    /// Seconds left, floored at zero.
+    var remaining: TimeInterval { max(0, deadline.timeIntervalSinceNow) }
+
+    /// Whether there is any point starting another step.
+    var isExhausted: Bool { refusal != nil || remaining < MailCall.minimumSlice }
+
+    /// What one script may have of the budget, given its own ceiling.
+    func slice(_ ceiling: TimeInterval) -> TimeInterval { min(ceiling, remaining) }
+
+    func latch(_ message: String) { if refusal == nil { refusal = message } }
+
+    /// Why a step was not run. `refusal` first: a call that stopped because
+    /// Mail could not be reached should not report it as slowness.
+    func skipReason(scopable: Bool) -> String {
+        if let refusal { return refusal }
+        var message = "the call\u{2019}s \(Int(budget))s time budget ran out before this could be read"
+        message += scopable
+            ? ". Narrow the scope (a specific account or mailbox, or a smaller limit), or pass a larger timeout_seconds (max \(Int(MailCall.maxCallerBudget)))."
+            : ". Pass a larger timeout_seconds (max \(Int(MailCall.maxCallerBudget))) and try again."
+        return message
+    }
+}
+
 enum MailService {
     /// Wall-clock ceiling for a single osascript invocation. Mail can wedge for
     /// minutes on an expensive Apple Event, and an unbounded wait would hang the
@@ -12,6 +151,91 @@ enum MailService {
     /// The bundle every mail_* tool sends Apple Events to. Not private, for the
     /// same reason as above.
     static let mailBundleID = "com.apple.mail"
+
+    /// How long each tool's whole call may take, before the caller overrides it
+    /// with `timeout_seconds`.
+    ///
+    /// **How these numbers were arrived at.** Each is the tool's measured
+    /// steady-state worst case on the fixture, multiplied by a contention
+    /// allowance of 8 (Mail served the same script in 2.16s alone and 17.58s
+    /// while another client was driving it — an 8.1x swing, which is the reason
+    /// a budget sized on the quiet number would fire on healthy calls), then
+    /// rounded up. Nothing here is above 300s: `main.swift` serves one request
+    /// at a time, so a call that runs longer than a few minutes has stopped
+    /// being useful to anyone by the time it answers, and a caller who really
+    /// does want a 200-body search can say so with `timeout_seconds`.
+    ///
+    /// They replace no bound at all. What each of these tools could take before,
+    /// read off the per-spawn deadlines that compose beneath them, was
+    /// `mail_get_emails` 406s at two accounts and 1398s at ten, `mail_get_email`
+    /// 421s, `mail_move` 372s, `mail_create_draft` 308s, and `mail_search` with
+    /// `search_body` about 1408s.
+    ///
+    /// Not private: the schema text quotes them, and a test pins that the two
+    /// agree.
+    enum Budget {
+        /// One `mail.accounts()` call, measured at ~0.3s.
+        static let listAccounts: TimeInterval = 45
+        /// One bulk mailbox build per account; ~0.5s for the fixture's 33.
+        static let listMailboxes: TimeInterval = 60
+        /// A full-scope scan of both accounts and every mailbox measured 4.2s.
+        static let getEmails: TimeInterval = 120
+        /// A metadata read plus a full source fetch. The fetch is the long pole:
+        /// a message still arriving spends up to 10s of `delay()` and 21
+        /// `source()` reads waiting for the rest of it, ~33s on a 70 MB message.
+        static let getEmail: TimeInterval = 300
+        /// Two metadata passes plus a capped body pass. `mailbox: "all"` with
+        /// `search_body: 5` measured 9.0s; the default `body_scan_limit` of 25
+        /// is ~39s at Mail's ~1.2s per body.
+        static let search: TimeInterval = 300
+        /// Compose, guard, send, close and sweep: ~4s.
+        static let send: TimeInterval = 120
+        /// The same, plus a 1.5s wait for the account to file the draft, the
+        /// find-back, and a source fetch for `body_check`.
+        static let createDraft: TimeInterval = 180
+        /// A source fetch, and the completion wait inside it, on a message that
+        /// can be tens of megabytes.
+        static let getSource: TimeInterval = 300
+        static let saveAttachment: TimeInterval = 300
+        /// Resolving a destination is dozens of Apple Events and the read-back
+        /// is up to 12 attempts over the destination's id column: ~10s on a
+        /// 12,000-message INBOX.
+        static let move: TimeInterval = 120
+        /// One find and one property write: ~1s.
+        static let markRead: TimeInterval = 60
+    }
+
+    /// The `timeout_seconds` argument, worded with this tool's own default.
+    ///
+    /// Every mail tool takes it, and uniformly rather than only on the tools
+    /// whose scope varies most, because which tool is the slow one depends on
+    /// the machine rather than on the schema: the 8.1x contention swing applies
+    /// to `mail_mark_read` exactly as it does to a full-scope search.
+    /// `mutating` changes what running out is promised to mean. A read that
+    /// runs out returns what it read; a tool that changes something cannot
+    /// promise that, because the budget can fire after Mail has already acted
+    /// and before the result comes back. Saying so is the difference between a
+    /// caller retrying safely and a caller sending twice.
+    static func timeoutProp(_ fallback: TimeInterval, mutating: Bool = false) -> JSONValue {
+        let outcome = mutating
+            ? "Running out is reported as an error, and because it can fire after Mail has already acted, check the mailbox before retrying rather than assuming nothing happened."
+            : "Running out is not an error: whatever was read is returned, and the coverage fields say what was not."
+        return intProp("Wall-clock budget in seconds for this whole call, shared by every step it takes (default: \(Int(fallback)), minimum \(Int(MailCall.minCallerBudget)), maximum \(Int(MailCall.maxCallerBudget))). \(outcome) Raise it when Mail is busy — another client driving Mail has been measured to slow the same request by 8x")
+    }
+
+    /// The one sentence for a refused Apple Events grant.
+    ///
+    /// Shared by the two places that can establish it, which is the whole
+    /// point of its being a function. The wording used to live only inside
+    /// `jxaTimeoutMessage`'s `.denied` branch, and that branch is reached only
+    /// when a script blows its deadline -- which a denial does not produce. A
+    /// denied grant makes `osascript` exit immediately with -1743, so the
+    /// carefully worded advice could never fire, and what the caller actually
+    /// got was the raw `execution error: Not authorized to send Apple events to
+    /// Mail. (-1743)`.
+    static func automationDeniedMessage() -> String {
+        "Mail was never asked: permission to send Apple Events to Mail is denied, so the request could not leave this process. Re-grant it in System Settings > Privacy & Security > Automation — in Relay, Settings > MCP Servers > macMCP > Reset Permissions — then try again."
+    }
 
     /// Builds the error returned when a script blows its deadline.
     ///
@@ -27,6 +251,15 @@ enum MailService {
     /// advice is only offered to tools that actually have scope. Whatever
     /// `osascript` wrote to stderr is kept either way -- it is the only other
     /// evidence there is, and the timeout path used to discard it.
+    ///
+    /// The `.pendingConsent` wording says "if it is still there" rather than
+    /// asserting the prompt is unanswered. This message is now reached after a
+    /// short window (`MailCall.automationDoubtWindow`) rather than after two
+    /// minutes, so the case where somebody clicked Allow at second 19 and the
+    /// script then needed longer than the window is a real one -- and telling
+    /// them to approve a prompt they just approved would be a confidently wrong
+    /// answer of exactly the kind this service exists not to give. Trying again
+    /// is the right advice in both readings.
     static func jxaTimeoutMessage(
         timeout: TimeInterval,
         automation: AutomationStatus,
@@ -37,9 +270,9 @@ enum MailService {
         var message: String
         switch automation {
         case .pendingConsent:
-            message = "Mail was never asked: macOS is waiting for permission to send Apple Events to Mail, and the request sat behind that prompt until it was cancelled after \(seconds)s. Approve the prompt on screen, or grant automation of Mail in System Settings > Privacy & Security > Automation, then try again."
+            message = "Mail was never asked, or has not answered yet: when this call started macOS was still waiting for permission to send Apple Events to Mail, and the request sat behind that prompt until it was cancelled after \(seconds)s. Approve the prompt on screen if it is still there, or grant automation of Mail in System Settings > Privacy & Security > Automation, then try again."
         case .denied:
-            message = "Mail was never asked: permission to send Apple Events to Mail is denied, so the request could not leave this process. Re-grant it in System Settings > Privacy & Security > Automation — in Relay, Settings > MCP Servers > macMCP > Reset Permissions — then try again."
+            message = automationDeniedMessage()
         case .checkBlocked:
             message = "Mail did not respond within \(seconds)s, and macOS would not say whether this process may control Mail either — that check only blocks while a consent prompt is waiting to be answered. Look for a permission prompt on screen and approve it; if there is none, grant automation of Mail in System Settings > Privacy & Security > Automation. Then try again."
         case .targetNotRunning:
@@ -56,6 +289,116 @@ enum MailService {
         return message
     }
 
+    /// Whether a pre-run automation answer is grounds for cutting the first
+    /// spawn short and for latching a refusal if it fails.
+    ///
+    /// `.targetNotRunning` is deliberately not in the list: it is not a
+    /// permission problem, sending the event is what launches Mail, and a cold
+    /// launch can legitimately outlast the window.
+    static func automationIsInDoubt(_ status: AutomationStatus) -> Bool {
+        switch status {
+        case .pendingConsent, .checkBlocked, .denied: return true
+        case .granted, .targetNotRunning, .unknown: return false
+        }
+    }
+
+    /// Reads osascript's stderr, which is not guaranteed to be UTF-8.
+    ///
+    /// It used to be `try? String(contentsOf:encoding:.utf8)`, so a byte
+    /// sequence that is not valid UTF-8 -- a mailbox or account name echoed
+    /// back through a locale that is not this process's, say -- collapsed the
+    /// whole of stderr to `""`. That costs more than the text: `osaStatus("")`
+    /// is nil, so `scriptErrorMessage` declines, the -1712 and -1728 branches
+    /// are never taken, and the caller is handed "osascript exited with status
+    /// 1" with the OSStatus this file's own comments call "the evidence"
+    /// thrown away. Latin-1 cannot fail, so falling back to it keeps every byte
+    /// -- mojibake in the prose is worth incomparably more than a lost error
+    /// code -- exactly as `MIME.decodeString` already does for message bytes.
+    ///
+    /// Not private: this is a decode with a fallback, and the fallback is the
+    /// part that only fires on input a test has to construct.
+    static func decodeStderr(_ data: Data) -> String {
+        let text = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1)
+            ?? ""
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Removes the script's own path from the front of an osascript error.
+    ///
+    /// The script is handed to osascript as a **file** rather than as an `-e`
+    /// argument (see `runJXAData`), and osascript prefixes the error line with
+    /// the path it read:
+    ///
+    ///     /var/.../macmcp-jxa-<uuid>.js: execution error: Error: Error: … (-2700)
+    ///
+    /// `scriptErrorMessage` requires the text to *begin* with `execution
+    /// error: `, so leaving the prefix in place would silently stop every
+    /// thrown sentence from being unwrapped -- the whole of #10's fix, undone
+    /// by a change of argument style. Stripping is exact rather than
+    /// pattern-based: the path is a fresh UUID under the temp directory, so
+    /// nothing a caller can pass in is able to impersonate it.
+    ///
+    /// Not private: this is the seam where a switch of argument style meets a
+    /// message-unwrapping rule, and the two only interact on stderr.
+    static func stripScriptPath(_ stderr: String, scriptPath: String) -> String {
+        guard !scriptPath.isEmpty else { return stderr }
+        return stderr.replacingOccurrences(of: scriptPath + ": ", with: "")
+    }
+
+    /// How much of the clock one `osascript` spawn may have.
+    ///
+    /// The whole of the deadline layer is which of three bounds wins, so it is
+    /// worth being able to ask that without spawning anything:
+    ///
+    /// * **the script's own ceiling** -- what this particular piece of work is
+    ///   worth waiting for, which is what the service had and all it had;
+    /// * **what is left of the call's budget**, which is the bound that was
+    ///   missing. Per-spawn deadlines compose: one per account, twice over for
+    ///   a body search, each given the full 120s independently, which is how
+    ///   `mail_search` reached a 23.5-minute worst case on a server that
+    ///   answers one request at a time;
+    /// * **the doubt window**, when macOS has already said the automation grant
+    ///   is not simply in place. A spawn is still worth making -- it settles
+    ///   for certain what the probe only predicts -- but it is worth about as
+    ///   long as somebody looking at a consent prompt takes to click Allow,
+    ///   not two minutes.
+    ///
+    /// `nil` for `callRemaining` means the run is not part of a larger call,
+    /// which is what a test or a helper outside a handler gets.
+    static func spawnAllowance(
+        scriptCeiling: TimeInterval,
+        callRemaining: TimeInterval?,
+        automationInDoubt: Bool
+    ) -> TimeInterval {
+        var allowance = scriptCeiling
+        if let callRemaining { allowance = min(allowance, callRemaining) }
+        if automationInDoubt { allowance = min(allowance, MailCall.automationDoubtWindow) }
+        return allowance
+    }
+
+    /// Waits for `process`, or gives up at `deadline`. Returns true if it is
+    /// still running.
+    ///
+    /// Polls, because the alternative -- `waitUntilExit()` on another thread,
+    /// or a termination handler -- means blocking this one on a semaphore while
+    /// `NSApplication`'s main RunLoop is what delivers half the completions in
+    /// this process. But it polls on a curve rather than in flat 50ms ticks:
+    /// a flat tick added up to 50ms of pure sleep to *every* spawn, and a scan
+    /// spawns one process per account per pass. Starting at a millisecond costs
+    /// a fast script almost nothing, and backing off keeps a two-minute wait
+    /// from being two million wakeups.
+    private static func wait(for process: Process, until deadline: Date) -> Bool {
+        var interval = 0.001
+        while process.isRunning {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { break }
+            Thread.sleep(forTimeInterval: min(interval, left))
+            interval = min(interval * 1.5, 0.05)
+        }
+        return process.isRunning
+    }
+
     /// Runs a JXA script under a hard deadline, returning trimmed stdout.
     ///
     /// `scopable` says whether the calling tool has an argument the caller could
@@ -66,9 +409,10 @@ enum MailService {
         _ script: String,
         retries: Int = 2,
         timeout: TimeInterval = defaultTimeout,
-        scopable: Bool = true
+        scopable: Bool = true,
+        call: MailCall? = nil
     ) -> (output: String, error: String?) {
-        let (data, error) = runJXAData(script, retries: retries, timeout: timeout, scopable: scopable)
+        let (data, error) = runJXAData(script, retries: retries, timeout: timeout, scopable: scopable, call: call)
         let output = String(data: data, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return (output, error)
@@ -79,9 +423,24 @@ enum MailService {
     /// Message sources run to megabytes and are handed straight to the MIME
     /// reader, so they must not be round-tripped through a trimmed `String`.
     ///
-    /// Output goes to temp files rather than pipes: a scan of a large mailbox
-    /// easily exceeds the 64 KB pipe buffer, and reading a pipe only after
-    /// `waitUntilExit()` deadlocks once the child fills it.
+    /// **stdout, stderr and the script itself all go through temp files.**
+    /// Output does because a scan of a large mailbox easily exceeds the 64 KB
+    /// pipe buffer, and reading a pipe only after `waitUntilExit()` deadlocks
+    /// once the child fills it. The *script* does for the mirror-image reason:
+    /// it used to be an `-e` argument, which puts it under `ARG_MAX`, and
+    /// `escapeJSString` renders every non-ASCII UTF-16 unit as six ASCII bytes
+    /// -- so the ceiling was about 1 MB of ASCII but only ~175 KB of Hebrew.
+    /// A `mail_create_draft` with 300,000 em dashes came back as "failed to run
+    /// osascript: The operation couldn't be completed. Argument list too long",
+    /// which names an implementation detail rather than the body, and no schema
+    /// documented a limit. A file has no such ceiling: the same script as a
+    /// 1.8 MB file runs in 40ms. The one thing it changes is that osascript
+    /// prefixes its error line with the file's path, which `stripScriptPath`
+    /// undoes before anything reads it.
+    ///
+    /// `call` is the whole call's budget and its memo of the automation grant.
+    /// Passing nil means "this run is the whole call", which is what the tests
+    /// do and what a helper called outside a handler gets.
     ///
     /// `automationProbe` exists for the tests. When the automation grant is
     /// taken is the property that keeps a consent-blocked run from hanging, and
@@ -92,8 +451,14 @@ enum MailService {
         retries: Int = 2,
         timeout: TimeInterval = defaultTimeout,
         scopable: Bool = true,
+        call: MailCall? = nil,
         automationProbe: (() -> AutomationStatus)? = nil
     ) -> (output: Data, error: String?) {
+        // Something earlier in this call already established that no Apple
+        // Event can get through. Spawning again cannot learn anything new; it
+        // can only spend the rest of the budget re-learning it.
+        if let refusal = call?.refusal { return (Data(), refusal) }
+
         // Ask TCC where the automation grant stands *before* running anything.
         // Asking afterwards, on the error path, is too late: while a consent
         // prompt is on screen the check itself blocks -- 12s in one measurement,
@@ -102,16 +467,48 @@ enum MailService {
         // the user. It costs about 10ms then, against a spawn that costs an
         // order of magnitude more, and it is the difference between reporting
         // "Mail was slow" and reporting the thing that is actually wrong.
-        let automation = automationProbe?() ?? PermissionsService.automationStatus(bundleID: mailBundleID)
+        //
+        // It is read once per *call*, not once per spawn: it describes this
+        // process, which does not change between two accounts of the same scan,
+        // and its 2s bound was being paid seven times over by a full-scope
+        // search.
+        let automation: AutomationStatus
+        if let automationProbe {
+            automation = automationProbe()
+        } else if let call {
+            automation = call.automation()
+        } else {
+            automation = PermissionsService.automationStatus(bundleID: mailBundleID)
+        }
+        let inDoubt = automationIsInDoubt(automation)
 
         for attempt in 0...retries {
+            if let call, call.isExhausted { return (Data(), call.skipReason(scopable: scopable)) }
+            let effective = spawnAllowance(
+                scriptCeiling: timeout,
+                callRemaining: call?.remaining,
+                automationInDoubt: inDoubt
+            )
+
             let tmpDir = FileManager.default.temporaryDirectory
             let stem = "macmcp-jxa-\(UUID().uuidString)"
+            let scriptURL = tmpDir.appendingPathComponent(stem + ".js")
             let outURL = tmpDir.appendingPathComponent(stem + ".out")
             let errURL = tmpDir.appendingPathComponent(stem + ".err")
             defer {
+                try? FileManager.default.removeItem(at: scriptURL)
                 try? FileManager.default.removeItem(at: outURL)
                 try? FileManager.default.removeItem(at: errURL)
+            }
+
+            // `escapeJSString` has already reduced the script to printable
+            // ASCII, so what encoding this is written in cannot matter -- but
+            // it is written as UTF-8 explicitly rather than left to a default,
+            // for the same reason the escaping exists.
+            do {
+                try Data(script.utf8).write(to: scriptURL, options: .atomic)
+            } catch {
+                return (Data(), "failed to write the script for osascript: \(error.localizedDescription)")
             }
 
             FileManager.default.createFile(atPath: outURL.path, contents: nil)
@@ -123,7 +520,7 @@ enum MailService {
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-l", "JavaScript", "-e", script]
+            process.arguments = ["-l", "JavaScript", scriptURL.path]
             process.standardOutput = outHandle
             process.standardError = errHandle
 
@@ -135,36 +532,36 @@ enum MailService {
                 return (Data(), "failed to run osascript: \(error.localizedDescription)")
             }
 
-            let deadline = Date().addingTimeInterval(timeout)
-            while process.isRunning && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-
-            var timedOut = false
-            if process.isRunning {
-                timedOut = true
+            let timedOut = wait(for: process, until: Date().addingTimeInterval(effective))
+            if timedOut {
                 process.terminate()
-                let killDeadline = Date().addingTimeInterval(2)
-                while process.isRunning && Date() < killDeadline {
-                    Thread.sleep(forTimeInterval: 0.05)
+                if wait(for: process, until: Date().addingTimeInterval(2)) {
+                    kill(process.processIdentifier, SIGKILL)
                 }
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
             }
             process.waitUntilExit()
             try? outHandle.close()
             try? errHandle.close()
 
             let output = (try? Data(contentsOf: outURL)) ?? Data()
-            let errOutput = (try? String(contentsOf: errURL, encoding: .utf8))?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let errOutput = stripScriptPath(
+                decodeStderr((try? Data(contentsOf: errURL)) ?? Data()),
+                scriptPath: scriptURL.path
+            )
 
             if timedOut {
-                return (Data(), jxaTimeoutMessage(
-                    timeout: timeout,
+                let message = jxaTimeoutMessage(
+                    timeout: effective,
                     automation: automation,
                     scopable: scopable,
                     stderr: errOutput
-                ))
+                )
+                // A spawn has now demonstrated what the probe predicted. Every
+                // other script in this call would demonstrate it again, one
+                // slice at a time, so the rest of the call is refused with this
+                // sentence instead of spending the budget on it.
+                if inDoubt { call?.latch(message) }
+                return (Data(), message)
             }
 
             if process.terminationStatus != 0 {
@@ -177,6 +574,19 @@ enum MailService {
                 // -- a -2700 reported as a -1712, with the sentence that said
                 // what was wrong thrown away.
                 let code = osaStatus(errOutput)?.code
+
+                // -1743 is TCC refusing the Apple Event outright, which is what
+                // a denied automation grant looks like from here: osascript
+                // exits at once rather than timing out. It used to fall through
+                // to the raw-stderr return, so `Not authorized to send Apple
+                // events to Mail. (-1743)` reached the caller verbatim while
+                // the sentence written for exactly this case sat in a branch
+                // only a timeout could reach.
+                if code == -1743 {
+                    let message = automationDeniedMessage()
+                    call?.latch(message)
+                    return (Data(), message)
+                }
 
                 // -1712 is an Apple Event timeout inside Mail itself. Retrying
                 // just spends the same wait again, so surface it instead.
@@ -311,13 +721,20 @@ enum MailService {
 
     /// Renders a Swift string as the body of a single-quoted JS string literal.
     ///
-    /// Everything outside printable ASCII becomes `\uXXXX`. The script reaches
-    /// osascript as an `-e` argument, which is decoded using the process
-    /// locale, and the MCP server is launched by a host that need not set one:
-    /// an em dash or a Hebrew transliteration passed through as raw UTF-8 comes
-    /// out mangled. Escaping keeps the whole script in the ASCII subset every
-    /// locale agrees on. U+2028/U+2029 also have to go — they terminate a JS
-    /// string literal even though they are not newlines to Swift.
+    /// Everything outside printable ASCII becomes `\uXXXX`. The reason it was
+    /// written was the `-e` argument: that is decoded using the process locale,
+    /// and the MCP server is launched by a host that need not set one, so an em
+    /// dash or a Hebrew transliteration passed through as raw UTF-8 came out
+    /// mangled. The script is a **file** now, and a script file is decoded as
+    /// UTF-8 whatever the locale says — verified with `env -i` and with
+    /// `LC_ALL=C`, both of which read raw UTF-8 correctly — so that particular
+    /// hazard is gone.
+    ///
+    /// The escaping stays, and not only out of caution: U+2028 and U+2029
+    /// terminate a JS string literal even though they are not newlines to
+    /// Swift, quotes and backslashes have to be escaped whatever the encoding,
+    /// and keeping the whole script in printable ASCII means nothing about how
+    /// osascript reads a file can change what the script says.
     private static func escapeJSString(_ s: String) -> String {
         var out = String()
         out.reserveCapacity(s.utf16.count)
@@ -1100,7 +1517,7 @@ enum MailService {
     /// `scopable` is passed straight through to the timeout message. Listing
     /// accounts has nothing to narrow when it is the whole request; when it is
     /// the first step of a scan, passing an `account` would skip it entirely.
-    private static func accountNames(scopable: Bool) -> (names: [String], error: String?) {
+    private static func accountNames(scopable: Bool, call: MailCall?) -> (names: [String], error: String?) {
         let script = """
         var mail = Application('Mail');
         var a = mail.accounts();
@@ -1108,7 +1525,7 @@ enum MailService {
         for (var i = 0; i < a.length; i++) out.push('' + a[i].name());
         JSON.stringify(out);
         """
-        let (output, error) = runJXA(script, timeout: 30, scopable: scopable)
+        let (output, error) = runJXA(script, timeout: 30, scopable: scopable, call: call)
         if let error { return ([], error) }
         guard let data = output.data(using: .utf8),
               let names = try? JSONSerialization.jsonObject(with: data) as? [String] else {
@@ -1123,10 +1540,10 @@ enum MailService {
     /// Not private: mapping "On My Mac" onto the local pass is the whole of
     /// what makes those mailboxes scopable, and it is worth pinning without a
     /// mailbox.
-    static func resolveTargets(account: String?) -> (targets: [String?], error: String?) {
+    static func resolveTargets(account: String?, call: MailCall? = nil) -> (targets: [String?], error: String?) {
         // `nil` is the local pass, so scoping to On My Mac is that pass alone.
         if let account { return ([isLocalAccount(account) ? nil : account], nil) }
-        let (names, error) = accountNames(scopable: true)
+        let (names, error) = accountNames(scopable: true, call: call)
         if let error { return ([], error) }
         return (names.map { Optional($0) } + [nil], nil)
     }
@@ -1143,13 +1560,23 @@ enum MailService {
         query: String?,
         searchRecipients: Bool,
         limit: Int,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        call: MailCall
     ) -> ScanOutcome {
         var outcome = ScanOutcome()
         outcome.filtered = query != nil
         // A `nil` target is Mail's local On-My-Mac mailboxes.
         for account in targets {
             let label = account ?? "On My Mac"
+            // The budget belongs to the call, not to this account. Running out
+            // is reported the way an account that timed out has always been
+            // reported -- named in `failed`, which makes `scan_complete` false
+            // and puts the reason in `note` -- rather than discarding the
+            // accounts that were read.
+            guard !call.isExhausted else {
+                outcome.failed.append("\(label): \(call.skipReason(scopable: true))")
+                continue
+            }
             let script = """
             var mail = Application('Mail');
             \(scanScriptJXA(
@@ -1160,7 +1587,7 @@ enum MailService {
                 limit: limit
             ))
             """
-            let (output, error) = runJXA(script, timeout: timeout, scopable: true)
+            let (output, error) = runJXA(script, timeout: timeout, scopable: true, call: call)
             if let error {
                 outcome.failed.append("\(label): \(error)")
                 continue
@@ -1683,9 +2110,11 @@ enum MailService {
     // MARK: - Tool Handlers
 
     private static func listAccounts(_ args: JSONObject?) -> MCPCallResult {
-        // Empty input schema: there is no account, no mailbox and no limit to
+        // `scopable: false`: there is no account, no mailbox and no limit to
         // pass, so "narrow the scope" would be advice the caller cannot follow.
-        let (names, error) = accountNames(scopable: false)
+        // `timeout_seconds` is not scope -- it says how long to wait, not what
+        // to wait for.
+        let (names, error) = accountNames(scopable: false, call: MailCall.forArguments(args, default: Budget.listAccounts))
         if let error { return errorResult(error) }
         return jsonResult(names)
     }
@@ -1769,7 +2198,11 @@ enum MailService {
         }
         // Naming an account is the only narrowing this tool offers, so once one
         // has been given there is nothing left to suggest.
-        let (output, error) = runJXA(script, scopable: account == nil)
+        let (output, error) = runJXA(
+            script,
+            scopable: account == nil,
+            call: MailCall.forArguments(args, default: Budget.listMailboxes)
+        )
         if let error { return errorResult(error) }
         return textResult(output)
     }
@@ -1778,8 +2211,9 @@ enum MailService {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let account = args?["account"]?.stringValue
+        let call = MailCall.forArguments(args, default: Budget.getEmails)
 
-        let (targets, targetError) = resolveTargets(account: account)
+        let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return errorResult(targetError) }
 
         let outcome = scanAllAccounts(
@@ -1788,7 +2222,8 @@ enum MailService {
             query: nil,
             searchRecipients: false,
             limit: limit,
-            timeout: defaultTimeout
+            timeout: defaultTimeout,
+            call: call
         )
 
         if let failure = scanFailure(outcome, targets: targets, mailbox: mailbox) { return failure }
@@ -1826,6 +2261,7 @@ enum MailService {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let call = MailCall.forArguments(args, default: Budget.getEmail)
         let findMessage = findMessageJXA(account: args?["account"]?.stringValue, mailbox: mailbox, messageId: messageId)
 
         let escapedId = escapeJSString(messageId)
@@ -1871,7 +2307,7 @@ enum MailService {
             });
         }
         """
-        let (output, error) = runJXA(script)
+        let (output, error) = runJXA(script, call: call)
         if let error { return errorResult(error) }
         var payload: [String: Any]
         switch scriptPayload(output) {
@@ -1884,7 +2320,8 @@ enum MailService {
             listedByMail: payload["attachments"] as? [[String: Any]] ?? [],
             account: payload["account"] as? String ?? args?["account"]?.stringValue,
             mailbox: payload["mailbox"] as? String ?? mailbox,
-            messageId: messageId
+            messageId: messageId,
+            call: call
         )
     }
 
@@ -1924,14 +2361,15 @@ enum MailService {
         listedByMail: [[String: Any]],
         account: String?,
         mailbox: String,
-        messageId: String
+        messageId: String,
+        call: MailCall
     ) -> MCPCallResult {
         var payload = message
         let (source, expectedSize, error) = fetchSource(
             account: account,
             mailbox: mailbox,
             messageId: messageId,
-            timeout: attachmentTypeFetchTimeout
+            call: call
         )
         guard error == nil else {
             payload["attachments"] = listedByMail.map(withFilenameGuess)
@@ -2197,24 +2635,30 @@ enum MailService {
         return out
     }
 
-    /// Wall-clock allowance for the source fetch `mail_get_email` checks itself
-    /// against. Shorter than a plain `mail_get_source`, because it is a check on
-    /// a read that already worked: exceeding it costs the caller a less precise
-    /// answer, not the message.
-    ///
-    /// The fetch used to happen only when Mail had listed at least one
-    /// attachment, which is exactly the case a half-downloaded message does not
-    /// present: it lists none, and the enrichment that would have caught it was
-    /// skipped for want of one. It now happens on every read.
-    ///
-    /// What it buys, beyond completeness: Mail's `MIME type` property on
-    /// `mail attachment` raises "AppleEvent handler failed" on every message
-    /// that has one, so the type used to be inferred from the filename -- a
-    /// guess presented as a fact, which disagreed with `mail_save_attachment`
-    /// for the same attachment (`text/csv` against `image/png` for a part
-    /// declared as `image/png; name="data.csv"`). `mime_type_source` says which
-    /// of the two a caller is looking at.
-    private static let attachmentTypeFetchTimeout: TimeInterval = 45
+    // `attachmentTypeFetchTimeout` used to live here: 45s for the source fetch
+    // `mail_get_email` checks itself against, on the reasoning that this is a
+    // check on a read that already worked, so exceeding it costs the caller a
+    // less precise answer rather than the message. The reasoning was sound and
+    // the number was not. It is the **same fetch** `mail_get_source` gives 180s
+    // to, running the same script -- which spends up to 10s in `delay()` and
+    // does up to 21 `source()` reads waiting for a message to finish arriving,
+    // ~33s on a 70 MB one. So the 45s expired exactly on the large or
+    // still-arriving messages the check exists for, and the fallback is Mail's
+    // unverified `body: ""` / `has_attachments: false` -- the confident wrong
+    // answer #31 was filed about. Both call sites now take `sourceFetchTimeout`,
+    // and what stops a wedged fetch from running away is the thing that should:
+    // `mail_get_email`'s own call budget, which the fetch shares with everything
+    // else the call does.
+    //
+    // What the fetch buys, beyond completeness: Mail's `MIME type` property on
+    // `mail attachment` raises "AppleEvent handler failed" on every message
+    // that has one, so the type used to be inferred from the filename -- a
+    // guess presented as a fact, which disagreed with `mail_save_attachment`
+    // for the same attachment (`text/csv` against `image/png` for a part
+    // declared as `image/png; name="data.csv"`). `mime_type_source` says which
+    // of the two a caller is looking at. It also used to happen only when Mail
+    // had listed at least one attachment, which is exactly what a
+    // half-downloaded message does not present; it happens on every read now.
 
     private static func withFilenameGuess(_ attachment: [String: Any]) -> [String: Any] {
         var out = attachment
@@ -2300,7 +2744,8 @@ JSON.stringify(out);
     private static func matchBodies(
         candidates: [[String: Any]],
         query: String,
-        deadline: Date
+        deadline: Date,
+        call: MailCall
     ) -> (matches: [[String: Any]], scanned: Int, complete: Bool) {
         // Group by mailbox so each one costs a single bulk id fetch.
         var byMailbox: [MailboxKey: [[String: Any]]] = [:]
@@ -2321,10 +2766,13 @@ JSON.stringify(out);
             let wanted = rows.compactMap { $0["id"] as? String }
             guard !wanted.isEmpty else { continue }
 
-            // Budget per mailbox, not per request: the caller's deadline covers
-            // the whole pass, and a group of two must not be given the whole of it.
-            let remaining = deadline.timeIntervalSinceNow
-            guard remaining > 0 else { complete = false; break }
+            // Budget per mailbox, not per request: the pass's own deadline
+            // covers the whole of it, and a group of two must not be given all
+            // of that. The call's budget bounds both -- a body pass that would
+            // legitimately run for minutes is still not allowed to outlive the
+            // call it belongs to.
+            let remaining = min(deadline.timeIntervalSinceNow, call.remaining)
+            guard remaining > 0, !call.isExhausted else { complete = false; break }
             let budget = min(remaining, Double(rows.count) * bodyFetchBudget + 30)
 
             let script = """
@@ -2332,7 +2780,7 @@ JSON.stringify(out);
             \(bodyFetchScriptJXA(account: key.account, mailbox: key.mailbox, ids: wanted))
             """
 
-            let (output, error) = runJXA(script, retries: 0, timeout: budget, scopable: true)
+            let (output, error) = runJXA(script, retries: 0, timeout: budget, scopable: true, call: call)
             if error != nil { complete = false; continue }
             guard let data = output.data(using: .utf8),
                   let fetched = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
@@ -2399,8 +2847,9 @@ JSON.stringify(out);
         // Each body costs ~1.2s, so this stays small by default and is clamped at
         // both ends -- a negative value would trap in `prefix` below.
         let bodyScanLimit = min(max(args?["body_scan_limit"]?.intValue ?? 25, 0), maxBodyScanLimit)
+        let call = MailCall.forArguments(args, default: Budget.search)
 
-        let (targets, targetError) = resolveTargets(account: account)
+        let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return errorResult(targetError) }
 
         let outcome = scanAllAccounts(
@@ -2409,7 +2858,8 @@ JSON.stringify(out);
             query: query,
             searchRecipients: searchRecipients,
             limit: limit,
-            timeout: defaultTimeout
+            timeout: defaultTimeout,
+            call: call
         )
 
         if let failure = scanFailure(outcome, targets: targets, mailbox: mailbox) { return failure }
@@ -2427,7 +2877,8 @@ JSON.stringify(out);
                 query: nil,
                 searchRecipients: false,
                 limit: bodyScanLimit,
-                timeout: defaultTimeout
+                timeout: defaultTimeout,
+                call: call
             )
             // The sweep re-reads the same messages the metadata pass did, so it
             // adds nothing to `messages_scanned` -- that field is documented as
@@ -2451,7 +2902,8 @@ JSON.stringify(out);
                 query: query,
                 // One deadline for the whole pass, sized to the candidates we
                 // actually have rather than to the cap the caller asked for.
-                deadline: Date().addingTimeInterval(Double(candidates.count) * bodyFetchBudget + 30)
+                deadline: Date().addingTimeInterval(Double(candidates.count) * bodyFetchBudget + 30),
+                call: call
             )
             rows.append(contentsOf: bodyMatches)
             sortNewestFirst(&rows)
@@ -3130,6 +3582,7 @@ JSON.stringify(out);
         visible: Bool,
         finalAction: String,
         disposesMessage: Bool,
+        call: MailCall,
         afterClose: String = "",
         postProcess: (([String: Any]) -> [String: Any])? = nil
     ) -> MCPCallResult {
@@ -3258,7 +3711,7 @@ JSON.stringify(out);
         JSON.stringify(result);
         """
         // Composing has no scope: the message is the message.
-        let (output, error) = runJXA(script, retries: 0, scopable: false)
+        let (output, error) = runJXA(script, retries: 0, scopable: false, call: call)
         if let error { return errorResult(error) }
         guard let data = output.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -3382,7 +3835,7 @@ JSON.stringify(out);
         composeEmail(args, visible: false, finalAction: """
         msg.send();
         result.status = 'sent';
-        """, disposesMessage: true)
+        """, disposesMessage: true, call: MailCall.forArguments(args, default: Budget.send))
     }
 
     /// After saving, the draft is looked up and its identifiers returned.
@@ -3527,6 +3980,7 @@ var savedDraft = (function() {
     }
 
     private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
+        let call = MailCall.forArguments(args, default: Budget.createDraft)
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
         let subject = args?["subject"]?.stringValue ?? ""
@@ -3559,7 +4013,7 @@ var savedDraft = (function() {
         // `disposesMessage: false`: `save` does not end Mail's interest in the
         // compose message, so an autosaved copy is reported rather than
         // deleted -- deleting one Mail is still holding brings it back.
-        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, afterClose: afterClose) { payload in
+        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, afterClose: afterClose) { payload in
             guard let body = args?["body"]?.stringValue,
                   args?["html_body"]?.stringValue == nil,
                   let draft = payload["draft"] as? [String: Any] else { return payload }
@@ -3570,7 +4024,8 @@ var savedDraft = (function() {
             let (source, _, fetchError) = fetchSource(
                 account: draft["account"] as? String,
                 mailbox: draft["mailbox"] as? String ?? "Drafts",
-                messageId: identifier
+                messageId: identifier,
+                call: call
             )
             var enriched = payload
             guard fetchError == nil else {
@@ -3951,13 +4406,14 @@ var savedDraft = (function() {
         account: String?,
         mailbox: String,
         messageId: String,
+        call: MailCall,
         timeout: TimeInterval = sourceFetchTimeout
     ) -> (data: Data, expectedSize: Int?, error: String?) {
         let script = """
         var mail = Application('Mail');
         \(sourceScriptJXA(account: account, mailbox: mailbox, messageId: messageId))
         """
-        let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true)
+        let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true, call: call)
         if let error {
             if error.contains("message not found") {
                 return (Data(), nil, "message not found with id: \(messageId)")
@@ -4056,7 +4512,8 @@ var savedDraft = (function() {
         let (data, expectedSize, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
-            messageId: messageId
+            messageId: messageId,
+            call: MailCall.forArguments(args, default: Budget.saveAttachment)
         )
         if let fetchError { return errorResult(fetchError) }
 
@@ -4213,7 +4670,8 @@ var savedDraft = (function() {
         let (data, expectedSize, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
-            messageId: messageId
+            messageId: messageId,
+            call: MailCall.forArguments(args, default: Budget.getSource)
         )
         if let fetchError { return errorResult(fetchError) }
         let fidelity = sourceFidelity(data, expectedSize: expectedSize)
@@ -4482,7 +4940,11 @@ var savedDraft = (function() {
         """
         // See `mutatingRetries`: this script moves a message, and a retry
         // re-runs the move.
-        let (output, error) = runJXA(script, retries: mutatingRetries)
+        let (output, error) = runJXA(
+            script,
+            retries: mutatingRetries,
+            call: MailCall.forArguments(args, default: Budget.move)
+        )
         if let error { return errorResult(error) }
         switch scriptPayload(output) {
         case .failure(let message): return errorResult(message)
@@ -4517,7 +4979,11 @@ var savedDraft = (function() {
         // itself, but a retried mutation is a habit rather than a judgement,
         // and the id this one binds by is no more guaranteed to still resolve
         // on the second run than the moved message's was.
-        let (output, error) = runJXA(script, retries: mutatingRetries)
+        let (output, error) = runJXA(
+            script,
+            retries: mutatingRetries,
+            call: MailCall.forArguments(args, default: Budget.markRead)
+        )
         if let error { return errorResult(error) }
         if case .failure(let message) = scriptPayload(output) { return errorResult(message) }
         return textResult("marked \(read ? "read" : "unread")")
@@ -4527,7 +4993,7 @@ var savedDraft = (function() {
 
     /// `mail_send` and `mail_create_draft` take the same message, so they take
     /// the same schema.
-    private static func composeSchema(action: String) -> JSONValue {
+    private static func composeSchema(action: String, budget: TimeInterval) -> JSONValue {
         schema(
             properties: [
                 "to": stringOrStringArrayProp("Recipient address(es). One string, an array of strings, or a comma-separated list. Display names are allowed: \"Susan Cross\" <s@example.org>"),
@@ -4538,7 +5004,8 @@ var savedDraft = (function() {
                 "bcc": stringOrStringArrayProp("BCC recipient address(es), same forms as `to`"),
                 "attachments": stringArrayProp("Absolute POSIX paths of files to attach, e.g. [\"/Users/me/Budget.pdf\"]. Attached after the body so they appear at the end of the message"),
                 "from": stringProp("Sender email address (overrides account lookup). Must be an address one of Mail's accounts sends as; an address no account owns is refused rather than substituted, because Mail's own behaviour is to send from the default account instead. The address the message actually went out as is reported back as `from`"),
-                "account": stringProp("Account name to \(action) (uses default account if omitted)")
+                "account": stringProp("Account name to \(action) (uses default account if omitted)"),
+                "timeout_seconds": timeoutProp(budget, mutating: true)
             ],
             required: ["to", "subject"]
         )
@@ -4551,7 +5018,7 @@ var savedDraft = (function() {
             MCPTool(
                 name: "mail_list_accounts",
                 description: "List all mail accounts configured in Mail.app",
-                inputSchema: emptySchema(),
+                inputSchema: schema(properties: ["timeout_seconds": timeoutProp(Budget.listAccounts)]),
                 annotations: MCPAnnotations(readOnlyHint: true)
             ),
             category: cat,
@@ -4564,7 +5031,8 @@ var savedDraft = (function() {
                 description: "List mailboxes. Groups by account when no account specified. Includes Mail's app-level mailboxes under the account name \"On My Mac\" — those belong to no account, and every mail tool accepts that name wherever an account is taken, so they can be scoped like any other. Nested folders are listed by their full path with / separators (Projects/Archive), because Mail reports leaf names for a flattened tree and one account can hold two mailboxes called Archive. Each string here is what identifies that mailbox and is accepted as mailbox, source_mailbox or target_mailbox by every other mail tool",
                 inputSchema: schema(
                     properties: [
-                        "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (lists every account if omitted)")
+                        "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (lists every account if omitted)"),
+                        "timeout_seconds": timeoutProp(Budget.listMailboxes)
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -4581,7 +5049,8 @@ var savedDraft = (function() {
                     properties: [
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (scans every account and the local boxes if omitted)"),
                         "mailbox": stringProp("Mailbox to read, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. Pass 'all' to scan every mailbox except the account's own junk/trash/drafts/outbox — those are named in excluded_mailboxes, and a nested folder that happens to be called Trash is ordinary mail and is scanned"),
-                        "limit": intProp("Maximum number of emails to return (default: 10)")
+                        "limit": intProp("Maximum number of emails to return (default: 10)"),
+                        "timeout_seconds": timeoutProp(Budget.getEmails)
                     ]
                 ),
                 annotations: MCPAnnotations(readOnlyHint: true)
@@ -4598,7 +5067,8 @@ var savedDraft = (function() {
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
                         "account": stringProp("Account name from results (optional, speeds up lookup)"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
+                        "timeout_seconds": timeoutProp(Budget.getEmail)
                     ],
                     required: ["message_id"]
                 ),
@@ -4620,7 +5090,8 @@ var savedDraft = (function() {
                         "limit": intProp("Maximum number of results, newest first (default: 10)"),
                         "search_recipients": boolProp("Also match To/CC recipient names and addresses (adds roughly 1s per 1000 messages scanned)"),
                         "search_body": boolProp("Also match body text. Mail can only supply bodies one at a time (~1.2s each), so this is a capped second pass over the newest messages in scope — it does NOT search every body. Coverage is reported in the body_search field of the result"),
-                        "body_scan_limit": intProp("How many bodies the search_body pass may read (default: 25, max: 200). Expect ~1.2s per body")
+                        "body_scan_limit": intProp("How many bodies the search_body pass may read (default: 25, max: 200). Expect ~1.2s per body"),
+                        "timeout_seconds": timeoutProp(Budget.search)
                     ],
                     required: ["query"]
                 ),
@@ -4634,7 +5105,7 @@ var savedDraft = (function() {
             MCPTool(
                 name: "mail_send",
                 description: "Send an email via Mail.app, optionally as HTML and with file attachments. The result reports rendered_chars: the length of the body Mail composed with all whitespace removed, so an 18-character body of \"just one line here\" reports 15. It exists to catch a body Mail rendered as empty, not to match the length of what was sent. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced. The result also reports from and account (the identity Mail actually sent as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that copy was found in Drafts and removed",
-                inputSchema: composeSchema(action: "send from"),
+                inputSchema: composeSchema(action: "send from", budget: Budget.send),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
@@ -4645,7 +5116,7 @@ var savedDraft = (function() {
             MCPTool(
                 name: "mail_create_draft",
                 description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts and removed — the draft you asked for is never touched by it",
-                inputSchema: composeSchema(action: "save the draft in"),
+                inputSchema: composeSchema(action: "save the draft in", budget: Budget.createDraft),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
@@ -4665,7 +5136,8 @@ var savedDraft = (function() {
                         "part_path": stringProp("Exact position of one part in the message (\"2\", \"1.2\"), as reported by mail_get_email in attachments[].part_path and inline_parts[].part_path. The one selector that reaches an inline part, and unambiguous where a name is not"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
-                        "overwrite": boolProp("Overwrite an existing file instead of saving alongside it as \"name (2).ext\" (default: false)")
+                        "overwrite": boolProp("Overwrite an existing file instead of saving alongside it as \"name (2).ext\" (default: false)"),
+                        "timeout_seconds": timeoutProp(Budget.saveAttachment)
                     ],
                     required: ["message_id", "destination"]
                 )
@@ -4684,7 +5156,8 @@ var savedDraft = (function() {
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
-                        "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000). The cut is moved back to the nearest character boundary, so bytes_returned can be up to 3 less than this")
+                        "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000). The cut is moved back to the nearest character boundary, so bytes_returned can be up to 3 less than this"),
+                        "timeout_seconds": timeoutProp(Budget.getSource)
                     ],
                     required: ["message_id"]
                 ),
@@ -4704,6 +5177,7 @@ var savedDraft = (function() {
                         "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "target_mailbox": stringProp("Destination mailbox, resolved within the message's own account. A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. If two mailboxes in the account carry the name and neither is at the root, the move is refused and both paths are named rather than one being guessed at"),
                         "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
+                        "timeout_seconds": timeoutProp(Budget.move, mutating: true),
                         "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one. That upload is a re-send of Mail's own copy, not a server-side move, so the bytes change: headers, content and RFC Message-Id survive, but the numeric message_id does not, line endings arrive as LF, and any NUL byte is lost — the same caveats mail_get_source reports as fidelity. Mail does fetch a message it holds only partially before uploading it, so nothing is truncated")
                     ],
                     required: ["message_id", "target_mailbox"]
@@ -4722,7 +5196,8 @@ var savedDraft = (function() {
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
                         "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
+                        "timeout_seconds": timeoutProp(Budget.markRead, mutating: true)
                     ],
                     required: ["message_id", "read"]
                 )
