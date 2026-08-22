@@ -42,7 +42,8 @@ enum UtilitiesService {
                         "path": stringProp("Path to the audio file to play")
                     ],
                     required: ["path"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: "Utilities",
             handler: playSound

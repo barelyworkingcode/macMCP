@@ -83,7 +83,8 @@ enum CaptureService {
                         "path": stringProp("File path to save the screenshot (defaults to ~/Desktop/screenshot-{timestamp}.png)"),
                         "type": enumProp("Capture type", values: ["fullscreen", "window", "selection"])
                     ]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: captureScreenshot
@@ -98,7 +99,8 @@ enum CaptureService {
                         "path": stringProp("File path to save the recording (defaults to ~/Desktop/recording-{timestamp}.m4a)"),
                         "duration": intProp("Recording duration in seconds (defaults to 10)")
                     ]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: captureAudio

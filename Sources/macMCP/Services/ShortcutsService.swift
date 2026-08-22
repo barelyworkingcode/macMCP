@@ -98,7 +98,8 @@ enum ShortcutsService {
                         "input": stringProp("Input text to pass to the shortcut")
                     ],
                     required: ["name"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: runShortcut

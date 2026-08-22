@@ -105,7 +105,8 @@ enum RemindersService {
                         "priority": intProp("Priority: 0 = none, 1-4 = high, 5 = medium, 6-9 = low")
                     ],
                     required: ["title"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat
         ) { args in
@@ -165,7 +166,8 @@ enum RemindersService {
                         "title": stringProp("Title of the reminder to complete")
                     ],
                     required: ["title"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat
         ) { args in

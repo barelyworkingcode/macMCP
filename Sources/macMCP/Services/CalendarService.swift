@@ -245,7 +245,8 @@ enum CalendarService {
                         "notes": stringProp("Event notes")
                     ],
                     required: ["title", "start_date", "end_date"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: createEvent

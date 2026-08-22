@@ -5871,7 +5871,8 @@ var savedDraft = (function() {
                         "timeout_seconds": timeoutProp(Budget.saveAttachment)
                     ],
                     required: ["message_id", "destination"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: saveAttachment
@@ -5892,7 +5893,17 @@ var savedDraft = (function() {
                     ],
                     required: ["message_id"]
                 ),
-                annotations: MCPAnnotations(readOnlyHint: true)
+                // false, not true: save_to writes a file, and readOnlyHint is a
+                // mode gate ("did this call mutate anything"), which is a
+                // different axis from context-scope's write_dirs ("mutate
+                // WHERE"). A write_dirs restriction (once enforced) bounds the
+                // destination directory; it says nothing about whether the
+                // operation itself counts as a write for a client that holds
+                // only `read` access. Leaving this `true` would let a
+                // read-only access profile call save_to before write_dirs
+                // enforcement exists to refuse it -- ADR-011 finding 9 names
+                // this `true` as wrong for exactly that reason.
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: getSource
@@ -5912,7 +5923,8 @@ var savedDraft = (function() {
                         "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one. That upload is a re-send of Mail's own copy, not a server-side move, so the bytes change: headers, content and RFC Message-Id survive, but the numeric message_id does not, line endings arrive as LF, and any NUL byte is lost — the same caveats mail_get_source reports as fidelity. Mail does fetch a message it holds only partially before uploading it, so nothing is truncated")
                     ],
                     required: ["message_id", "target_mailbox"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: moveEmail
@@ -5931,7 +5943,8 @@ var savedDraft = (function() {
                         "timeout_seconds": timeoutProp(Budget.markRead, mutating: true)
                     ],
                     required: ["message_id", "read"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: markRead

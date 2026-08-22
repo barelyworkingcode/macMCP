@@ -459,7 +459,8 @@ enum MessagesService {
                         "text": stringProp("Message text to send")
                     ],
                     required: ["to", "text"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: sendMessage

@@ -32,7 +32,8 @@ enum MapsService {
                 inputSchema: schema(
                     properties: ["query": stringProp("Address or place name to open in Apple Maps")],
                     required: ["query"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: openInMaps

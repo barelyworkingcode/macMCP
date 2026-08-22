@@ -54,7 +54,8 @@ enum ContactsService {
                 "email": stringProp("Email address"),
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
-            ], required: ["first_name"])
+            ], required: ["first_name"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsCreate)
 
         registry.register(MCPTool(
@@ -68,7 +69,8 @@ enum ContactsService {
                 "email": stringProp("Email address"),
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
-            ], required: ["id"])
+            ], required: ["id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsUpdate)
 
         registry.register(MCPTool(
@@ -76,7 +78,8 @@ enum ContactsService {
             description: "Delete a contact permanently.",
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
-            ], required: ["id"])
+            ], required: ["id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsDelete)
 
         registry.register(MCPTool(
@@ -91,7 +94,8 @@ enum ContactsService {
             description: "Create a contact group. Returns the new group id.",
             inputSchema: schema(properties: [
                 "name": stringProp("Group name"),
-            ], required: ["name"])
+            ], required: ["name"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsCreateGroup)
 
         registry.register(MCPTool(
@@ -100,7 +104,8 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
-            ], required: ["contact_id", "group_id"])
+            ], required: ["contact_id", "group_id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsAddToGroup)
 
         registry.register(MCPTool(
@@ -109,7 +114,8 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
-            ], required: ["contact_id", "group_id"])
+            ], required: ["contact_id", "group_id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsRemoveFromGroup)
 
         registry.register(MCPTool(
