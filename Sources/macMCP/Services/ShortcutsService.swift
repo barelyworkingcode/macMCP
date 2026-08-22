@@ -24,7 +24,7 @@ enum ShortcutsService {
 
     // MARK: - Tool Handlers
 
-    private static func listShortcuts(_ args: JSONObject?) -> MCPCallResult {
+    private static func listShortcuts(_ ctx: MCPCallContext) -> MCPCallResult {
         let (status, output) = runProcess("/usr/bin/shortcuts", ["list"])
         if status != 0 {
             return errorResult("shortcuts list failed (exit \(status)): \(output)")
@@ -36,7 +36,8 @@ enum ShortcutsService {
         return textResult(trimmed)
     }
 
-    private static func runShortcut(_ args: JSONObject?) -> MCPCallResult {
+    private static func runShortcut(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let name = args?["name"]?.stringValue, !name.isEmpty else {
             return errorResult("missing required parameter: name")
         }
@@ -98,7 +99,8 @@ enum ShortcutsService {
                         "input": stringProp("Input text to pass to the shortcut")
                     ],
                     required: ["name"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: runShortcut

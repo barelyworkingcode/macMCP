@@ -29,7 +29,8 @@ enum WebService {
 
     // MARK: - Handlers
 
-    private static func fetch(_ args: JSONObject?) -> MCPCallResult {
+    private static func fetch(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard let urlString = args?["url"]?.stringValue, !urlString.isEmpty else {
             return errorResult("url is required")
         }

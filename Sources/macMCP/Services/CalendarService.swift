@@ -86,7 +86,7 @@ enum CalendarService {
 
     // MARK: - Tool Handlers
 
-    private static func listCalendars(_ args: JSONObject?) -> MCPCallResult {
+    private static func listCalendars(_ ctx: MCPCallContext) -> MCPCallResult {
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
@@ -102,7 +102,8 @@ enum CalendarService {
         return jsonResult(results)
     }
 
-    private static func listEvents(_ args: JSONObject?) -> MCPCallResult {
+    private static func listEvents(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
@@ -149,7 +150,8 @@ enum CalendarService {
         return jsonResult(results)
     }
 
-    private static func createEvent(_ args: JSONObject?) -> MCPCallResult {
+    private static func createEvent(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else {
             return errorResult(accessDeniedMsg)
         }
@@ -245,7 +247,8 @@ enum CalendarService {
                         "notes": stringProp("Event notes")
                     ],
                     required: ["title", "start_date", "end_date"]
-                )
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
             handler: createEvent

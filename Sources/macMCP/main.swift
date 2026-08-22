@@ -65,7 +65,9 @@ while let line = readLine(strippingNewline: true) {
                 "capabilities": .object(["tools": .object([:])]),
                 "serverInfo": .object([
                     "name": .string("macmcp"),
-                    "version": .string("1.0.0")
+                    "version": .string("1.1.0"),
+                    "contextSchemaVersion": .int(2),
+                    "contextSchema": .object(mailContextSchema)
                 ])
             ])
         ))
@@ -98,7 +100,51 @@ while let line = readLine(strippingNewline: true) {
         if let args = req.params?["arguments"]?.objectValue {
             arguments = args
         }
-        let result = registry.call(name: name, arguments: arguments)
+        // MCP convention: `_meta` rides as a sibling of `name`/`arguments`
+        // inside `params`. Relay injects `_meta.project_id` and, once a
+        // caller's access profile declares one, resource-scope fields
+        // (mail_accounts, mail_mailboxes, file_dirs -- see contextSchema
+        // below and MailScope). Absent stays absent rather than becoming an
+        // empty object, because MailScope's whole contract depends on being
+        // able to tell "no _meta at all" apart from "_meta present but a
+        // scope field empty" (ADR-011 decision 4).
+        //
+        // **A `_meta` that is present and is not an object is a malformed
+        // mediated call, and it refuses.** This used to read
+        // `req.params?["_meta"]?.objectValue`, which is `nil` for `null`, for
+        // an array, for a string and for a number alike -- indistinguishable
+        // from the key being absent, which is the one thing that means
+        // *nobody mediated this call*. So `"_meta": null` took the unmediated
+        // branch and was answered with every account, every mailbox and
+        // `mail_send`: the fail-open direction, on the single test ADR-011
+        // decision 4 says is macMCP's own rather than relay's. Relay always
+        // sends an object, so nothing reachable through relay produced it --
+        // which is exactly why it had to be closed here, since a check that
+        // only holds because of what the other side happens to send is one
+        // check and not two.
+        //
+        // The refusal is `-32602` (invalid params) rather than a tool result
+        // carrying `isError`, and it is made here rather than per tool,
+        // because what is malformed is the *request*: `_meta` is the channel
+        // that says a chokepoint handled this call, and a caller that cannot
+        // spell it has said nothing trustworthy about mediation for any of
+        // macMCP's tools, not only the mail ones.
+        var meta: JSONObject? = nil
+        if let rawMeta = req.params?["_meta"] {
+            guard let object = rawMeta.objectValue else {
+                respond(JSONRPCResponse(
+                    id: req.id,
+                    error: JSONRPCError(
+                        code: -32602,
+                        message: "params._meta must be an object; a `_meta` that is present but is not one "
+                            + "cannot be read as \"nobody mediated this call\", which is what its absence means"
+                    )
+                ))
+                break
+            }
+            meta = object
+        }
+        let result = registry.call(name: name, arguments: arguments, meta: meta)
 
         let contentValues: [JSONValue] = result.content.map { c in
             .object(["type": .string(c.type), "text": .string(c.text)])
@@ -107,7 +153,61 @@ while let line = readLine(strippingNewline: true) {
         if result.isError == true {
             resultObj["isError"] = .bool(true)
         }
+        // `_meta` on the result, a sibling of `content` and `isError`, which is
+        // where MCP puts it. Today the only key is `scope_violation: true`
+        // (ADR-011 decision 7) -- omitted entirely when nothing set one, so a
+        // client or a relay that does not read it sees exactly the response it
+        // saw before this existed.
+        if let meta = result.meta, !meta.isEmpty {
+            resultObj["_meta"] = .object(meta)
+        }
         respond(JSONRPCResponse(id: req.id, result: .object(resultObj)))
+
+    // ADR-011 decision 6: a separate JSON-RPC method, not a tool. It backs a
+    // picker in relay's operator-facing Settings UI, never a tool call, so it
+    // must stay off `tools/list` (nothing above registers it with `registry`)
+    // and is dispatched here directly. Unlike `tools/call` it reads no
+    // `_meta` and applies no scope: an operator configuring a profile is
+    // allowed to see everything on the host, which is the disclosure ADR-011
+    // names as deliberate. An MCP that does not implement this method still
+    // falls through to the `default` case below and returns the ordinary
+    // -32601, which is how relay detects the absence and degrades to a
+    // free-text box (decision 6's "raw JSON editor is the fallback").
+    case "context/enumerate":
+        guard let field = req.params?["field"]?.stringValue else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "context/enumerate requires a \"field\" string parameter")
+            ))
+            break
+        }
+        guard let fragment = mailContextSchema[field]?.objectValue else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "unknown contextSchema field: \(field)")
+            ))
+            break
+        }
+        guard fragment["enumerable"]?.boolValue == true else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "contextSchema field \(field) is not enumerable")
+            ))
+            break
+        }
+        let values = req.params?["values"]?.objectValue
+        let (entries, error) = MailService.enumerateContext(field: field, values: values)
+        if let error {
+            respond(JSONRPCResponse(id: req.id, error: JSONRPCError(code: -32000, message: error)))
+            break
+        }
+        let valueValues: [JSONValue] = entries.map {
+            .object(["value": .string($0.value), "label": .string($0.label)])
+        }
+        respond(JSONRPCResponse(
+            id: req.id,
+            result: .object(["field": .string(field), "values": .array(valueValues)])
+        ))
 
     default:
         respond(JSONRPCResponse(

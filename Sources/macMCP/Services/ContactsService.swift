@@ -54,7 +54,8 @@ enum ContactsService {
                 "email": stringProp("Email address"),
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
-            ], required: ["first_name"])
+            ], required: ["first_name"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsCreate)
 
         registry.register(MCPTool(
@@ -68,7 +69,8 @@ enum ContactsService {
                 "email": stringProp("Email address"),
                 "organization": stringProp("Organization name"),
                 "job_title": stringProp("Job title"),
-            ], required: ["id"])
+            ], required: ["id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsUpdate)
 
         registry.register(MCPTool(
@@ -76,7 +78,8 @@ enum ContactsService {
             description: "Delete a contact permanently.",
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
-            ], required: ["id"])
+            ], required: ["id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsDelete)
 
         registry.register(MCPTool(
@@ -91,7 +94,8 @@ enum ContactsService {
             description: "Create a contact group. Returns the new group id.",
             inputSchema: schema(properties: [
                 "name": stringProp("Group name"),
-            ], required: ["name"])
+            ], required: ["name"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsCreateGroup)
 
         registry.register(MCPTool(
@@ -100,7 +104,8 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
-            ], required: ["contact_id", "group_id"])
+            ], required: ["contact_id", "group_id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsAddToGroup)
 
         registry.register(MCPTool(
@@ -109,7 +114,8 @@ enum ContactsService {
             inputSchema: schema(properties: [
                 "contact_id": stringProp("Contact id from contacts_list results"),
                 "group_id": stringProp("Group id from contacts_list_groups results"),
-            ], required: ["contact_id", "group_id"])
+            ], required: ["contact_id", "group_id"]),
+            annotations: MCPAnnotations(readOnlyHint: false)
         ), category: cat, handler: contactsRemoveFromGroup)
 
         registry.register(MCPTool(
@@ -199,7 +205,8 @@ enum ContactsService {
 
     // MARK: - Tool Handlers
 
-    private static func contactsList(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsList(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
 
         let request = CNContactFetchRequest(keysToFetch: fetchKeys)
@@ -219,7 +226,8 @@ enum ContactsService {
         return jsonResult(results)
     }
 
-    private static func contactsGet(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsGet(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
@@ -230,7 +238,8 @@ enum ContactsService {
         return jsonResult(contactDict(contact))
     }
 
-    private static func contactsCreate(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsCreate(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let firstName = args?["first_name"]?.stringValue else {
             return errorResult("first_name is required")
@@ -258,7 +267,8 @@ enum ContactsService {
         return jsonResult(["id": contact.identifier, "created": true])
     }
 
-    private static func contactsUpdate(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsUpdate(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
@@ -288,7 +298,8 @@ enum ContactsService {
         return jsonResult(["id": id, "updated": true])
     }
 
-    private static func contactsDelete(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsDelete(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let id = args?["id"]?.stringValue else {
             return errorResult("id is required")
@@ -307,7 +318,7 @@ enum ContactsService {
         return jsonResult(["id": id, "deleted": true])
     }
 
-    private static func contactsListGroups(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsListGroups(_ ctx: MCPCallContext) -> MCPCallResult {
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
 
         do {
@@ -319,7 +330,8 @@ enum ContactsService {
         }
     }
 
-    private static func contactsCreateGroup(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsCreateGroup(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let name = args?["name"]?.stringValue else {
             return errorResult("name is required")
@@ -338,7 +350,8 @@ enum ContactsService {
         return jsonResult(["id": group.identifier, "name": name, "created": true])
     }
 
-    private static func contactsAddToGroup(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsAddToGroup(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let contactId = args?["contact_id"]?.stringValue else {
             return errorResult("contact_id is required")
@@ -370,7 +383,8 @@ enum ContactsService {
         return jsonResult(["contact_id": contactId, "group_id": groupId, "added": true])
     }
 
-    private static func contactsRemoveFromGroup(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsRemoveFromGroup(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let contactId = args?["contact_id"]?.stringValue else {
             return errorResult("contact_id is required")
@@ -402,7 +416,8 @@ enum ContactsService {
         return jsonResult(["contact_id": contactId, "group_id": groupId, "removed": true])
     }
 
-    private static func contactsSearchByPhone(_ args: JSONObject?) -> MCPCallResult {
+    private static func contactsSearchByPhone(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
         guard hasAccess() else { return errorResult(accessDeniedMsg) }
         guard let phone = args?["phone"]?.stringValue else {
             return errorResult("phone is required")

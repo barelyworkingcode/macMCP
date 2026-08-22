@@ -96,6 +96,11 @@ enum JXA {
 ///   after, so counting columns cannot see it and only re-reading the id column
 ///   can.
 ///
+/// A mailbox may also carry `containerRaises: true`, which makes every read of
+/// its `container.name()` throw -- the shape of an ancestor that went away
+/// mid-walk, and the only way to get a mailbox whose full path cannot be
+/// determined.
+///
 /// A mailbox nests with `container`, which is the **path** of its parent:
 /// `{name: 'Sub', container: 'Archive'}` is the fixture's `Archive/Sub`. Mail
 /// reports only the leaf name for it, so an account can enumerate two mailboxes
@@ -313,6 +318,17 @@ enum MailStubJS {
             // condition for walking the chain upwards.
             Object.defineProperty(box, 'container', {
                 get: function() {
+                    // `containerRaises: true` models an ancestor renamed or
+                    // deleted while the chain was being walked: Mail answers
+                    // the `container` reference and then raises on `name()`.
+                    // `mbPathOf` gives up and returns null, which is the only
+                    // way to produce a mailbox whose PATH is unknown while its
+                    // leaf name is not -- and the leaf name is what the scope
+                    // check used to silently fall back to.
+                    if (b.containerRaises) {
+                        return {name: function() { throw new Error('Invalid index'); },
+                                exists: function() { return false; }};
+                    }
                     if (box._parent !== null) return box._parent;
                     return {name: function() { return null; }, exists: function() { return false; }};
                 }

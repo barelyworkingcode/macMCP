@@ -1,6 +1,53 @@
 import Foundation
 
-typealias ToolHandler = (JSONObject?) -> MCPCallResult
+/// What a handler receives for one `tools/call`: the ordinary arguments, plus
+/// whatever the caller put in `_meta`.
+///
+/// MCP places `_meta` as a sibling of `name`/`arguments` inside `params`. Until
+/// now macMCP read `arguments` and dropped `_meta` on the floor entirely (ADR-011
+/// finding 3) -- there was no side channel to a handler at all, `ToolHandler`
+/// being a bare `(JSONObject?) -> MCPCallResult`. Relay has been injecting
+/// `_meta.project_id` into every macMCP call since ADR-007 and macMCP has never
+/// read it.
+///
+/// This is a struct rather than a second positional `JSONObject?` on
+/// `ToolHandler` on purpose: a bare second optional at the ~47 registration
+/// call sites is easy to pass in the wrong order (or transpose with a third
+/// one later), where a named field cannot be.
+///
+/// `meta` is `nil` exactly when `_meta` was absent from the request -- which is
+/// every request today, since nothing yet injects one -- and that has to stay
+/// distinguishable from `_meta` being present but empty (see `MailScope`,
+/// which is the first thing built on top of this). Most handlers ignore `meta`
+/// entirely; `let args = ctx.arguments` at the top of a handler is the whole of
+/// what most of them needed to change.
+struct MCPCallContext {
+    let arguments: JSONObject?
+    let meta: JSONObject?
+
+    /// The name this call was dispatched under.
+    ///
+    /// A handler obviously knows which tool it is. What it cannot otherwise
+    /// know is the *string* relay and `mailContextSchema` both use to talk
+    /// about it, and that string is what a `scope: "restrict"` field's
+    /// `applies_to` globs are matched against (`restrictFieldsGoverning`). So
+    /// the presence check ADR-011 decision 4 requires can be driven by the
+    /// declaration rather than by a list re-typed at every handler -- which is
+    /// how four tools ended up checking a field they were declared to be
+    /// governed by and did not consult.
+    ///
+    /// Defaulted so every existing construction, in `main.swift` and in the
+    /// tests alike, keeps compiling; the registry always supplies it.
+    let toolName: String
+
+    init(arguments: JSONObject? = nil, meta: JSONObject? = nil, toolName: String = "") {
+        self.arguments = arguments
+        self.meta = meta
+        self.toolName = toolName
+    }
+}
+
+typealias ToolHandler = (MCPCallContext) -> MCPCallResult
 
 struct ToolRegistration {
     let tool: MCPTool
@@ -20,11 +67,14 @@ class ToolRegistry {
         registrations.values.map(\.tool).sorted { $0.name < $1.name }
     }
 
-    func call(name: String, arguments: JSONObject?) -> MCPCallResult {
+    /// `meta` defaults to `nil` so every existing caller -- `main.swift` before
+    /// this change, and every test -- keeps compiling and behaving exactly as
+    /// it did when `_meta` did not exist as a concept here.
+    func call(name: String, arguments: JSONObject?, meta: JSONObject? = nil) -> MCPCallResult {
         guard let reg = registrations[name] else {
             return errorResult("unknown tool: \(name)")
         }
-        return reg.handler(arguments)
+        return reg.handler(MCPCallContext(arguments: arguments, meta: meta, toolName: name))
     }
 }
 

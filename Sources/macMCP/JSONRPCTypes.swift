@@ -156,6 +156,38 @@ struct MCPContent: Encodable {
 struct MCPCallResult: Encodable {
     let content: [MCPContent]
     var isError: Bool?
+
+    /// The result's own `_meta`, for facts about the *call* rather than about
+    /// the thing the call was asking after.
+    ///
+    /// One key uses it today: `scope_violation: true`, set by
+    /// `scopeViolationResult` when a call was refused because it reached
+    /// outside the resource scope its `_meta` carried (ADR-011 decision 7).
+    /// Relay surfaces that as an audit field while `outcome` stays
+    /// `tool_error`, which is what the ADR asks for: the call completed and
+    /// the MCP answered no, so a boundary was probed and held -- a different
+    /// event from relay itself denying the call, and not worth a new outcome
+    /// in an enum that `--outcome`, the CLI table and the UI pill all key on.
+    ///
+    /// The wire shape is a sibling of `content` and `isError` in the
+    /// `tools/call` result, which is where MCP puts `_meta`:
+    ///
+    /// ```json
+    /// {"content": [{"type": "text", "text": "..."}],
+    ///  "isError": true,
+    ///  "_meta": {"scope_violation": true}}
+    /// ```
+    ///
+    /// Absent (not `false`) when nothing set it, so a relay that does not read
+    /// it sees exactly what it saw before, and a relay that does can tell "not
+    /// a scope violation" from "this server does not report them".
+    var meta: JSONObject?
+
+    private enum CodingKeys: String, CodingKey {
+        case content
+        case isError
+        case meta = "_meta"
+    }
 }
 
 func textResult(_ text: String) -> MCPCallResult {
@@ -164,6 +196,22 @@ func textResult(_ text: String) -> MCPCallResult {
 
 func errorResult(_ message: String) -> MCPCallResult {
     MCPCallResult(content: [MCPContent(type: "text", text: message)], isError: true)
+}
+
+/// An error that is a *resource scope* refusal: the call reached outside what
+/// the `_meta` it carried allows.
+///
+/// It is an ordinary `isError` result -- ADR-011 decision 7 is explicit that a
+/// scope violation must not become a new outcome, because relay is relaying
+/// the MCP's answer rather than making a decision of its own -- distinguished
+/// only by the `_meta` marker, so alerting has a signal that does not depend
+/// on anyone parsing the sentence.
+func scopeViolationResult(_ message: String) -> MCPCallResult {
+    MCPCallResult(
+        content: [MCPContent(type: "text", text: message)],
+        isError: true,
+        meta: ["scope_violation": .bool(true)]
+    )
 }
 
 func jsonResult(_ value: Any) -> MCPCallResult {

@@ -72,7 +72,8 @@ enum LocationService {
                 annotations: MCPAnnotations(readOnlyHint: true)
             ),
             category: cat
-        ) { args in
+        ) { ctx in
+            let args = ctx.arguments
             guard let address = args?["address"]?.stringValue, !address.isEmpty else {
                 return errorResult("address is required")
             }
@@ -94,7 +95,8 @@ enum LocationService {
                 annotations: MCPAnnotations(readOnlyHint: true)
             ),
             category: cat
-        ) { args in
+        ) { ctx in
+            let args = ctx.arguments
             guard let lat = extractDouble(args, key: "latitude"),
                   let lon = extractDouble(args, key: "longitude") else {
                 return errorResult("latitude and longitude are required")
