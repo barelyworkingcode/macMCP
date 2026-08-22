@@ -243,4 +243,50 @@ final class MailFindMessageTests: XCTestCase {
             XCTAssertEqual(row["body"], "BODY \(row["id"] ?? "")", "a body arrived under another message's id")
         }
     }
+
+    func testABodyIsNotReturnedForAMessageThatHasMovedToAnotherAccount() throws {
+        // The body pass re-binds by id, which is right, and then checked only
+        // the mailbox **name** the message reports. Every account has an INBOX,
+        // so a message that moved `Alice:INBOX` -> `Bob:INBOX` between the
+        // metadata scan and this pass passed that check and had its body
+        // returned under a row saying `"account": "Alice"` — the same class of
+        // wrong answer as a body under another message's id, one level up.
+        //
+        // `findMessageJXA` has always checked the account here (`fmInScope`);
+        // this path enforced a weaker invariant than the one beside it.
+        let stub = """
+        var mail = makeMail({accounts: [
+            {name: 'Alice', mailboxes: [
+                {name: 'INBOX', messages: [
+                    {id: 401, subject: 'first',  content: 'BODY 401'},
+                    {id: 402, subject: 'second', content: 'BODY 402'}
+                ]}
+            ]},
+            {name: 'Bob', mailboxes: [{name: 'INBOX'}]}
+        ]});
+        // 402 is refiled into Bob's INBOX after the metadata scan stamped its
+        // row `Alice:INBOX`. `byId` resolves across accounts, so it still
+        // answers, and its mailbox is still called INBOX.
+        (function() {
+            var alice = mail.accounts()[0].mailboxes()[0];
+            var bob = mail.accounts()[1].mailboxes()[0];
+            var moved = alice._msgs.splice(1, 1)[0];
+            bob._msgs.push(moved);
+            moved._box = bob;
+        })();
+        """
+        let output = try JXA.run("""
+        \(MailStubJS.source)
+        \(stub)
+        \(MailService.bodyFetchScriptJXA(account: "Alice", mailbox: "INBOX", ids: ["401", "402"]))
+        """)
+        guard let data = output.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
+            return XCTFail("not a JSON array: \(output)")
+        }
+        XCTAssertEqual(
+            rows.map { $0["id"] ?? "" }, ["401"],
+            "402 is in Bob's INBOX now; its body cannot come back under a row claiming Alice"
+        )
+    }
 }

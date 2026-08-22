@@ -199,17 +199,30 @@ final class MailMessageCheckTests: XCTestCase {
         let source = Data((["Subject: two", "MIME-Version: 1.0", "Content-Type: multipart/mixed; boundary=\"B\"", "", ""].joined(separator: "\n") + part + part + "--B--\n").utf8)
         XCTAssertEqual(MIME.attachments(of: MIME.parse(source)).count, 2, "the fixture itself")
 
-        // Mail listed one of the two, so exactly one is missing.
-        let extras = MailService.attachmentsMailDidNotList([["name": "data.csv"]], source: source)
-        XCTAssertEqual(extras.count, 1)
-        XCTAssertEqual(extras.first?["name"] as? String, "data.csv")
+        func listedFlags(_ rows: [[String: Any]]) -> [Bool] {
+            let list = MailService.attachmentList(of: MIME.parse(source))
+            return MailService
+                .reconcileWithMail(list.attachments + list.inlineParts, listedByMail: rows)
+                .entries
+                .map(\.listedByMail)
+        }
 
-        // And when Mail listed both, nothing is added.
+        // Two parts sharing a filename are two entries, always — never one part
+        // reported twice, and never two collapsed into one. Mail listed one of
+        // the pair, so exactly one entry says so; each row claims at most one
+        // part.
+        XCTAssertEqual(listedFlags([["name": "data.csv"]]), [true, false])
+
+        // And when Mail listed both, both are accounted for and nothing is left
+        // over.
+        XCTAssertEqual(listedFlags([["name": "data.csv"], ["name": "DATA.CSV"]]), [true, true])
+
+        let list = MailService.attachmentList(of: MIME.parse(source))
         XCTAssertEqual(
-            MailService.attachmentsMailDidNotList(
-                [["name": "data.csv"], ["name": "DATA.CSV"]],
-                source: source
-            ).count,
+            MailService.reconcileWithMail(
+                list.attachments,
+                listedByMail: [["name": "data.csv"], ["name": "DATA.CSV"]]
+            ).unlocated.count,
             0
         )
     }

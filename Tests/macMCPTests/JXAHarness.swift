@@ -399,7 +399,14 @@ enum MailStubJS {
                     };
                     for (var i = 0; i < m.length; i++) spec[i] = positionalSpecifier(box, i);
                     return spec;
-                }
+                },
+                // Configurable so a test can wrap this getter and change the
+                // mailbox at a chosen read without the spec keys above having to
+                // model every kind of change. A message being *refiled into
+                // another account* is one of those: it does not leave the world,
+                // so `byId` keeps resolving it, and only its own account can
+                // tell that a row's stamp has stopped being true.
+                configurable: true
             });
             // A mailbox owned by an account answers `account`; a local
             // On My Mac mailbox raises, which is how the real thing behaves and

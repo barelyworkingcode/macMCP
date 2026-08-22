@@ -166,4 +166,67 @@ final class MailSchemaDocsTests: XCTestCase {
         XCTAssertTrue(text.contains("has_attachments"), text)
         XCTAssertTrue(text.contains("listed_by_mail"), "the reconciled list: \(text)")
     }
+
+    // MARK: - The two tools share one attachment namespace (#R2-2, #R4-4)
+
+    func testBothAttachmentToolsSayTheyAreTalkingAboutTheSameList() throws {
+        // The defect a caller met first was a documented promise that was not
+        // true: `attachment_name` said "as reported by mail_get_email" while
+        // mail_save_attachment selected out of a different list, under different
+        // names, in a different order. Now that they really are one list, both
+        // descriptions have to say so — a caller who does not know they agree
+        // has no reason to copy a name from one into the other.
+        let get = try description(of: "mail_get_email")
+        let save = try description(of: "mail_save_attachment")
+        for text in [get, save] {
+            assertMentions(
+                text,
+                anyOf: ["same list", "SAME list", "exactly the list mail_get_email reports"],
+                "the two tools agreeing"
+            )
+            XCTAssertTrue(text.contains("part_path"), "the exact handle: \(text)")
+            XCTAssertTrue(text.contains("inline"), "what is deliberately not an attachment: \(text)")
+        }
+
+        // And `attachment_name` names which of the two names is the handle,
+        // since mail_get_email now reports both.
+        let name = try property("attachment_name", of: "mail_save_attachment")
+        XCTAssertTrue(name.contains("mail_name"), name)
+
+        let path = try property("part_path", of: "mail_save_attachment")
+        assertMentions(path, anyOf: ["inline"], "the one way to reach an inline part")
+    }
+
+    /// A mailbox that changes under a scan no longer costs the caller the
+    /// mailbox — its rows are re-read one message at a time instead. That is a
+    /// different answer with different fields in it, and the fields are only
+    /// legible if the schema names them: `changed_mailboxes` says where it
+    /// happened, `rows_reverified` / `rows_dropped` say what it cost, and for a
+    /// search it is also why `scan_complete` is false.
+    func testTheScanToolsSayWhatAChangedMailboxMeansForTheAnswer() throws {
+        for tool in ["mail_get_emails", "mail_search"] {
+            let text = try description(of: tool)
+            XCTAssertTrue(text.contains("changed_mailboxes"), "\(tool): \(text)")
+            XCTAssertTrue(text.contains("rows_reverified"), "\(tool): \(text)")
+            XCTAssertTrue(text.contains("rows_dropped"), "\(tool): \(text)")
+            assertMentions(
+                text,
+                anyOf: ["re-read", "reread", "read message by message"],
+                "\(tool) saying the rows were re-read rather than discarded"
+            )
+            // `skipped_mailboxes` now carries a reason per entry, which is the
+            // difference between a mailbox that is gone and one Mail was busy.
+            XCTAssertTrue(text.contains("skipped_mailboxes"), "\(tool): \(text)")
+        }
+
+        // And the body pass reports its own coverage, because it is a second
+        // scan of the same scope and can fall short where the first did not.
+        let search = try description(of: "mail_search")
+        XCTAssertTrue(search.contains("body_scan_complete"), search)
+        assertMentions(
+            search,
+            anyOf: ["body_scan_skipped_mailboxes", "body_scan_note", "second pass's own coverage"],
+            "the body pass's own coverage"
+        )
+    }
 }

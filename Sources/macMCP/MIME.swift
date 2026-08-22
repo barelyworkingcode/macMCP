@@ -25,6 +25,28 @@ enum MIME {
         var contentID: String?
         var body: [UInt8] = []
         var parts: [Part] = []
+        /// Where this part sits in the message: 1-based component numbers,
+        /// outermost first, joined with "." -- `2`, `1.2`, `1.1.3`. The root of
+        /// a `multipart/*` message carries "" because the message as a whole is
+        /// not a part; a message that is a single part carries "1".
+        ///
+        /// This is not a label. It is **Mail's own identifier for the part**:
+        /// `mail attachment.id` returns exactly this string, which is what makes
+        /// it the thing to reconcile Mail's attachment list against. Measured on
+        /// Mail 16 against four fixture messages -- `2`, `3`, `4` for three
+        /// attachments of a flat `multipart/mixed`, and `1.2` for an inline
+        /// image inside a `multipart/related` that is itself part 1 of a
+        /// `multipart/mixed`, in a message four levels deep. It is the same
+        /// numbering IMAP `BODYSTRUCTURE` uses.
+        ///
+        /// Everything else a part carries is a *description* of it and can be
+        /// rendered two ways by two readers -- which is the whole of the
+        /// attachment-namespace bug: Mail mangles a non-ASCII filename to
+        /// Latin-1 mojibake, sanitises a "/" out of one, invents "Mail
+        /// Attachment" for a part that has none, and reports `da"ta.csv` where
+        /// the header says `da\"ta.csv`. The position does not depend on any of
+        /// that.
+        var path = ""
         /// Set on a `multipart/*` part whose children were **not** read, because
         /// a limit stopped the parse there. Its `body` is still the unread
         /// bytes; `parts` is empty because nothing was read, not because there
@@ -52,6 +74,10 @@ enum MIME {
         /// flagged rather than dropped.
         let inline: Bool
         let contentID: String?
+        /// `Part.path` -- the part's position in the message, and the only
+        /// handle on it that two readers cannot render differently. See the doc
+        /// comment there.
+        let path: String
     }
 
     // MARK: - Limits
@@ -189,25 +215,30 @@ enum MIME {
     static func parseReporting(bytes: [UInt8]) -> (part: Part, report: Report) {
         var report = Report()
         var nodes: [(part: Part, children: [Int])] = []
-        var pending: [(index: Int, depth: Int)] = []
+        var pending: [(index: Int, depth: Int, path: String)] = []
 
-        func addNode(_ raw: [UInt8], depth: Int) -> Int? {
+        func addNode(_ raw: [UInt8], depth: Int, path: String) -> Int? {
             guard report.parts < maxParts else {
                 report.partLimited = true
                 return nil
             }
             report.parts += 1
             report.depth = max(report.depth, depth)
-            nodes.append((parseOne(raw, report: &report), []))
-            pending.append((nodes.count - 1, depth))
+            var part = parseOne(raw, report: &report)
+            part.path = path
+            nodes.append((part, []))
+            pending.append((nodes.count - 1, depth, path))
             return nodes.count - 1
         }
 
-        _ = addNode(bytes, depth: 1)
+        // The root is the message, not a part of it, so it has no number of its
+        // own -- its children are 1, 2, 3. A message that is a *single* part is
+        // part 1, which is fixed up below once it is known not to be multipart.
+        _ = addNode(bytes, depth: 1, path: "")
 
         var cursor = 0
         while cursor < pending.count {
-            let (index, depth) = pending[cursor]
+            let (index, depth, path) = pending[cursor]
             cursor += 1
             guard nodes[index].part.isMultipart,
                   let boundary = nodes[index].part.parameters["boundary"],
@@ -228,8 +259,9 @@ enum MIME {
             let budget = maxParts - report.parts
             let pieces = splitMultipart(nodes[index].part.body, boundary: boundary, limit: budget + 1)
             var readAll = true
-            for piece in pieces {
-                guard let child = addNode(piece, depth: depth + 1) else {
+            for (offset, piece) in pieces.enumerated() {
+                let childPath = path.isEmpty ? "\(offset + 1)" : "\(path).\(offset + 1)"
+                guard let child = addNode(piece, depth: depth + 1, path: childPath) else {
                     readAll = false
                     break
                 }
@@ -247,6 +279,10 @@ enum MIME {
         }
 
         guard !nodes.isEmpty else { return (Part(), report) }
+        // A message with no `multipart/*` at the top *is* part 1, which is what
+        // IMAP numbers it and what Mail reports for an attachment that is the
+        // whole message.
+        if !nodes[0].part.isMultipart { nodes[0].part.path = "1" }
         for i in stride(from: nodes.count - 1, through: 0, by: -1) where !nodes[i].children.isEmpty {
             nodes[i].part.parts = nodes[i].children.map { nodes[$0].part }
         }
@@ -325,7 +361,8 @@ enum MIME {
                 mimeType: mimeType,
                 data: part.decodedBody,
                 inline: disposition == "inline" || (disposition.isEmpty && part.contentID != nil),
-                contentID: part.contentID
+                contentID: part.contentID,
+                path: part.path
             ))
         }
         return out
@@ -392,13 +429,49 @@ enum MIME {
         for token in tokens.dropFirst() {
             guard let eq = token.firstIndex(of: "=") else { continue }
             let key = String(token[token.startIndex..<eq]).trimmingCharacters(in: .whitespaces).lowercased()
-            var value = String(token[token.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
-            if value.count >= 2 && value.hasPrefix("\"") && value.hasSuffix("\"") {
-                value = String(value.dropFirst().dropLast())
-            }
-            rawParams[key] = value
+            let value = String(token[token.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            rawParams[key] = unquote(value)
         }
         return (first.trimmingCharacters(in: .whitespaces), resolveParameters(rawParams))
+    }
+
+    /// Undoes an RFC 2045 quoted-string: the surrounding quotes **and** the
+    /// backslash of every quoted-pair inside them.
+    ///
+    /// Stripping the quotes alone is what shipped, and it is wrong for exactly
+    /// the character the quotes exist to carry. A part headed
+    /// `Content-Type: image/png; name="da\"ta.csv"` came out as `da\"ta.csv`
+    /// with the backslash still in it, while Mail -- which unquotes properly --
+    /// reported `da"ta.csv`. Reconciling the two lists by name then saw two
+    /// different names for one part and emitted it twice, once with the type the
+    /// message declares and once with a type guessed from the ".csv" the
+    /// backslash was not hiding: `text/csv` for a part the message calls
+    /// `image/png`, which is verbatim the wrong answer `mime_type_source`
+    /// exists to prevent.
+    ///
+    /// `splitOutsideQuotes` already tracks escapes when it decides where a
+    /// parameter ends, so the token arriving here is well-formed; only the
+    /// unescaping was missing.
+    static func unquote(_ raw: String) -> String {
+        guard raw.count >= 2, raw.hasPrefix("\""), raw.hasSuffix("\"") else { return raw }
+        var out = ""
+        var escaped = false
+        for ch in raw.dropFirst().dropLast() {
+            if escaped {
+                out.append(ch)
+                escaped = false
+                continue
+            }
+            if ch == "\\" {
+                escaped = true
+                continue
+            }
+            out.append(ch)
+        }
+        // A trailing backslash inside the quotes escaped nothing; keep it
+        // rather than swallowing a character of the sender's filename.
+        if escaped { out.append("\\") }
+        return out
     }
 
     /// Folds `name*0`, `name*1*`, `name*` back into `name`. Segments are

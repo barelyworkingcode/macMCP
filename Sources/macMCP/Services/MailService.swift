@@ -465,6 +465,34 @@ enum MailService {
         }
         return parts.length === 0 ? null : parts.join('/');
     }
+    // Where a message actually is, asked of the **message** rather than of the
+    // collection it was reached through. `messages.byId(n)` resolves across
+    // every account, so the specifier used to reach a message says nothing
+    // about where it is: an id read out of Alice's INBOX still answers after it
+    // has moved to Bob's. Anything that stamps a row with an account and a
+    // mailbox has to read them back off the message before it can stand behind
+    // that stamp.
+    //
+    // A local On My Mac mailbox raises on `.account`, which is how the two are
+    // told apart -- the same rule `fmLocate` uses.
+    function mbWhere(msg) {
+        var box = null;
+        try { box = msg.mailbox; } catch (e) { return null; }
+        var path = mbPathOf(box);
+        if (path === null) { try { path = '' + box.name(); } catch (e2) { return null; } }
+        var acct = 'On My Mac';
+        try { acct = '' + box.account.name(); } catch (e3) { acct = 'On My Mac'; }
+        return {account: acct, mailbox: path};
+    }
+    // The account is compared case-insensitively, as `fmInScope` does, because
+    // it travels through a caller's request and back. The mailbox path is
+    // compared exactly: both sides come from Mail's own `name()`, and two
+    // mailboxes in one account may differ only in case.
+    function mbSamePlace(at, acctName, path) {
+        return at !== null
+            && ('' + at.account).toLowerCase() === ('' + acctName).toLowerCase()
+            && ('' + at.mailbox) === ('' + path);
+    }
     function boundByName(collection) {
         for (var attempt = 0; attempt < MB_ATTEMPTS; attempt++) {
             // --- the window. Bulk column fetches and nothing else: no probe,
@@ -657,7 +685,11 @@ enum MailService {
         mailbox: String,
         query: String?,
         searchRecipients: Bool,
-        limit: Int
+        limit: Int,
+        /// Overridable only so a test can drive the exhausted-budget path, which
+        /// is otherwise unreachable without a mailbox that changes for twenty
+        /// seconds. A negative value expires it before the first row.
+        reverifySeconds: TimeInterval = reverifyBudget
     ) -> String {
         // `nil` here means the local boxes, not "everywhere": the caller scans one
         // account per osascript and passes nil for the local pass. Naming them
@@ -742,7 +774,8 @@ enum MailService {
         \(collect)
         \(filter)
 
-        var rows = [], scanned = [], skipped = [], unstable = [], total = 0, messagesScanned = 0;
+        var rows = [], scanned = [], skipped = [], changed = [], total = 0, messagesScanned = 0;
+        var reverified = 0, dropped = 0;
         // Gmail-style accounts file every message in both INBOX and "All Mail",
         // so ids are deduplicated across this account's mailboxes. Without it
         // `total` counts each message once per mailbox it appears in.
@@ -753,6 +786,15 @@ enum MailService {
         // one message's id with another message's subject -- and the id is the
         // handle mail_move, mail_mark_read and mail_get_email act on. So the id
         // column is read again at the end and has to come back the same.
+        //
+        // That re-read is a **trigger**, not a verdict. What it detects is that
+        // the columns cannot be trusted *as a pairing*; it says nothing about
+        // the ids, which arrived in one Apple Event and are therefore internally
+        // consistent. Discarding the mailbox on detection threw away 11,807
+        // readable rows on the fixture to avoid a mispairing that affects at
+        // most the rows after the splice -- and reported `total_messages: 0`,
+        // which is a claim that the mailbox is empty. What happens instead is
+        // below in `reverify`.
         function unchanged(before, after) {
             if (before.length !== after.length) return false;
             for (var i = 0; i < before.length; i++) {
@@ -766,6 +808,70 @@ enum MailService {
             }
             return true;
         }
+        function scriptErrorText(err) {
+            if (err == null) return 'it could not be read';
+            var m = err.message == null ? ('' + err) : ('' + err.message);
+            return m.length === 0 ? 'it could not be read' : m;
+        }
+
+        // Re-reads the rows that are actually being returned, one message at a
+        // time, and hands back the ones it can stand behind.
+        //
+        // `messages.byId(n)` re-resolves by identity, so the message that
+        // answers is the message the row claims to be about, or nothing. Asking
+        // *it* for its own subject, sender, date and read state settles the
+        // pairing outright -- there is no second column to be out of step with.
+        // Bounded by LIMIT, not by the size of the mailbox: ~11ms to bind plus
+        // the properties, against a whole mailbox discarded.
+        //
+        // `byId` resolves across every account, so a message that has left this
+        // mailbox since the id column was read still answers -- under a row
+        // stamped with the mailbox it has left. Its place is therefore read back
+        // off the message, and a row that no longer belongs where it says it
+        // does is dropped rather than relabelled: relabelling would move it
+        // outside the scope the caller asked for.
+        //
+        // The budget is wall clock rather than a row count because the cost is
+        // per row and the number of changed mailboxes is not bounded by
+        // anything. Past it, a changed mailbox goes back to being reported as
+        // unread -- which is the old behaviour, kept for the pathological case
+        // and only for it.
+        var RV_DEADLINE = Date.now() + \(Int(reverifySeconds * 1000));
+        function reverify(mb, list, acctName, path) {
+            var out = [];
+            for (var r = 0; r < list.length; r++) {
+                if (Date.now() > RV_DEADLINE) return null;
+                var row = list[r];
+                var numeric = parseInt(row.id, 10);
+                if (!isFinite(numeric)) { dropped++; continue; }
+                var m = mb.messages.byId(numeric);
+                var here = false;
+                try { here = m.exists() === true; } catch (e1) { here = false; }
+                if (!here) { dropped++; continue; }
+                var subj, sndr, when, rdst;
+                try {
+                    subj = m.subject(); sndr = m.sender();
+                    when = m.dateReceived(); rdst = m.readStatus();
+                } catch (e2) { dropped++; continue; }
+                if (!mbSamePlace(mbWhere(m), acctName, path)) { dropped++; continue; }
+                row.subject = subj == null ? '' : '' + subj;
+                row.sender = sndr == null ? '' : '' + sndr;
+                row.date_received = when ? '' + when : '';
+                row.t = when ? when.getTime() : 0;
+                row.read = rdst ? true : false;
+                // The query was applied to a column that has just been shown
+                // not to line up, so it is applied again to the message's own
+                // subject and sender. Recipients are not re-read: four more
+                // Apple Events a row, for a haystack the caller opted into.
+                if (QUERY !== null && !row.matchedOnRecipients) {
+                    if ((row.subject + ' ' + row.sender).toLowerCase().indexOf(QUERY) === -1) { dropped++; continue; }
+                }
+                reverified++;
+                out.push(row);
+            }
+            out.sort(function(x, y) { return y.t - x.t; });
+            return out;
+        }
 
         for (var e = 0; e < entries.length; e++) {
             var label = entries[e].acctName + ':' + entries[e].path;
@@ -773,39 +879,40 @@ enum MailService {
             // identified. It is reported here rather than where it was read, so
             // the caller is told about the mailboxes in scope and not about
             // every mailbox the account happens to hold.
-            if (entries[e].mbox === null) { unstable.push(label); continue; }
+            if (entries[e].mbox === null) {
+                skipped.push(label + ': the mailbox list kept changing while it was being read, so this mailbox could not be identified (transient — try again in a moment)');
+                continue;
+            }
             try {
                 var mb = entries[e].mbox;
-                var ids = null, su = null, se = null, dt = null, rd = null;
+                var su = null, se = null, dt = null, rd = null;
                 var tos = null, ccs = null, tns = null, cns = null;
-                var aligned = false;
-                // Three tries: a message arriving mid-scan is a moment, not a
-                // state, so the next read almost always lands cleanly.
-                for (var attempt = 0; attempt < 3 && !aligned; attempt++) {
-                    ids = mb.messages.id();
-                    if (ids.length === 0) { aligned = true; break; }
+                var ids = mb.messages.id();
+                if (ids.length > 0) {
                     su = mb.messages.subject();
                     se = mb.messages.sender();
                     dt = mb.messages.dateReceived();
                     rd = mb.messages.readStatus();
         \(recipientFetch)
-                    aligned = sameLength(ids, [su, se, dt, rd, tos, ccs, tns, cns])
+                    var stable = sameLength(ids, [su, se, dt, rd, tos, ccs, tns, cns])
                         && unchanged(ids, mb.messages.id());
-                }
-                // Reporting a mailbox as unread is a smaller wrong than
-                // reporting a message under another message's id.
-                if (!aligned) { unstable.push(label); continue; }
-                if (ids.length > 0) {
+
+                    // Counts, not pairings. `ids` arrived in a single Apple
+                    // Event, so how many there are and which they are is not in
+                    // doubt whatever happened afterwards.
                     messagesScanned += ids.length;
                     var local = [];
                     for (var i = 0; i < ids.length; i++) {
                         var id = '' + ids[i];
                         if (seen[id]) continue;
                         seen[id] = true;
+                        var onRecipients = false;
                         if (QUERY !== null) {
-                            var hay = (su[i] == null ? '' : '' + su[i]) + ' ' + (se[i] == null ? '' : '' + se[i]);
+                            var meta = (su[i] == null ? '' : '' + su[i]) + ' ' + (se[i] == null ? '' : '' + se[i]);
+                            var hay = meta;
         \(recipientMatch)
                             if (hay.toLowerCase().indexOf(QUERY) === -1) continue;
+                            onRecipients = meta.toLowerCase().indexOf(QUERY) === -1;
                         }
                         local.push({
                             id: id,
@@ -815,23 +922,59 @@ enum MailService {
                             sender: se[i] == null ? '' : '' + se[i],
                             date_received: dt[i] ? '' + dt[i] : '',
                             read: rd[i] ? true : false,
-                            t: dt[i] ? dt[i].getTime() : 0
+                            t: dt[i] ? dt[i].getTime() : 0,
+                            matchedOnRecipients: onRecipients
                         });
                     }
-                    total += local.length;
+                    var counted = local.length;
+                    total += counted;
                     local.sort(function(x, y) { return y.t - x.t; });
                     if (local.length > LIMIT) local = local.slice(0, LIMIT);
-                    for (var q = 0; q < local.length; q++) rows.push(local[q]);
+                    if (!stable) {
+                        local = reverify(mb, local, entries[e].acctName, entries[e].path);
+                        if (local === null) {
+                            // Out of budget. Nothing was verified, so nothing is
+                            // returned from here and the mailbox is named as
+                            // unread -- and a mailbox reported as unread must not
+                            // be counted, so both counts are taken back out.
+                            messagesScanned -= ids.length;
+                            total -= counted;
+                            skipped.push(label + ': it kept changing while it was being read and there was no time left to re-read its messages one by one (transient — try again in a moment)');
+                            continue;
+                        }
+                        changed.push(label);
+                    }
+                    for (var q = 0; q < local.length; q++) {
+                        delete local[q].matchedOnRecipients;
+                        rows.push(local[q]);
+                    }
                 }
                 scanned.push(label);
             } catch (err) {
-                skipped.push(label);
+                // Why, not just which. A mailbox that raised because it is gone
+                // and one that raised because Mail was busy are the same word
+                // otherwise, and only one of them is worth retrying.
+                skipped.push(label + ': ' + scriptErrorText(err));
             }
         }
-        for (var u = 0; u < MB_UNSTABLE.length; u++) unstable.push(MB_UNSTABLE[u]);
-        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, unstable: unstable, excluded: excluded, matched: entries.length, messages_scanned: messagesScanned});
+        for (var u = 0; u < MB_UNSTABLE.length; u++) {
+            skipped.push(MB_UNSTABLE[u] + ': it kept changing while it was being read, so no mailbox in it could be identified (transient — try again in a moment)');
+        }
+        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, changed: changed, excluded: excluded, matched: entries.length, messages_scanned: messagesScanned, reverified: reverified, dropped: dropped});
         """
     }
+
+    /// How long the per-row re-read of a changed mailbox may run, across every
+    /// mailbox in one account's scan.
+    ///
+    /// The salvage costs a few Apple Events per row and is bounded by `limit`
+    /// per mailbox, but the number of mailboxes that change under one scan is
+    /// not bounded by anything -- a `mailbox: "all"` scan of a busy account
+    /// could in principle need it for every one of them. Past this the scan
+    /// reports the remaining changed mailboxes as unread rather than running on
+    /// towards the 120s script timeout, which would cost the caller the whole
+    /// account rather than one mailbox.
+    private static let reverifyBudget: TimeInterval = 20
 
     /// Wall-clock allowance per message body. Mail needs ~1.2s to read and
     /// decode one off disk; the rest is headroom for slow disks and spawn cost.
@@ -857,11 +1000,29 @@ enum MailService {
         var total = 0
         var messagesScanned = 0
         var scanned: [String] = []
+        /// Mailboxes in scope that could not be read, each with the reason —
+        /// the same shape `failed` carries for a whole account. "Could not be
+        /// read" covers a mailbox that raised, one whose list would not hold
+        /// still, and one that changed under the read with no budget left to
+        /// re-read its rows; those are different conditions and only some are
+        /// worth retrying, so the sentence travels with the name.
         var skipped: [String] = []
-        /// Mailboxes that changed while their columns were being read, so no
-        /// row from them could be trusted to pair the right id with the right
-        /// subject. Reported rather than silently dropped.
-        var unstable: [String] = []
+        /// Mailboxes that changed while their columns were being read.
+        ///
+        /// Not a failure: the rows returned from them were each re-read by id
+        /// and are as sound as any other row — which is what `reverified` and
+        /// `dropped` count. They are named because the mailbox moved under the
+        /// scan, and for a *search* that means the count was taken from columns
+        /// that have since been shown not to line up.
+        var changed: [String] = []
+        /// Rows re-read message by message after their mailbox changed, and the
+        /// rows that were let go because the message that answered was no
+        /// longer there, no longer in that mailbox, or no longer a match.
+        var reverified = 0
+        var dropped = 0
+        /// Whether a query was applied, which is what decides whether the
+        /// counts from a changed mailbox are exact or approximate.
+        var filtered = false
         var failed: [String] = []
         /// Mailboxes `mailbox: "all"` deliberately left out: an account's own
         /// Trash, Junk, Drafts and Outbox.
@@ -880,28 +1041,58 @@ enum MailService {
         ///
         /// `total_messages` and `total_matches` count what *was* read, so when
         /// this is false they are a floor rather than a total -- and a caller
-        /// who does not know to look at `unstable_mailboxes`,
-        /// `skipped_mailboxes` and `failed_accounts` reads a short count as a
-        /// complete one. It is reported unconditionally, true or false: a flag
-        /// that only appears when something is wrong is one a caller has to
-        /// already suspect before it helps.
-        var scanComplete: Bool { unstable.isEmpty && skipped.isEmpty && failed.isEmpty }
+        /// who does not know to look at `skipped_mailboxes` and
+        /// `failed_accounts` reads a short count as a complete one. It is
+        /// reported unconditionally, true or false: a flag that only appears
+        /// when something is wrong is one a caller has to already suspect
+        /// before it helps.
+        ///
+        /// A mailbox that *changed* under an unfiltered read is not in here. It
+        /// was read, every row returned from it was then re-read by id, and the
+        /// count is of ids that arrived in a single Apple Event -- so the answer
+        /// is not short, and a flag saying it was would be false.
+        ///
+        /// Under a **query** it is, and that is the one thing the salvage cannot
+        /// recover. The match decision is made against the subject and sender
+        /// columns, which are exactly what has just been shown not to line up:
+        /// a row that really matches can be filtered out under its neighbour's
+        /// subject and never reach the re-read. Every row that does come back is
+        /// verified, so nothing returned is wrong -- but the count is a floor,
+        /// which is precisely what this flag means everywhere else.
+        var scanComplete: Bool {
+            skipped.isEmpty && failed.isEmpty && !(filtered && !changed.isEmpty)
+        }
 
-        /// What was not read, in words, for the same reason.
-        var incompleteNote: String? {
-            guard !scanComplete else { return nil }
+        /// What was not read, and what was read across a change, in words.
+        ///
+        /// Both belong in one place because both are answers to "how much of
+        /// this can I lean on", and a caller reading a count needs them
+        /// together.
+        var coverageNote: String? {
             var parts: [String] = []
-            if !unstable.isEmpty {
-                parts.append("\(unstable.joined(separator: ", ")) kept changing while being read, so no row from there could be trusted to pair the right id with the right subject (transient — try again in a moment)")
+            if !skipped.isEmpty || !failed.isEmpty {
+                var missed: [String] = []
+                if !skipped.isEmpty { missed.append(skipped.joined(separator: "; ")) }
+                if !failed.isEmpty { missed.append(failed.joined(separator: "; ")) }
+                parts.append(
+                    "Not every mailbox in scope was read, so the counts here are a floor rather than a total: "
+                    + missed.joined(separator: "; ") + "."
+                )
             }
-            if !skipped.isEmpty {
-                parts.append("\(skipped.joined(separator: ", ")) could not be read")
+            if !changed.isEmpty {
+                let one = changed.count == 1
+                var sentence = "\(changed.joined(separator: ", ")) changed while being read, so "
+                    + "the columns a scan pairs by index could no longer be trusted to line up. "
+                    + "Every row returned from \(one ? "it" : "them") was re-read message by message by its own id and "
+                    + "carries that message's own subject, sender and date: \(reverified) re-read, "
+                    + "\(dropped) let go because the message was no longer there, no longer in that mailbox, "
+                    + "or no longer a match."
+                sentence += filtered
+                    ? " The match was decided against those columns, so a message that matches can have been passed over under its neighbour's subject: the count is a floor rather than a total, which is why scan_complete is false."
+                    : " The counts above are of ids read in a single call and are unaffected."
+                parts.append(sentence)
             }
-            if !failed.isEmpty {
-                parts.append("\(failed.joined(separator: "; "))")
-            }
-            return "Not every mailbox in scope was read, so the counts here are a floor rather than a total: "
-                + parts.joined(separator: "; ") + "."
+            return parts.isEmpty ? nil : parts.joined(separator: " ")
         }
     }
 
@@ -955,6 +1146,7 @@ enum MailService {
         timeout: TimeInterval
     ) -> ScanOutcome {
         var outcome = ScanOutcome()
+        outcome.filtered = query != nil
         // A `nil` target is Mail's local On-My-Mac mailboxes.
         for account in targets {
             let label = account ?? "On My Mac"
@@ -983,7 +1175,9 @@ enum MailService {
             outcome.messagesScanned += obj["messages_scanned"] as? Int ?? 0
             outcome.scanned.append(contentsOf: obj["scanned"] as? [String] ?? [])
             outcome.skipped.append(contentsOf: obj["skipped"] as? [String] ?? [])
-            outcome.unstable.append(contentsOf: obj["unstable"] as? [String] ?? [])
+            outcome.changed.append(contentsOf: obj["changed"] as? [String] ?? [])
+            outcome.reverified += obj["reverified"] as? Int ?? 0
+            outcome.dropped += obj["dropped"] as? Int ?? 0
             outcome.excluded.append(contentsOf: obj["excluded"] as? [String] ?? [])
             if (obj["matched"] as? Int ?? 0) > 0 { outcome.matchedMailbox = true }
         }
@@ -1024,29 +1218,45 @@ enum MailService {
     /// The two error paths every scan-backed handler shares. Returns nil when
     /// the scan produced something worth reporting.
     static func scanFailure(_ outcome: ScanOutcome, targets: [String?], mailbox: String) -> MCPCallResult? {
-        if outcome.failed.count == targets.count {
+        if !targets.isEmpty && outcome.failed.count == targets.count {
             return errorResult("scan failed for every account — \(outcome.failed.joined(separator: "; "))")
         }
-        // Every mailbox in scope changed under the read, so there is nothing to
-        // report -- and reporting nothing as `total_messages: 0` beside
-        // `isError: false` is an affirmative claim that they are empty. The
-        // mailbox this fired on held thousands of messages. A caller who does
-        // not read `unstable_mailboxes` cannot tell the two apart, and the
-        // answer to "I could not read this" is not "it is empty".
-        if outcome.scanned.isEmpty && !outcome.unstable.isEmpty {
-            let one = outcome.unstable.count == 1
+        // Anything below only fires when *no* mailbox was read at all: a scan
+        // that read one mailbox of two is an answer, and `scan_complete` plus
+        // `note` are what say it is short. `scanned` non-empty also implies the
+        // requested mailbox matched somewhere, so the two conditions cannot
+        // both be live.
+        guard outcome.scanned.isEmpty else { return nil }
+
+        let named = mailbox.lowercased() != "all"
+        var unread: [String] = []
+        if !outcome.skipped.isEmpty { unread.append(outcome.skipped.joined(separator: "; ")) }
+        if !outcome.failed.isEmpty { unread.append(outcome.failed.joined(separator: "; ")) }
+
+        // Nothing went wrong; the scope really was empty. A named mailbox that
+        // matched nothing anywhere is the one definitive negative here, and it
+        // is definitive precisely because every account was read.
+        if unread.isEmpty {
+            guard named && !outcome.matchedMailbox else { return nil }
             return errorResult(
-                "\(outcome.unstable.joined(separator: ", ")) kept changing while being read — "
-                + "every attempt paired one message's id with another message's subject, so no row from "
-                + (one ? "it" : "them") + " could be returned, and "
-                + (one ? "it was" : "they were") + " the whole of the scope. "
-                + "This is transient: try again in a moment, or narrow the scope to a quieter mailbox."
+                "no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\""
             )
         }
-        if !outcome.matchedMailbox && mailbox.lowercased() != "all" {
-            return errorResult("no mailbox named \"\(mailbox)\" found — use mail_list_mailboxes to see available names, or pass mailbox \"all\"")
-        }
-        return nil
+
+        // Part of the scope went unread, so "no mailbox named X" would be a
+        // definitive negative built on an account nobody looked in -- and
+        // reporting nothing as `total_messages: 0` beside `isError: false`
+        // would be an affirmative claim that the scope is empty. Whatever the
+        // mix, every reason is named: a scan where one account timed out and
+        // one mailbox would not hold still used to mention only the second.
+        let opening = (named && !outcome.matchedMailbox)
+            ? "no mailbox named \"\(mailbox)\" was found in the part of the scope that could be read, and the rest of it could not be read"
+            : "no mailbox in scope could be read"
+        return errorResult(
+            "\(opening) — \(unread.joined(separator: "; ")). "
+            + "Nothing was read, so a count of 0 here would be a claim that there is nothing there rather than a report that nothing was looked at. "
+            + "Most of these conditions are transient: try again in a moment, or narrow the scope."
+        )
     }
 
     /// How many times a by-Message-ID lookup will re-read a mailbox that changed
@@ -1593,10 +1803,22 @@ enum MailService {
             "scan_complete": outcome.scanComplete
         ]
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
-        if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
         if !outcome.excluded.isEmpty { payload["excluded_mailboxes"] = outcome.excluded }
-        if let note = outcome.incompleteNote { payload["note"] = note }
+        addChangedMailboxes(&payload, outcome)
+        if let note = outcome.coverageNote { payload["note"] = note }
         return jsonResult(payload)
+    }
+
+    /// The one report a scan owes a caller when a mailbox moved under it.
+    ///
+    /// Shared by both scan-backed tools so the shape cannot drift between them,
+    /// and only present when it happened -- a scan of a quiet mailbox is the
+    /// normal case and says nothing.
+    private static func addChangedMailboxes(_ payload: inout [String: Any], _ outcome: ScanOutcome) {
+        guard !outcome.changed.isEmpty else { return }
+        payload["changed_mailboxes"] = outcome.changed
+        payload["rows_reverified"] = outcome.reverified
+        payload["rows_dropped"] = outcome.dropped
     }
 
     private static func getEmail(_ args: JSONObject?) -> MCPCallResult {
@@ -1750,19 +1972,39 @@ enum MailService {
         // only path on which anything was parsed -- an incomplete fetch reports
         // Mail's own list, and `omitted` already covers it.
         var attachments: [[String: Any]]
-        var missed: [[String: Any]] = []
+        var notes: [String] = []
         if fidelity.complete {
             let parsed = MIME.parseReporting(source)
             payload["structure"] = parsed.report.dict
-            attachments = declaredAttachmentTypes(listedByMail, parsed: parsed.part)
-            missed = attachmentsMailDidNotList(listedByMail, parsed: parsed.part)
+            let list = attachmentList(of: parsed.part)
+            let reconciled = reconcileWithMail(list.attachments + list.inlineParts, listedByMail: listedByMail)
+            let entries = reconciled.entries
+            attachments = entries.filter { !$0.part.inline }.map(attachmentDict)
+            let inlineParts = entries.filter { $0.part.inline }.map(attachmentDict)
+
+            let notListed = entries.filter { !$0.part.inline && !$0.listedByMail }.count
+            if notListed > 0 {
+                notes.append("\(notListed) attachment(s) here are declared by the message but are not in Mail's own list for it, which Mail can leave empty for good once a message has been read while it was still downloading. They carry listed_by_mail: false.")
+            }
+            // Kept out of `attachments_note`, which is about the attachment
+            // list: each of these describes the field beside it, and a note
+            // filed under the wrong field is one a caller reads as being about
+            // something else.
+            if !inlineParts.isEmpty {
+                payload["inline_parts"] = inlineParts
+                payload["inline_parts_note"] = "\(inlineParts.count) part(s) the message displays inside its body — a logo, a pasted image — rather than offering as files. They are deliberately not attachments and do not count towards has_attachments; mail_save_attachment writes one only when asked for it by part_path."
+            }
+            if !reconciled.unlocated.isEmpty {
+                payload["attachments_mail_lists_only"] = reconciled.unlocated
+                payload["attachments_mail_lists_only_note"] = "\(reconciled.unlocated.count) entry(ies) Mail lists for this message could not be found in its source, so there are no bytes behind them here and mail_save_attachment cannot reach them. Check structure: a parse that stopped short is the usual reason."
+            }
         } else {
             attachments = listedByMail.map(withFilenameGuess)
+            if !attachments.isEmpty {
+                notes.append("These are Mail's own entries for a message it has not finished downloading, not parts read out of the message, so the names are the ones Mail displays and mail_save_attachment cannot select on them — it refuses on an incomplete message anyway. Ask again once fidelity.complete is true.")
+            }
         }
-        attachments += missed
-        if !missed.isEmpty {
-            payload["attachments_note"] = "\(missed.count) attachment(s) here are declared by the message but are not in Mail's own list for it, which is what mail_save_attachment reads and Mail can leave empty for good once a message has been read while it was still downloading. They carry listed_by_mail: false, and size is the decoded size of the part."
-        }
+        if !notes.isEmpty { payload["attachments_note"] = notes.joined(separator: " ") }
 
         var omitted: [String] = []
         if attachments.isEmpty && !fidelity.complete {
@@ -1787,45 +2029,170 @@ enum MailService {
         return payload
     }
 
-    /// The attachments a message declares that Mail did not list, matched by
-    /// name so that a message with two parts of the same name still reports both.
+    /// **The one attachment list.** Both `mail_get_email` and
+    /// `mail_save_attachment` work from this and nothing else, which is the
+    /// whole of the fix for #R2-2.
     ///
-    /// Inline parts are left out: Mail deliberately does not list a body image
-    /// as an attachment, and turning `has_attachments` true for every HTML
-    /// message with a logo in it would be a new wrong answer in place of the old
-    /// one.
-    static func attachmentsMailDidNotList(
-        _ listedByMail: [[String: Any]],
-        source: Data
-    ) -> [[String: Any]] {
-        attachmentsMailDidNotList(listedByMail, parsed: MIME.parse(source))
+    /// They used to build their lists separately. `mail_get_email` reported
+    /// Mail's `mailAttachments()` rows with source-declared extras appended;
+    /// `mail_save_attachment` indexed `MIME.attachments(of:)` straight, in
+    /// document order, *including* inline parts and with `attachment-<n>.<ext>`
+    /// invented for the ones Mail had named something else. Different
+    /// membership, different order, different names -- while the schema said
+    /// `attachment_name` was "as reported by mail_get_email". Measured on a
+    /// probe carrying an HTML body, a CID-only inline PNG and a `report.txt`:
+    /// `mail_get_email` reported `[report.txt, Mail Attachment.png]`,
+    /// `index: 0` wrote the **inline body image** and reported success, and
+    /// `attachment_name: "Mail Attachment.png"` -- the name the caller had just
+    /// been handed -- was rejected outright.
+    ///
+    /// The list is derived from the **message source**, never from Mail's rows.
+    /// That is not a preference: Mail's list is provably non-authoritative --
+    /// a message first read while it was still downloading kept
+    /// `mailAttachments()` empty *permanently* against a source declaring one,
+    /// which `mail_save_attachment` then extracted byte-exactly. So the source
+    /// decides membership, order, names and types, and Mail's rows only annotate
+    /// (`reconcileWithMail`).
+    ///
+    /// Inline parts are split off rather than dropped. Mail deliberately does
+    /// not offer a body image as a file, and turning `has_attachments` true for
+    /// every HTML message with a logo in it would be a new wrong answer in place
+    /// of the old one -- but a caller who does want the logo has to be able to
+    /// reach it, which is what `mail_save_attachment`'s `part_path` is for.
+    /// Inline-ness is read off the message alone (an explicit
+    /// `Content-Disposition: inline`, or a `Content-ID` with no disposition at
+    /// all), never off whether Mail listed it: Mail listed the probe's CID-only
+    /// PNG as "Mail Attachment.png", so letting Mail's list decide would put the
+    /// body image straight back among the attachments.
+    static func attachmentList(of parsed: MIME.Part)
+        -> (attachments: [MIME.Attachment], inlineParts: [MIME.Attachment]) {
+        let all = MIME.attachments(of: parsed)
+        return (all.filter { !$0.inline }, all.filter(\.inline))
     }
 
-    static func attachmentsMailDidNotList(
-        _ listedByMail: [[String: Any]],
-        parsed: MIME.Part
-    ) -> [[String: Any]] {
-        func key(_ name: Any?) -> String { (name as? String ?? "").lowercased() }
-        var listed: [String: Int] = [:]
-        for attachment in listedByMail { listed[key(attachment["name"]), default: 0] += 1 }
+    /// One part of the message, plus Mail's row for the same part when Mail
+    /// listed it.
+    struct AttachmentEntry {
+        let part: MIME.Attachment
+        /// Mail's `mailAttachments()` row for this part, or nil when Mail's list
+        /// does not have it.
+        let mailRow: [String: Any]?
 
-        var out: [[String: Any]] = []
-        for part in MIME.attachments(of: parsed) where !part.inline {
-            if let count = listed[part.name.lowercased()], count > 0 {
-                listed[part.name.lowercased()] = count - 1
-                continue
+        var listedByMail: Bool { mailRow != nil }
+    }
+
+    /// Matches Mail's own attachment rows onto the parts read out of the source.
+    ///
+    /// **Identity is the MIME part path, not the filename.** `mail attachment`
+    /// carries an `id`, and that id is the part's position in the message --
+    /// `2`, `3`, `1.2` -- the same numbering IMAP `BODYSTRUCTURE` uses.
+    /// Measured on Mail 16 against fixture messages: three attachments of a flat
+    /// `multipart/mixed` came back `2`, `3`, `4`, and an inline image inside a
+    /// `multipart/related` that is part 1 of a `multipart/mixed` came back
+    /// `1.2`, in a message four levels deep.
+    ///
+    /// Filename cannot be the identity, and #R4-4 found four independent proofs
+    /// of it, each of which made one part come out as **two attachments** -- the
+    /// Mail-derived one carrying a type guessed from an extension, so a part the
+    /// message declares as `image/png` was reported as `text/csv`:
+    ///
+    /// * an escaped quote in a quoted-string filename (`da\"ta.csv` on the wire;
+    ///   Mail says `da"ta.csv`, and so does macMCP now that `MIME.unquote`
+    ///   exists, but this must not depend on that)
+    /// * a raw non-ASCII filename -- Mail hands back its own Latin-1 mojibake,
+    ///   `na\u{c3}\u{af}ve...`, verified through plain JXA, so macMCP is relaying
+    ///   it faithfully and no amount of decoding on this side will make it equal
+    ///   the source's `naïve—ünïcode.txt`
+    /// * no `filename` parameter at all -- Mail invents "Mail Attachment",
+    ///   the source has nothing to invent from
+    /// * a "/" in the filename -- Mail sanitises it, the source keeps it
+    ///
+    /// The position survives all four because it is not a rendering of anything.
+    ///
+    /// Name and size are kept as later passes only for a Mail that does not
+    /// report an id: the size pass takes a match only when exactly one unclaimed
+    /// part has that size, because a wrong `listed_by_mail` is worse than an
+    /// honest one. Every part is claimed at most once, so two parts sharing a
+    /// name still get their own rows.
+    ///
+    /// A row that matches nothing comes back in `unlocated`. It is *not* turned
+    /// into an attachment: there are no bytes behind it, so nothing could save
+    /// it, and putting it in the list would break the one property this fix
+    /// exists to establish -- that everything `mail_get_email` reports can be
+    /// passed back to `mail_save_attachment`.
+    static func reconcileWithMail(
+        _ parts: [MIME.Attachment],
+        listedByMail: [[String: Any]]
+    ) -> (entries: [AttachmentEntry], unlocated: [[String: Any]]) {
+        var claimedBy = [Int?](repeating: nil, count: parts.count)
+        var rowUsed = [Bool](repeating: false, count: listedByMail.count)
+
+        func claim(part: Int, row: Int) {
+            claimedBy[part] = row
+            rowUsed[row] = true
+        }
+
+        // Pass 1 -- the part path Mail reports as the attachment's id.
+        for (r, row) in listedByMail.enumerated() {
+            guard let id = (row["id"] as? String).map({ $0.trimmingCharacters(in: .whitespaces) }),
+                  !id.isEmpty else { continue }
+            if let p = parts.indices.first(where: { claimedBy[$0] == nil && parts[$0].path == id }) {
+                claim(part: p, row: r)
             }
-            out.append([
-                "name": part.name,
-                // Mail quotes `fileSize` for the parts it lists, which is the
-                // encoded size; this is what the part decodes to, and the note
-                // on the result says so rather than passing one off as the other.
-                "size": part.data.count,
-                "mime_type": part.mimeType,
-                "mime_type_source": "declared",
-                "listed_by_mail": false,
-                "downloaded": true
-            ])
+        }
+        // Pass 2 -- exact name, for a Mail that reported no usable id.
+        for (r, row) in listedByMail.enumerated() where !rowUsed[r] {
+            let name = (row["name"] as? String ?? "").lowercased()
+            guard !name.isEmpty else { continue }
+            if let p = parts.indices.first(where: { claimedBy[$0] == nil && parts[$0].name.lowercased() == name }) {
+                claim(part: p, row: r)
+            }
+        }
+        // Pass 3 -- decoded size, and only when it picks out one part. Mail
+        // quotes `fileSize` in decoded bytes (measured: 6 for a part whose
+        // base64 body is 8 characters), which is what `data.count` is here.
+        for (r, row) in listedByMail.enumerated() where !rowUsed[r] {
+            guard let size = row["size"] as? Int else { continue }
+            let candidates = parts.indices.filter { claimedBy[$0] == nil && parts[$0].data.count == size }
+            if candidates.count == 1 { claim(part: candidates[0], row: r) }
+        }
+
+        let entries = parts.indices.map { i in
+            AttachmentEntry(part: parts[i], mailRow: claimedBy[i].map { listedByMail[$0] })
+        }
+        let unlocated = listedByMail.indices.filter { !rowUsed[$0] }.map { listedByMail[$0] }
+        return (entries, unlocated)
+    }
+
+    /// One attachment as a result object. The same builder for both tools, so
+    /// the two cannot drift apart again.
+    ///
+    /// `name` and `mime_type` come from the **message**, which is what
+    /// `mail_save_attachment` selects on and what `mime_type_source: "declared"`
+    /// promises. `mail_name` carries what Mail.app displays for the same part
+    /// when the two differ, so a caller reading a name off the Mail window can
+    /// see which one is theirs -- it is a label, and the schema says the handle
+    /// is `name` (or `part_path`, which is exact).
+    static func attachmentDict(_ entry: AttachmentEntry) -> [String: Any] {
+        let part = entry.part
+        var out: [String: Any] = [
+            "name": part.name,
+            "part_path": part.path,
+            // The decoded size of the part, which is also the unit Mail quotes
+            // `fileSize` in.
+            "size": part.data.count,
+            "mime_type": part.mimeType,
+            "mime_type_source": "declared",
+            "listed_by_mail": entry.listedByMail,
+            "downloaded": entry.mailRow?["downloaded"] as? Bool ?? true
+        ]
+        if part.inline { out["inline"] = true }
+        if let cid = part.contentID, !cid.isEmpty { out["content_id"] = cid }
+        if let row = entry.mailRow {
+            if let id = row["id"] as? String, !id.isEmpty { out["id"] = id }
+            if let mailName = row["name"] as? String, mailName != part.name {
+                out["mail_name"] = mailName
+            }
         }
         return out
     }
@@ -1856,41 +2223,6 @@ enum MailService {
         return out
     }
 
-    /// Matches Mail's attachment list against the parts in the raw source and
-    /// takes each type from the message.
-    ///
-    /// Matching is by name, consuming each declared part once so that two
-    /// attachments sharing a filename still get their own types in order. An
-    /// attachment with no counterpart in the source keeps the filename guess and
-    /// says so, rather than borrowing the type of an unrelated part.
-    static func declaredAttachmentTypes(
-        _ attachments: [[String: Any]],
-        source: Data
-    ) -> [[String: Any]] {
-        declaredAttachmentTypes(attachments, parsed: MIME.parse(source))
-    }
-
-    static func declaredAttachmentTypes(
-        _ attachments: [[String: Any]],
-        parsed: MIME.Part
-    ) -> [[String: Any]] {
-        var declared: [String: [String]] = [:]
-        for part in MIME.attachments(of: parsed) {
-            declared[part.name.lowercased(), default: []].append(part.mimeType)
-        }
-        return attachments.map { attachment in
-            let key = (attachment["name"] as? String ?? "").lowercased()
-            guard var queue = declared[key], !queue.isEmpty else {
-                return withFilenameGuess(attachment)
-            }
-            var out = attachment
-            out["mime_type"] = queue.removeFirst()
-            out["mime_type_source"] = "declared"
-            declared[key] = queue
-            return out
-        }
-    }
-
     /// The JXA for one body-scan batch: the bodies of a known set of ids in one
     /// mailbox, minus the `var mail = Application('Mail');` line.
     ///
@@ -1905,10 +2237,16 @@ enum MailService {
     /// not the message whose body matched (#50). Nothing is read by index here,
     /// and the ids are already known, so no column is fetched at all.
     ///
-    /// `byId` resolves across every mailbox, so a message that has left this one
-    /// since the metadata scan would still answer. Its mailbox is checked,
-    /// because the row carries the mailbox it was found in and that claim has to
-    /// stay true.
+    /// `byId` resolves across every mailbox **and every account**, so a message
+    /// that has left this one since the metadata scan would still answer. Both
+    /// halves of where it is are therefore read back off the message: the row
+    /// carries an account and a mailbox, and both claims have to stay true.
+    ///
+    /// Checking the mailbox alone is not enough, and the gap is the ordinary
+    /// case rather than an exotic one: every account has an `INBOX`, so a
+    /// message that moved `Alice:INBOX` -> `Bob:INBOX` between the metadata scan
+    /// and this pass passed a name-only check and had its body returned under a
+    /// row saying `"account": "Alice"`.
     static func bodyFetchScriptJXA(account: String, mailbox: String, ids: [String]) -> String {
         let escapedAccount = escapeJSString(account)
         let escapedMailbox = escapeJSString(mailbox)
@@ -1920,7 +2258,7 @@ var mb = (function() {
     var boxes = [];
     var accts = boundByNameOrThrow(mail.accounts, 'the account list');
     for (var i = 0; i < accts.length; i++) {
-        if (accts[i].name === '\(escapedAccount)') { boxes = boundByNameOrReport(accts[i].element.mailboxes, accts[i].name); break; }
+        if (('' + accts[i].name).toLowerCase() === '\(escapedAccount)'.toLowerCase()) { boxes = boundByNameOrReport(accts[i].element.mailboxes, accts[i].name); break; }
     }
     if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = boundByNameOrReport(mail.mailboxes, 'On My Mac');
     // The mailbox comes from a row this pass is following up, and a row is
@@ -1939,7 +2277,9 @@ if (mb) {
         if (!isFinite(numeric)) continue;
         try {
             var m = mb.messages.byId(numeric);
-            if (mbPathOf(m.mailbox) !== '\(escapedMailbox)') continue;
+            // Account **and** mailbox, off the message. See the note above the
+            // function: a name-only check cannot tell Alice's INBOX from Bob's.
+            if (!mbSamePlace(mbWhere(m), '\(escapedAccount)', '\(escapedMailbox)')) continue;
             out.push({id: WANT[i], body: '' + m.content()});
         } catch (e) {}
     }
@@ -2019,6 +2359,34 @@ JSON.stringify(out);
         return (matches, scanned, complete)
     }
 
+    /// Whether the body pass covered everything it was asked to cover.
+    ///
+    /// Four things can make it short, and the last of them used to be missing.
+    /// The sweep is a **second scan of the same scope**, run for the body pass
+    /// alone, and it can fall short on its own: a mailbox it could not read
+    /// contributes no candidates *and* nothing to `sweep.total`, so
+    /// `rows.count >= total` was satisfied **by** the failure. A sweep that read
+    /// nothing at all therefore reported `body_scan_complete: true` beside
+    /// `bodies_read: 0` and `body_matches: 0` — a completeness claim resting on
+    /// the completeness test never being reached. That is the shape #57 removed
+    /// from the metadata scan, and it was never carried across to the sweep,
+    /// whose `skipped`, `failed` and `changed` the caller only ever saw for the
+    /// *other* scan.
+    ///
+    /// Not private: this is a claim about coverage, and it is worth pinning
+    /// without a mailbox.
+    static func bodyScanComplete(
+        bodiesRead: Bool,
+        candidates: Int,
+        eligible: Int,
+        sweep: ScanOutcome
+    ) -> Bool {
+        bodiesRead
+            && candidates == eligible
+            && sweep.rows.count >= sweep.total
+            && sweep.scanComplete
+    }
+
     private static func searchEmails(_ args: JSONObject?) -> MCPCallResult {
         guard let query = args?["query"]?.stringValue else {
             return errorResult("query is required")
@@ -2093,12 +2461,39 @@ JSON.stringify(out);
                 "body_matches": bodyMatches.count,
                 "body_scan_limit": bodyScanLimit,
                 // Complete only if every body was read AND nothing was dropped
-                // on the way there: not by the candidate cap, and not by the
-                // per-mailbox trim inside the sweep itself.
-                "body_scan_complete": bodiesComplete
-                    && candidates.count == eligible.count
-                    && sweep.rows.count >= sweep.total
+                // on the way there: not by the candidate cap, not by the
+                // per-mailbox trim inside the sweep itself, and -- the part
+                // that was missing -- not by a mailbox the sweep could not read.
+                //
+                // The sweep is its own scan of the same scope and can fail on
+                // its own: a mailbox that raised there, or an account that
+                // timed out there, contributes no candidates AND nothing to
+                // `sweep.total`, so `rows.count >= total` was satisfied *by*
+                // the failure and a sweep that read nothing at all reported
+                // `body_scan_complete: true` beside `bodies_read: 0`. That is
+                // the shape #57 removed from the metadata scan; the sweep never
+                // got it.
+                "body_scan_complete": bodyScanComplete(
+                    bodiesRead: bodiesComplete,
+                    candidates: candidates.count,
+                    eligible: eligible.count,
+                    sweep: sweep
+                )
             ]
+            // The sweep's own coverage, kept separate from the metadata scan's
+            // rather than merged into it: they are two reads of the same scope
+            // at two moments, and one can succeed where the other failed.
+            if !sweep.skipped.isEmpty { bodyInfo?["body_scan_skipped_mailboxes"] = sweep.skipped }
+            if !sweep.failed.isEmpty { bodyInfo?["body_scan_failed_accounts"] = sweep.failed }
+            if !sweep.changed.isEmpty {
+                bodyInfo?["body_scan_changed_mailboxes"] = sweep.changed
+                bodyInfo?["body_scan_rows_reverified"] = sweep.reverified
+                bodyInfo?["body_scan_rows_dropped"] = sweep.dropped
+            }
+            if let sweepNote = sweep.coverageNote {
+                bodyInfo?["body_scan_note"] =
+                    "This describes the second pass, over the newest messages in scope, that the bodies were read from. " + sweepNote
+            }
         }
 
         var payload: [String: Any] = [
@@ -2112,9 +2507,9 @@ JSON.stringify(out);
         ]
         if let bodyInfo { payload["body_search"] = bodyInfo }
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
-        if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
         if !outcome.excluded.isEmpty { payload["excluded_mailboxes"] = outcome.excluded }
-        if let note = outcome.incompleteNote { payload["note"] = note }
+        addChangedMailboxes(&payload, outcome)
+        if let note = outcome.coverageNote { payload["note"] = note }
         return jsonResult(payload)
     }
 
@@ -3677,8 +4072,19 @@ var savedDraft = (function() {
         }
 
         let parsed = MIME.parseReporting(data)
-        let all = MIME.attachments(of: parsed.part)
-        guard !all.isEmpty else {
+        // The same list `mail_get_email` reports, built by the same helper, in
+        // the same order and under the same names -- which is the point of
+        // `attachmentList` existing. `index` is an index into `mail_get_email`'s
+        // `attachments`, and `attachment_name` is one of its `name`s, because
+        // this *is* that list.
+        let (all, inlineParts) = attachmentList(of: parsed.part)
+        let wantedPath = args?["part_path"]?.stringValue
+
+        func describe(_ parts: [MIME.Attachment]) -> String {
+            parts.map { "\($0.path) \"\($0.name)\"" }.joined(separator: ", ")
+        }
+
+        if all.isEmpty && wantedPath == nil {
             // "No attachments" measured against a message the reader could not
             // read in full is the same class of confident wrong answer as one
             // measured against a message Mail had not finished downloading, and
@@ -3686,11 +4092,22 @@ var savedDraft = (function() {
             guard parsed.report.complete else {
                 return errorResult("no attachment could be read out of message \(messageId), which is not the same as the message having none: \(parsed.report.note ?? "the message could not be read in full")")
             }
+            guard inlineParts.isEmpty else {
+                return errorResult("message \(messageId) has no attachments. Its \(inlineParts.count) non-body part(s) are inline — the message displays them in its body rather than offering them as files, and mail_get_email lists them under inline_parts rather than attachments. Pass part_path to save one anyway: \(describe(inlineParts))")
+            }
             return errorResult("message \(messageId) has no attachments")
         }
 
         var selected = all
-        if let index = args?["index"]?.intValue {
+        if let path = wantedPath {
+            // The exact handle, and the only way to reach an inline part. It is
+            // the part's position in the message, so it cannot be ambiguous and
+            // cannot be rendered two ways.
+            guard let hit = (all + inlineParts).first(where: { $0.path == path }) else {
+                return errorResult("message \(messageId) has no part at path \"\(path)\" — it has: \(describe(all + inlineParts))")
+            }
+            selected = [hit]
+        } else if let index = args?["index"]?.intValue {
             guard index >= 0 && index < all.count else {
                 return errorResult("index \(index) out of range — message has \(all.count) attachment(s)")
             }
@@ -3700,7 +4117,15 @@ var savedDraft = (function() {
             selected = all.filter { $0.name.lowercased() == needle }
             if selected.isEmpty { selected = all.filter { $0.name.lowercased().contains(needle) } }
             guard !selected.isEmpty else {
-                return errorResult("no attachment matching \"\(wanted)\" — message has: \(all.map(\.name).joined(separator: ", "))")
+                // An inline part matching the name is worth saying so about:
+                // the caller asked for something real, it is simply not one of
+                // the message's attachments, and there is an exact way to get it.
+                if let inline = inlineParts.first(where: { $0.name.lowercased() == needle })
+                    ?? inlineParts.first(where: { $0.name.lowercased().contains(needle) }) {
+                    return errorResult("\"\(wanted)\" is an inline part of message \(messageId) (part \(inline.path)), which the message displays in its body rather than offering as a file, so it is not one of the attachments mail_get_email lists. Pass part_path: \"\(inline.path)\" to save it anyway.")
+                }
+                let alsoInline = inlineParts.isEmpty ? "" : " It also has \(inlineParts.count) inline part(s), which are not attachments and are reachable only by part_path: \(describe(inlineParts))."
+                return errorResult("no attachment matching \"\(wanted)\" — message \(messageId) has: \(describe(all)).\(alsoInline) These are the names the message itself declares, which is what mail_get_email reports as `name`; Mail.app may display a different one for the same part, and mail_get_email reports that as `mail_name` rather than as a handle.")
             }
         }
 
@@ -3732,10 +4157,27 @@ var savedDraft = (function() {
             do {
                 try attachment.data.write(to: target)
             } catch {
-                return errorResult("could not write \(target.path): \(error.localizedDescription)")
+                // The files written before this one are on disk and stay there.
+                // Returning a bare sentence discarded `saved`, so a caller was
+                // told the call failed with no way to learn what it had already
+                // created -- and then either left them or deleted the wrong
+                // thing (#R2-5). The failure is still a failure; it just names
+                // what exists.
+                var result = jsonResult([
+                    "error": "could not write \(target.path): \(error.localizedDescription)",
+                    "saved": saved,
+                    "saved_before_the_failure": saved.count,
+                    "note": saved.isEmpty
+                        ? "Nothing was written."
+                        : "\(saved.count) file(s) had already been written when this failed and are still on disk; they are listed under saved.",
+                    "message_id": messageId
+                ])
+                result.isError = true
+                return result
             }
             saved.append([
                 "name": attachment.name,
+                "part_path": attachment.path,
                 "path": target.path,
                 "bytes": attachment.data.count,
                 "mime_type": attachment.mimeType,
@@ -3746,6 +4188,10 @@ var savedDraft = (function() {
         return jsonResult([
             "saved": saved,
             "attachments_in_message": all.count,
+            // Not attachments, and not counted as any -- reported so a caller
+            // can see there is something else in the message and how to ask
+            // for it.
+            "inline_parts_in_message": inlineParts.count,
             // Of the source the attachments were cut out of. What is written to
             // disk is only as faithful as what Mail handed over, and a caller
             // saving an 8bit part has no other way to learn that.
@@ -4130,7 +4576,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (scans every account and the local boxes if omitted)"),
@@ -4147,7 +4593,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. Attachments the message declares but Mail does not list are included with listed_by_mail: false, because Mail's own list can stay empty for good for a message first read while it was still arriving, and mail_save_attachment reads the source rather than that list. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. structure reports what the MIME reader made of the source: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), and the attachment list is then short by whatever those parts contain rather than complete — a short list and a message with fewer attachments look identical without it. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
+                description: "Get full email by message ID, including the list of attachments (name, part_path, size, mime_type, mime_type_source, listed_by_mail). The attachments list is read out of the message's own source and is the SAME list mail_save_attachment selects from, in the same order: index N there is entry N here, and every name here works as attachment_name. name is the filename the message declares; when Mail.app displays a different one for the same part — it mangles a non-ASCII filename, strips a \"/\", and invents \"Mail Attachment\" for a part that has none — that appears beside it as mail_name, which is a label rather than a handle. part_path is the part's position in the message (\"2\", \"1.2\") and is the exact handle mail_save_attachment takes. mime_type is the Content-Type the message itself declares, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. inline_parts lists parts the message displays inside its body (a logo, a pasted image) — they are deliberately not attachments and do not count towards has_attachments, and mail_save_attachment writes one only when asked for it by part_path. attachments_mail_lists_only holds anything Mail claims for the message that is not in its source, which has no bytes behind it and cannot be saved. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. listed_by_mail says whether Mail's own attachment list has the part, matched to it by MIME part path rather than by filename; false is common and not a fault, because Mail's list can stay empty for good for a message first read while it was still arriving. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. structure reports what the MIME reader made of the source: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), and the attachment list is then short by whatever those parts contain rather than complete — a short list and a message with fewer attachments look identical without it. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
@@ -4165,7 +4611,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count, which was taken from the columns. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched. With search_body, body_search reports the second pass's own coverage separately (body_scan_complete, and body_scan_skipped_mailboxes / body_scan_failed_accounts / body_scan_changed_mailboxes / body_scan_note when they apply), because it is a second read of the same scope and can fall short where the first did not",
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),
@@ -4209,13 +4655,14 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Selects out of exactly the list mail_get_email reports in attachments — same membership, same order, same names — so index is an index into that list and attachment_name is one of its name values. Saves every attachment in it when none of part_path, attachment_name or index is given. Inline parts (a logo, a pasted image the message displays in its body) are never in that list and are never saved by default; mail_get_email reports them separately under inline_parts, and part_path — the part's position in the message, e.g. \"2\" or \"1.2\" — is the exact handle that reaches one, or any other single part. Each saved entry reports part_path too. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "destination": stringProp("Absolute POSIX path: a directory to save into (created if missing), or a full file path when saving a single attachment"),
-                        "attachment_name": stringProp("Name of the attachment to save, as reported by mail_get_email (exact match preferred, substring accepted)"),
-                        "index": intProp("Zero-based index of the attachment to save, as an alternative to attachment_name"),
+                        "attachment_name": stringProp("Name of the attachment to save, as reported by mail_get_email in attachments[].name — the name the message itself declares (exact match preferred, substring accepted). Not mail_name, which is what Mail.app displays for the same part and can differ from what the message says"),
+                        "index": intProp("Zero-based index into mail_get_email's attachments list, as an alternative to attachment_name. Never selects an inline part"),
+                        "part_path": stringProp("Exact position of one part in the message (\"2\", \"1.2\"), as reported by mail_get_email in attachments[].part_path and inline_parts[].part_path. The one selector that reaches an inline part, and unambiguous where a name is not"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "overwrite": boolProp("Overwrite an existing file instead of saving alongside it as \"name (2).ext\" (default: false)")

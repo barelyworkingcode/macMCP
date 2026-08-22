@@ -102,8 +102,13 @@ final class MailAttachmentNamespaceTests: XCTestCase {
     }
 
     /// The list `mail_save_attachment` selects out of.
+    ///
+    /// Repointed at the shared helper, per the note above: `attachmentList` is
+    /// the one list both tools now work from, and `mail_save_attachment` calls
+    /// exactly this. It used to read `MIME.attachments(of:)` directly, which is
+    /// what `saveAttachment` did at the time.
     private func selectable() -> [MIME.Attachment] {
-        MIME.attachments(of: MIME.parse(Self.source))
+        MailService.attachmentList(of: MIME.parse(Self.source)).attachments
     }
 
     private func names(_ attachments: [[String: Any]]) -> [String] {

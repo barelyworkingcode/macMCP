@@ -150,14 +150,13 @@ final class MailMailboxAlignmentTests: XCTestCase {
 
         let scanned = payload["scanned"] as? [String] ?? []
         let skipped = payload["skipped"] as? [String] ?? []
-        let unstable = payload["unstable"] as? [String] ?? []
         XCTAssertTrue(
             scanned.isEmpty,
             "no mailbox held still long enough to be read, so none should be reported as scanned: \(scanned)"
         )
         XCTAssertGreaterThanOrEqual(
-            skipped.count + unstable.count, 2,
-            "Bob has two mailboxes called Archive; they left the result without being reported (scanned: \(scanned), skipped: \(skipped), unstable: \(unstable))"
+            skipped.count, 2,
+            "Bob has two mailboxes called Archive; they left the result without being reported (scanned: \(scanned), skipped: \(skipped))"
         )
         XCTAssertEqual(
             (payload["rows"] as? [[String: Any]] ?? []).count, 0,
