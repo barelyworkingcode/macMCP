@@ -6837,7 +6837,7 @@ var savedDraft = (function() {
                         "message_id": stringOrIntProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
                         "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
-                        "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
+                        "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages. Confined to the file_dirs of the calling client's resource scope; a client whose scope carries no file_dirs may still read a message's source inline, but an out-of-scope save_to (including no file_dirs at all) is refused before anything is fetched -- omit save_to to read inline instead"),
                         "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000). The cut is moved back to the nearest character boundary, so bytes_returned can be up to 3 less than this"),
                         "timeout_seconds": timeoutProp(Budget.getSource)
                     ],

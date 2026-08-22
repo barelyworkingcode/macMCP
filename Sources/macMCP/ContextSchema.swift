@@ -69,26 +69,41 @@ let mailContextSchema: JSONObject = [
     // what the client may read off this machine and mail away -- and a control
     // whose name understates it is constraint 2 defeating constraint 1.
     //
-    // **`applies_to` still names only the two file tools, deliberately.**
-    // Relay reads `applies_to` as "deny these tools outright when the field
-    // has no value" (`checkScopePresence`), and denying `mail_send` outright
-    // is not the intended outcome: a client with no `file_dirs` may still
-    // send, it just may not attach a file off this host. The field governs the
-    // *parameter*, which is the same reading `mail_get_source` has always had
-    // here -- `save_to` is refused and the tool keeps working inline -- and it
-    // is a reading only macMCP can act on, since relay is domain-blind about
-    // arguments. That macMCP enforces something relay does not advertise is
-    // the fail-CLOSED direction of a mismatch; ADR-011 decision 9 forbids the
-    // other one, where relay advertises a confinement that is not real. The
-    // `attachments` schema on both compose tools says so in the tool
-    // description, which is the surface a client actually reads.
+    // **The general rule `applies_to` is read by: name a tool here only if it
+    // cannot function at all without this field. A tool that merely has a
+    // *parameter* needing the field keeps working, and the parameter itself
+    // is what refuses.**
+    //
+    // Relay reads `applies_to` as "deny this tool outright when the field has
+    // no value" (`checkScopePresence`). That is the right answer for
+    // `mail_save_attachment`: `destination` is required, so with no
+    // `file_dirs` the tool cannot do anything at all, and relay denying it
+    // outright is ADR-011 finding 1's intended outcome. It is the wrong
+    // answer for `mail_send`, `mail_create_draft` and `mail_get_source`: each
+    // has an optional parameter that needs a directory (`attachments`,
+    // `attachments`, `save_to`), and none of the three stops working without
+    // one -- a client with no `file_dirs` may still send without attaching,
+    // still draft without attaching, still read a message's source inline.
+    // Denying the whole tool to close one parameter would gut a write profile
+    // for a field that only ever bore on a fraction of its calls.
+    //
+    // So those three tools stay out of `applies_to`, and the field governs
+    // their parameter instead, at the one place each path actually opens a
+    // file (`writeDestination` for `destination` and `save_to`,
+    // `readableAttachment` for `attachments`) -- a reading only macMCP can
+    // act on, since relay is domain-blind about arguments. Enforcing a
+    // parameter relay does not know it is enforcing is the fail-CLOSED
+    // direction of a mismatch between the two; ADR-011 decision 9 forbids
+    // only the other one, where relay *advertises* a confinement that is not
+    // real. The `attachments` and `save_to` schemas say this in the tool
+    // descriptions, which is the surface a client actually reads.
     "file_dirs": .object([
         "type": .string("array"),
         "items": .object(["type": .string("string")]),
         "description": .string("Directories on this host this client may write files into and read attachments from"),
         "scope": .string("restrict"),
         "source": .string("project_path"),
-        "applies_to": .array([.string("mail_save_attachment"), .string("mail_get_source")])
+        "applies_to": .array([.string("mail_save_attachment")])
     ])
 ]
 

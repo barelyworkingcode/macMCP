@@ -165,6 +165,41 @@ final class MailScopeHardeningTests: XCTestCase {
         }
     }
 
+    // MARK: - `mail_get_source` is a parameter refusal, not a tool refusal
+
+    /// `save_to` is optional and `mail_get_source` reads inline without it, so
+    /// the field is deliberately out of `file_dirs`'s `applies_to` (relay must
+    /// not deny the whole tool over a parameter most calls do not use) -- but
+    /// a call that DOES pass `save_to` with no `file_dirs` in scope must still
+    /// be refused, at the parameter, by macMCP itself. End to end through the
+    /// registry, mirroring `testMailSendRefusesAnOutOfScopeAttachmentBeforeComposingAnything`:
+    /// the refusal has to fire before `fetchSource` runs, since there is no
+    /// Mail stub behind this call.
+    func testMailGetSourceRefusesSaveToWithNoFileDirsBeforeFetchingAnything() {
+        let registry = ToolRegistry()
+        MailService.register(registry)
+        let result = registry.call(
+            name: "mail_get_source",
+            arguments: [
+                "message_id": .int(1),
+                "save_to": .string("/tmp/zsec-exfil.eml")
+            ],
+            meta: Self.bobInboxScope
+        )
+        XCTAssertEqual(result.isError, true)
+        XCTAssertEqual(result.meta?["scope_violation"], .bool(true))
+        XCTAssertTrue(
+            (result.content.first?.text ?? "").contains("may not write files"),
+            result.content.first?.text ?? ""
+        )
+    }
+
+    /// The tool-level half of the same claim, at the unit that actually makes
+    /// it (`presenceRefusal`), which is what `testFileDirsDoesNotTakeAToolAwayTheWayAnOperatorFieldDoes`
+    /// already pins directly without going through `fetchSource` -- a call
+    /// with `save_to` omitted reaches Mail for real through the registry, so
+    /// it is not repeated here.
+
     // MARK: - A3 / A5: the declaration is what says which tools a field governs
 
     /// `mail_list_mailboxes` called `scopeRefusal(..., mailboxKeys: [])`, so a
@@ -221,7 +256,12 @@ final class MailScopeHardeningTests: XCTestCase {
 
     /// The declaration and the enforcement have to be the same list, or the
     /// derivation is decorative. `mail_*` is the glob both operator fields
-    /// declare.
+    /// declare. `file_dirs` names only `mail_save_attachment` -- `destination`
+    /// is required, so that tool cannot function without it -- and deliberately
+    /// leaves `mail_get_source` out: `save_to` is optional, the tool reads
+    /// inline without it, and denying the whole tool would be relay's
+    /// tool-level `checkScopePresence` gutting a call that has nothing to do
+    /// with a file. Both are still governed by the two operator fields.
     func testTheGovernedListComesFromTheDeclaredAppliesTo() {
         XCTAssertEqual(
             restrictFieldsGoverning(tool: "mail_search"),
@@ -229,6 +269,10 @@ final class MailScopeHardeningTests: XCTestCase {
         )
         XCTAssertEqual(
             restrictFieldsGoverning(tool: "mail_get_source"),
+            ["mail_accounts", "mail_mailboxes"]
+        )
+        XCTAssertEqual(
+            restrictFieldsGoverning(tool: "mail_save_attachment"),
             ["file_dirs", "mail_accounts", "mail_mailboxes"]
         )
         XCTAssertEqual(restrictFieldsGoverning(tool: "contacts_list"), [])

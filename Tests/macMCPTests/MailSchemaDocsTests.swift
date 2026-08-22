@@ -231,6 +231,25 @@ final class MailSchemaDocsTests: XCTestCase {
         XCTAssertTrue(text.contains("listed_by_mail"), "the reconciled list: \(text)")
     }
 
+    // MARK: - file_dirs governs a parameter on three tools, a whole tool on one
+
+    /// `mail_get_source` is deliberately out of `file_dirs`'s `applies_to`
+    /// (it reads inline with nowhere to write), so a client with no
+    /// directory scope still sees this tool -- and its schema is the only
+    /// place that client learns `save_to` will be refused before it tries.
+    /// `attachments` on the compose tools documents the same confinement for
+    /// the same reason.
+    func testSaveToDocumentsTheFileDirsConfinementLikeAttachmentsDoes() throws {
+        let saveTo = try property("save_to", of: "mail_get_source")
+        XCTAssertTrue(saveTo.contains("file_dirs"), saveTo)
+        assertMentions(saveTo, anyOf: ["inline"], "the tool still works without it: \(saveTo)")
+
+        for tool in ["mail_send", "mail_create_draft"] {
+            let attachments = try property("attachments", of: tool)
+            XCTAssertTrue(attachments.contains("file_dirs"), "\(tool): \(attachments)")
+        }
+    }
+
     // MARK: - The two tools share one attachment namespace (#R2-2, #R4-4)
 
     func testBothAttachmentToolsSayTheyAreTalkingAboutTheSameList() throws {
