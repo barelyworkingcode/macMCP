@@ -25,6 +25,12 @@ enum MIME {
         var contentID: String?
         var body: [UInt8] = []
         var parts: [Part] = []
+        /// Set on a `multipart/*` part whose children were **not** read, because
+        /// a limit stopped the parse there. Its `body` is still the unread
+        /// bytes; `parts` is empty because nothing was read, not because there
+        /// is nothing in it. `MIME.Report` carries the same fact for the message
+        /// as a whole, which is what reaches a caller.
+        var unparsed = false
 
         var isMultipart: Bool { contentType.hasPrefix("multipart/") }
 
@@ -48,6 +54,112 @@ enum MIME {
         let contentID: String?
     }
 
+    // MARK: - Limits
+
+    /// How deep a `multipart/*` tree is descended before the reader stops and
+    /// says so.
+    ///
+    /// Real messages need a handful of levels. `multipart/mixed` over
+    /// `multipart/alternative` over `text/plain` -- the ordinary message with an
+    /// attachment -- is 3, and the deepest shape in normal circulation,
+    /// `multipart/signed` over `multipart/mixed` over `multipart/related` over
+    /// `multipart/alternative` over `text/html`, is 5. Forwarded chains add
+    /// none: this reader descends into `multipart/*` only and never opens a
+    /// `message/rfc822` part, so a mail forwarded twenty times is still 5. The
+    /// deepest thing in the testMail fixture's Maildir is 3. 32 is therefore
+    /// about six times the deepest shape a human can produce.
+    ///
+    /// The cap is **not** a stack guard. `parseReporting` is iterative and its
+    /// stack usage does not vary with depth, which is the point: a depth counter
+    /// threaded through recursion leaves the crash one forgotten call site away.
+    /// What the cap bounds is *work* -- every level holds its own copy of the
+    /// bytes beneath it, so an uncapped descent is O(depth x size) in memory
+    /// even with no stack left to exhaust.
+    ///
+    /// It replaces unbounded recursion, which was reachable from
+    /// `mail_get_email` and `mail_save_attachment` and is sender-controlled: a
+    /// 929 KB message nested ~13,000 deep exhausted the 8 MB main-thread stack
+    /// and killed macmcp with SIGSEGV -- no response, no error, and all 46 tools
+    /// gone with it, the process being one synchronous stdin loop. Measured:
+    /// depth 12,000 parsed, depth 13,000 exited 139.
+    static let maxDepth = 32
+
+    /// How many parts one message may yield, across the whole tree.
+    ///
+    /// A digest or a bulk forward runs to dozens of parts; hundreds is already
+    /// unusual. The ceiling is here because part count is sender-controlled too,
+    /// and costs more than depth: the cheapest a part can be is a delimiter line
+    /// and one byte, eight bytes in all, so a 70 MB body is nearly nine million
+    /// of them -- each a `Part` with its own dictionaries, and each one
+    /// `attachments(of:)` would hand to a caller as a JSON object.
+    static let maxParts = 10_000
+
+    /// How much of one part's header block is read.
+    ///
+    /// RFC 5322 puts no ceiling on a header block, and a message with **no**
+    /// blank line in it -- which is what a truncated fetch looks like, and is
+    /// deliberately treated as all headers -- makes the whole message one.
+    /// Decoding 70 MB of "headers" into strings costs several times that for a
+    /// result no consumer can use: everything this reader wants from a header
+    /// block (`Content-Type`, `Content-Disposition`,
+    /// `Content-Transfer-Encoding`, `Content-ID`) is in its first few hundred
+    /// bytes. 256 KB is some 2,000 times an ordinary header block.
+    static let maxHeaderBytes = 256 * 1024
+
+    /// What a parse read, and what it stopped short of.
+    ///
+    /// A limit that is not reported is a lie. A message whose attachments sit
+    /// below `maxDepth` comes back with a *shorter* attachment list, and a
+    /// shorter list is indistinguishable from a message that simply has fewer
+    /// attachments -- the same confident wrong answer `SourceFidelity` and
+    /// `scan_complete` exist to prevent next door. So this is reported whether
+    /// or not anything went wrong, and `parsed_complete` is a fact that can go
+    /// either way rather than a field that only appears on failure.
+    struct Report {
+        /// Parts read, including the root.
+        var parts = 0
+        /// Deepest level reached. The root is 1.
+        var depth = 0
+        /// `multipart/*` parts whose children were not read.
+        var unparsedMultiparts = 0
+        var depthLimited = false
+        var partLimited = false
+        var headerLimited = false
+
+        /// Whether every part of the message was read.
+        var complete: Bool { !depthLimited && !partLimited && !headerLimited }
+
+        var note: String? {
+            guard !complete else { return nil }
+            var sentences: [String] = []
+            if depthLimited {
+                sentences.append("This message nests multipart parts more than \(MIME.maxDepth) levels deep, so \(unparsedMultiparts) part(s) were left unread rather than descended into, and anything inside them — an attachment, a body — is not in this result. Real messages nest a handful of levels; a message shaped like this one is malformed or hostile.")
+            }
+            if partLimited {
+                sentences.append("This message declares more than \(MIME.maxParts) parts and reading stopped there, so parts beyond that are not in this result.")
+            }
+            if headerLimited {
+                sentences.append("At least one part carries more than \(MIME.maxHeaderBytes) bytes of headers and only the first \(MIME.maxHeaderBytes) were read, so a header declared past that point was not seen.")
+            }
+            return sentences.joined(separator: " ")
+        }
+
+        var dict: [String: Any] {
+            var out: [String: Any] = [
+                "parsed_complete": complete,
+                "parts": parts,
+                "depth": depth
+            ]
+            if !complete {
+                out["unparsed_parts"] = unparsedMultiparts
+                out["max_depth"] = MIME.maxDepth
+                out["max_parts"] = MIME.maxParts
+            }
+            if let note { out["note"] = note }
+            return out
+        }
+    }
+
     // MARK: - Parsing
 
     static func parse(_ data: Data) -> Part {
@@ -55,9 +167,108 @@ enum MIME {
     }
 
     static func parse(bytes: [UInt8]) -> Part {
+        parseReporting(bytes: bytes).part
+    }
+
+    static func parseReporting(_ data: Data) -> (part: Part, report: Report) {
+        parseReporting(bytes: [UInt8](data))
+    }
+
+    /// Parses a whole message, and says what it could not read.
+    ///
+    /// Iterative, over an explicit work list, rather than recursive. That is not
+    /// a style preference: the recursion this replaces had no depth bound at
+    /// all, and bounding it with a counter threaded through the call would have
+    /// left every later multipart walk to remember the same thing. Here there is
+    /// one descent and one place the limits are applied.
+    ///
+    /// Parts are built into a flat arena and the tree is assembled bottom-up at
+    /// the end. That is sound because a child is always appended after its
+    /// parent and so always has a higher index, which a breadth-first work list
+    /// guarantees and a depth-first one would not.
+    static func parseReporting(bytes: [UInt8]) -> (part: Part, report: Report) {
+        var report = Report()
+        var nodes: [(part: Part, children: [Int])] = []
+        var pending: [(index: Int, depth: Int)] = []
+
+        func addNode(_ raw: [UInt8], depth: Int) -> Int? {
+            guard report.parts < maxParts else {
+                report.partLimited = true
+                return nil
+            }
+            report.parts += 1
+            report.depth = max(report.depth, depth)
+            nodes.append((parseOne(raw, report: &report), []))
+            pending.append((nodes.count - 1, depth))
+            return nodes.count - 1
+        }
+
+        _ = addNode(bytes, depth: 1)
+
+        var cursor = 0
+        while cursor < pending.count {
+            let (index, depth) = pending[cursor]
+            cursor += 1
+            guard nodes[index].part.isMultipart,
+                  let boundary = nodes[index].part.parameters["boundary"],
+                  !boundary.isEmpty else { continue }
+
+            if depth >= maxDepth {
+                report.depthLimited = true
+                report.unparsedMultiparts += 1
+                // Kept, not dropped: the part is still in the tree with its own
+                // bytes, it is only not descended into. Nothing here invents a
+                // structure it could not read.
+                nodes[index].part.unparsed = true
+                continue
+            }
+
+            // One more than the remaining budget, so a message that runs past
+            // the ceiling is seen to run past it rather than landing on it.
+            let budget = maxParts - report.parts
+            let pieces = splitMultipart(nodes[index].part.body, boundary: boundary, limit: budget + 1)
+            var readAll = true
+            for piece in pieces {
+                guard let child = addNode(piece, depth: depth + 1) else {
+                    readAll = false
+                    break
+                }
+                nodes[index].children.append(child)
+            }
+            if readAll {
+                // A multipart part's own bytes *are* the parts below it, which
+                // are now held separately. Keeping both is what makes a parse
+                // cost O(depth x size) in memory rather than O(size).
+                nodes[index].part.body = []
+            } else {
+                report.unparsedMultiparts += 1
+                nodes[index].part.unparsed = true
+            }
+        }
+
+        guard !nodes.isEmpty else { return (Part(), report) }
+        for i in stride(from: nodes.count - 1, through: 0, by: -1) where !nodes[i].children.isEmpty {
+            nodes[i].part.parts = nodes[i].children.map { nodes[$0].part }
+        }
+        return (nodes[0].part, report)
+    }
+
+    /// One part: its headers, its body, and the fields read off the headers.
+    /// Descending into a `multipart/*` body is `parseReporting`'s job, which is
+    /// what keeps the descent in one place.
+    private static func parseOne(_ bytes: [UInt8], report: inout Report) -> Part {
         var part = Part()
         let split = splitHeadersAndBody(bytes)
-        let headers = parseHeaders(Array(bytes[split.headers]))
+
+        var headerEnd = min(split.headers.upperBound, split.headers.lowerBound + maxHeaderBytes)
+        if headerEnd < split.headers.upperBound {
+            report.headerLimited = true
+            // Cut at a line boundary. Half a header line is not a header, and
+            // `parseHeaders` gives the first occurrence of a name the field, so
+            // a truncated one would win over a later real one.
+            while headerEnd > split.headers.lowerBound && bytes[headerEnd - 1] != 0x0A { headerEnd -= 1 }
+        }
+        let headers = parseHeaders(Array(bytes[split.headers.lowerBound..<headerEnd]))
         part.body = Array(bytes[split.body])
 
         if let ctype = headers["content-type"] {
@@ -75,10 +286,6 @@ enum MIME {
         }
         part.contentID = headers["content-id"]?
             .trimmingCharacters(in: CharacterSet(charactersIn: "<> \t"))
-
-        if part.isMultipart, let boundary = part.parameters["boundary"], !boundary.isEmpty {
-            part.parts = splitMultipart(part.body, boundary: boundary).map { parse(bytes: $0) }
-        }
         return part
     }
 
@@ -86,20 +293,29 @@ enum MIME {
     /// anything with a filename, plus anything explicitly dispositioned as one.
     /// The body parts of the message — text/plain and text/html with no
     /// filename — are skipped.
+    ///
+    /// Iterative for the same reason the parse is: this walk used to recurse
+    /// over a tree whose depth the sender chose, which made it a second way to
+    /// reach the same SIGSEGV. `parseReporting` now bounds the depth, and this
+    /// no longer depends on that being true.
     static func attachments(of root: Part) -> [Attachment] {
         var out: [Attachment] = []
         var counter = 0
-        func walk(_ part: Part) {
+        // Children are pushed reversed so the stack yields them left to right,
+        // which is the order the recursive walk produced and the order
+        // `mail_save_attachment`'s `index` argument refers to.
+        var stack: [Part] = [root]
+        while let part = stack.popLast() {
             if part.isMultipart {
-                part.parts.forEach(walk)
-                return
+                stack.append(contentsOf: part.parts.reversed())
+                continue
             }
             let disposition = part.disposition ?? ""
             let named = part.filename
             let isBodyPart = named == nil && disposition != "attachment"
                 && (part.contentType == "text/plain" || part.contentType == "text/html")
-            if isBodyPart { return }
-            if named == nil && disposition != "attachment" && part.contentID == nil { return }
+            if isBodyPart { continue }
+            if named == nil && disposition != "attachment" && part.contentID == nil { continue }
 
             counter += 1
             let mimeType = part.contentType.isEmpty ? "application/octet-stream" : part.contentType
@@ -112,7 +328,6 @@ enum MIME {
                 contentID: part.contentID
             ))
         }
-        walk(root)
         return out
     }
 
@@ -237,11 +452,21 @@ enum MIME {
     /// Returns each part's bytes, delimited by `--boundary` lines. The preamble
     /// before the first delimiter and the epilogue after the closing one are
     /// discarded, per RFC 2046.
-    private static func splitMultipart(_ bytes: [UInt8], boundary: String) -> [[UInt8]] {
+    ///
+    /// `limit` caps the parts produced. Without it a body of nothing but bare
+    /// `--B` lines yields one part per four bytes -- 17 million of them for a
+    /// 70 MB message -- and the delimiter list alone is collected in full before
+    /// a single part is built. The caller passes its remaining part budget plus
+    /// one, so a message that runs past the ceiling is seen to run past it.
+    ///
+    /// The scan cannot stall: `marker` is `--` plus a non-empty boundary, so
+    /// every iteration advances `search` by at least three bytes.
+    private static func splitMultipart(_ bytes: [UInt8], boundary: String, limit: Int) -> [[UInt8]] {
+        guard limit > 0 else { return [] }
         let marker = [UInt8]("--\(boundary)".utf8)
         var delimiters: [(start: Int, afterLine: Int, isClose: Bool)] = []
         var search = 0
-        while search < bytes.count {
+        while search < bytes.count && delimiters.count <= limit {
             guard let hit = index(of: marker, in: bytes, from: search) else { break }
             let atLineStart = hit == 0 || bytes[hit - 1] == 0x0A
             if atLineStart {

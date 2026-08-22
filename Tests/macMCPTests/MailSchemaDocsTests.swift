@@ -57,6 +57,21 @@ final class MailSchemaDocsTests: XCTestCase {
         )
     }
 
+    /// A message can nest multipart parts as deep as its sender likes. macMCP
+    /// stops descending at `MIME.maxDepth`, which makes the attachment list
+    /// short rather than wrong — and short is indistinguishable from "this
+    /// message has fewer attachments" unless the schema says the field exists
+    /// and what it means (#R3-1).
+    func testTheAttachmentToolsSayWhenAMessageWasNotReadInFull() throws {
+        for tool in ["mail_get_email", "mail_save_attachment"] {
+            assertMentions(
+                try description(of: tool),
+                anyOf: ["parsed_complete"],
+                "\(tool) reporting a message it could not parse in full"
+            )
+        }
+    }
+
     func testListMailboxesNamesMailsOwnLocalMailboxes() throws {
         // They are scanned and their rows come back labelled `On My Mac:...`,
         // so a listing that does not name them hands a caller a mailbox they

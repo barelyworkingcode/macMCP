@@ -88,9 +88,6 @@ enum JXA {
 ///
 /// * `arrival: {after, at, message, repeat}` splices a message in. The
 ///   collection gets longer, which a column-count check can see.
-/// A mailbox marked `byNameHidden: true` is enumerated and named but cannot be
-/// reached through `byName`, which is what a nested mailbox does in Mail.
-///
 /// * `departure: {after, at, repeat}` takes a message back out. Paired with an
 ///   `arrival` it models a change that is over before the scan looks again,
 ///   which the id re-read cannot see and only the column lengths can.
@@ -98,6 +95,15 @@ enum JXA {
 ///   out and puts another in. The collection is the **same length** before and
 ///   after, so counting columns cannot see it and only re-reading the id column
 ///   can.
+///
+/// A mailbox nests with `container`, which is the **path** of its parent:
+/// `{name: 'Sub', container: 'Archive'}` is the fixture's `Archive/Sub`. Mail
+/// reports only the leaf name for it, so an account can enumerate two mailboxes
+/// called `Archive`, and `mailboxes.byName('Sub')` cannot reach a nested one --
+/// both modelled here. What does reach it is its path, which is also what
+/// `mailboxes.container.name()` (a bulk column, chainable) is used to build.
+/// A mailbox marked `byNameHidden: true` cannot be reached through `byName` at
+/// all, which is what drives the fallback to positional specifiers.
 ///
 /// `mail.takeOut(account, mailbox, index)` removes one message on demand, so a
 /// test can change a mailbox *between* two reads of a specifier a script has
@@ -112,12 +118,18 @@ enum JXA {
 /// specifier re-resolving: `byName` hands back the element itself, so only the
 /// message-level binding can be pinned here.
 ///
+/// `mail.delete(x)` models Mail's delete command: the message leaves the
+/// mailbox it is in and lands on `mail.log.deleted`. A message can also carry
+/// `autoSaved: true` (or a whole `headers` string), which is what
+/// `allHeaders()` answers with -- the one thing that tells a draft Mail wrote
+/// by itself from one that was saved on purpose.
+///
 /// Every mutation is recorded on `mail.log` so a test can assert on what the
 /// script did rather than only on what it returned.
 enum MailStubJS {
     static let source = """
     function makeMail(spec) {
-        var log = {moves: [], created: [], sent: [], saved: [], bodies: [], sourceReads: []};
+        var log = {moves: [], created: [], sent: [], saved: [], bodies: [], sourceReads: [], deleted: []};
 
         // Mail's element collections are callable *and* carry `name()` (one
         // bulk Apple Event for every name) and `byName()`. `Function.name` is
@@ -141,6 +153,66 @@ enum MailStubJS {
                 return missingElement();
             };
             return fn;
+        }
+
+        // A mailbox collection carries everything the one above does plus the
+        // container chain, because a mailbox is identified by its **path** and
+        // not by the leaf name Mail reports for it.
+        //
+        // `mailboxes.container.name()` is one bulk Apple Event giving each
+        // mailbox's parent name, null at the top level, and the chain extends:
+        // `.container.container.name()`, until a level is entirely null. That
+        // is how a path is built, and it is why a path costs a fixed handful of
+        // Apple Events for a whole account rather than one per mailbox.
+        //
+        // `byName` takes a path (`'Projects/Archive'`) and resolves it exactly.
+        // A bare name reaches a **top-level** mailbox only, which is what Mail
+        // does and why a nested mailbox is unreachable by its leaf name --
+        // `mailboxes.byName('Sub')` for `Archive/Sub` is `exists()` false while
+        // position 2 reads fine. `byNameHidden: true` models a mailbox that
+        // cannot be reached by `byName` at all, which is what drives the
+        // fallback to positional specifiers.
+        function mailboxCollectionOf(itemsFn) {
+            function level(pick) {
+                var fn = function() { return pick(); };
+                Object.defineProperty(fn, 'name', {
+                    value: function() {
+                        return pick().map(function(b) { return b == null ? null : '' + b.name(); });
+                    },
+                    writable: true, configurable: true
+                });
+                Object.defineProperty(fn, 'container', {
+                    get: function() {
+                        return level(function() {
+                            return pick().map(function(b) { return b == null ? null : b._parent; });
+                        });
+                    },
+                    configurable: true
+                });
+                return fn;
+            }
+            var fn = level(itemsFn);
+            fn.byName = function(n) {
+                var want = '' + n;
+                var items = itemsFn();
+                for (var i = 0; i < items.length; i++) {
+                    if (items[i]._byNameHidden) continue;
+                    if (items[i]._path === want) return items[i];
+                }
+                return missingElement();
+            };
+            return fn;
+        }
+
+        // Resolves each mailbox's `container` (given as the parent's path) to
+        // the mailbox object it names, once every mailbox in the collection
+        // exists.
+        function linkContainers(boxes) {
+            var byPath = Object.create(null);
+            boxes.forEach(function(b) { byPath[b._path] = b; });
+            boxes.forEach(function(b) {
+                b._parent = b._containerPath === null ? null : (byPath[b._containerPath] || null);
+            });
         }
 
         // What a specifier that resolves to nothing behaves like: `exists()` is
@@ -187,6 +259,17 @@ enum MailStubJS {
                 messageSize: function() {
                     if (m.size == null) throw new Error('AppleEvent handler failed.');
                     return m.size;
+                },
+                // Mail's `all headers`, which is how an autosaved draft is
+                // told from one somebody saved on purpose: Mail stamps its own
+                // with `X-Apple-Auto-Saved: 1`. `autoSaved: true` is the
+                // shorthand; `headers` sets the block outright, and a message
+                // with neither answers with just its subject, which is what a
+                // message whose headers say nothing interesting looks like.
+                allHeaders: function() {
+                    if (m.headers != null) return '' + m.headers;
+                    return 'Subject: ' + this._subject + '\\n'
+                        + (m.autoSaved ? 'X-Apple-Auto-Saved: 1\\n' : '');
                 }
             };
             // `found.mailbox = destMbox` is a property assignment in JXA, so the
@@ -215,8 +298,25 @@ enum MailStubJS {
                 acctName: acctName,
                 _msgs: [],
                 _reads: 0,
+                // `container` is the parent's **path**, so the fixture's
+                // `Archive/Sub` is `{name: 'Sub', container: 'Archive'}` and
+                // `R4-PROBE-Deep/L2/L3/L4` is
+                // `{name: 'L4', container: 'R4-PROBE-Deep/L2/L3'}`. Mail
+                // reports only the leaf name, which is the whole problem.
+                _containerPath: b.container == null ? null : ('' + b.container),
+                _parent: null,
                 name: function() { return b.name; }
             };
+            box._path = box._containerPath === null ? ('' + b.name) : (box._containerPath + '/' + b.name);
+            // Mail answers `container` with an object either way; a top-level
+            // mailbox's container simply has no name, which is the stop
+            // condition for walking the chain upwards.
+            Object.defineProperty(box, 'container', {
+                get: function() {
+                    if (box._parent !== null) return box._parent;
+                    return {name: function() { return null; }, exists: function() { return false; }};
+                }
+            });
             // `mb.messages.id()` is a bulk column fetch; `mb.messages[k]` is an
             // element. Mail exposes both off the same specifier, and re-evaluates
             // it on each access, so the stub rebuilds it from the live array
@@ -318,14 +418,16 @@ enum MailStubJS {
 
         var accounts = (spec.accounts || []).map(function(a) {
             var boxes = (a.mailboxes || []).map(function(b) { return makeMailbox(b, a.name); });
+            linkContainers(boxes);
             return {
                 name: function() { return a.name; },
                 exists: function() { return true; },
                 emailAddresses: function() { return a.emailAddresses || []; },
-                mailboxes: collectionOf(function() { return boxes; }, function(b) { return '' + b.name(); })
+                mailboxes: mailboxCollectionOf(function() { return boxes; })
             };
         });
         var localBoxes = (spec.local || []).map(function(b) { return makeMailbox(b, 'On My Mac'); });
+        linkContainers(localBoxes);
 
         function everyMessage() {
             var out = [];
@@ -349,14 +451,18 @@ enum MailStubJS {
         // one.
         var FORWARDED = ['id', 'messageId', 'subject', 'sender', 'dateReceived', 'dateSent',
                          'messageSize', 'source', 'content', 'mailAttachments',
-                         'toRecipients', 'ccRecipients'];
+                         'toRecipients', 'ccRecipients', 'allHeaders'];
         function specifier(resolve, present) {
             function live() {
                 var m = resolve();
                 if (m == null) throw new Error("Can't get object.");
                 return m;
             }
-            var spec = {exists: present};
+            // `_live` is the specifier's own resolution, exposed so that a
+            // command taking an element -- `mail.delete(msg)` -- can act on
+            // the message rather than on the specifier wrapping it. Mail
+            // resolves the specifier itself; the stub has to be told to.
+            var spec = {exists: present, _live: live};
             FORWARDED.forEach(function(k) {
                 spec[k] = function() {
                     var m = live();
@@ -427,12 +533,26 @@ enum MailStubJS {
             return null;
         }
 
+        // `mail.delete(x)` -- Mail's delete command, which for a message moves
+        // it to Trash rather than erasing it. The stub takes it out of the
+        // mailbox it is in and records it, which is all any caller here can
+        // observe. It accepts either a message or a specifier for one.
+        function deleteElement(el) {
+            var m = (el && typeof el._live === 'function') ? el._live() : el;
+            if (m == null || m._box == null) throw new Error("Can't get object.");
+            var at = m._box._msgs.indexOf(m);
+            if (at < 0) throw new Error("Can't get object.");
+            m._box._msgs.splice(at, 1);
+            log.deleted.push({id: m._id, subject: m._subject, mailbox: m._box.name()});
+        }
+
         return {
             log: log,
             inbox: inbox,
             takeOut: takeOut,
+            delete: deleteElement,
             accounts: collectionOf(function() { return accounts; }, function(a) { return '' + a.name(); }),
-            mailboxes: collectionOf(function() { return localBoxes; }, function(b) { return '' + b.name(); })
+            mailboxes: mailboxCollectionOf(function() { return localBoxes; })
         };
     }
     """

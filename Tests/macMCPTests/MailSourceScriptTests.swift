@@ -82,9 +82,10 @@ final class MailSourceScriptTests: XCTestCase {
         XCTAssertEqual(reads.count, 4, "one read plus three attempts")
 
         // And Swift turns that into an explicit "this is a fragment".
-        let (size, body) = MailService.splitSourceSizeMarker(Data(output.utf8))
-        XCTAssertEqual(size, 100_000)
-        XCTAssertFalse(MailService.sourceFidelity(body, expectedSize: size).complete)
+        let split = MailService.splitSourceSizeMarker(Data(output.utf8))
+        XCTAssertEqual(split.size, 100_000)
+        XCTAssertNil(split.error)
+        XCTAssertFalse(MailService.sourceFidelity(split.body, expectedSize: split.size).complete)
     }
 
     // MARK: - When Mail will not say how big the message is
@@ -96,9 +97,10 @@ final class MailSourceScriptTests: XCTestCase {
         XCTAssertTrue(output.hasPrefix("MACMCP-SIZE:-1\n"), output)
         XCTAssertEqual(reads.count, 1)
 
-        let (size, body) = MailService.splitSourceSizeMarker(Data(output.utf8))
-        XCTAssertNil(size)
-        XCTAssertTrue(MailService.sourceFidelity(body, expectedSize: size).complete)
+        let split = MailService.splitSourceSizeMarker(Data(output.utf8))
+        XCTAssertNil(split.size)
+        XCTAssertNil(split.error, "-1 is the script's own sentinel")
+        XCTAssertTrue(MailService.sourceFidelity(split.body, expectedSize: split.size).complete)
     }
 
     // MARK: - The rest of the script still works

@@ -364,83 +364,217 @@ enum MailService {
         case everything
     }
 
-    /// JXA that builds `var <varName> = [{mbox, acctName, name}]` for `scope`.
-    /// Note: Mail returns account.mailboxes() already flattened (nested folders
-    /// included), so no recursion is needed.
-    /// JavaScript that pairs each element of a Mail collection with the name it
-    /// was read under, and binds the element by that name.
+    /// JXA that builds `var <varName> = [{mbox, acctName, name, path}]` for
+    /// `scope`. Note: Mail returns account.mailboxes() already flattened (nested
+    /// folders included), so no recursion is needed -- but the names it reports
+    /// are **leaf** names, which is why every entry also carries a path.
+    /// JavaScript that gives a Mail collection's elements an identity, and binds
+    /// each element by that identity.
     ///
-    /// Every collection Mail hands back -- accounts, mailboxes, messages -- is
-    /// indexed by **position**, and JXA re-evaluates a specifier on every
-    /// property access rather than snapshotting the object behind it. `boxes[i]`
-    /// therefore means "whatever is at position i right now", so a collection
-    /// that changes between two reads answers the second one about a different
-    /// element, silently and with no error. That is issue #50 at the message
-    /// level; it is the same shape one level up.
+    /// Two separate problems, one helper.
     ///
-    /// The names come from a bulk `collection.name()` -- one Apple Event for all
-    /// of them, the same trick the scan uses for message columns -- so the name
-    /// and the binding are taken from a single read rather than from a walk that
-    /// the collection can change underneath.
+    /// **A leaf name does not identify a mailbox.** Mail flattens an account's
+    /// mailbox tree and reports leaf names, so `Projects/Archive` beside a
+    /// top-level `Archive` gives an account **two** mailboxes called `Archive`,
+    /// and one account can hold two `Trash`es and two `Drafts`es. Anything that
+    /// resolves, labels or excludes a mailbox by that name is guessing between
+    /// them -- which is how a `mail_move` to `"Trash"` filed a message into a
+    /// user's project folder and reported `verified: true`.
     ///
-    /// **A name that does not identify the element keeps the positional
-    /// specifier**, because half a binding is worse than none. Two cases, both
-    /// measured against the fixture with nested IMAP folders:
+    /// What identifies it is the **path**: the leaf names of its containers,
+    /// outermost first, joined with `/`. Three things make that the right
+    /// choice rather than merely a unique label, all measured against the
+    /// fixture (Mail 16.0, 30 mailboxes on one account):
     ///
-    /// * A name that repeats. Mail flattens an account's mailbox tree and
-    ///   reports leaf names, so `Projects/Archive` beside a top-level `Archive`
-    ///   gives an account **two** mailboxes called `Archive`. Binding both by
-    ///   name would collapse them onto whichever one `byName` picks -- a new
-    ///   wrong answer in place of the old one -- and the scan really does read
-    ///   them as two, one holding `NESTED-ARCHIVE` and the other
-    ///   `Decommission plan`.
-    /// * A name that resolves to nothing. `byName` matches at the top level
-    ///   only, so a nested mailbox it enumerates and names cannot be reached by
-    ///   that name at all: `mailboxes.byName('Sub')` for `Projects/Sub` gives a
-    ///   specifier whose `exists()` is false, while position 2 reads fine. The
-    ///   binding is therefore checked before it is used, which is why this is
-    ///   not simply `collection.byName(names[i])`.
-    private static let boundByNameJXA = """
-    function boundByName(collection) {
-        var names = collection.name();
-        var elements = null;
-        function positional(i) {
-            if (elements === null) elements = collection();
-            return i < elements.length ? elements[i] : null;
+    /// * It is what Mail itself accepts. `mailboxes.byName('Projects/Archive')`
+    ///   resolves, and `byName('Archive')` resolves to the **top-level** one --
+    ///   so a path is a handle, not just a name, and a bare name is a path with
+    ///   one component. All 30 paths resolved, including the nested ones whose
+    ///   leaf name does not (`byName('Sub')` for `Archive/Sub` is `exists()`
+    ///   false) and including names carrying quotes, apostrophes, spaces,
+    ///   ampersands, emoji and Hebrew.
+    /// * It cannot be ambiguous. Mail treats `/` in a mailbox name as a
+    ///   separator -- creating a mailbox named `a/b` produces a mailbox `b`
+    ///   inside a mailbox `a` -- so no leaf name can contain one, and siblings
+    ///   are unique.
+    /// * It is cheap. The containers come back as bulk columns, one Apple Event
+    ///   per level of nesting for the whole collection:
+    ///   `mailboxes.container.name()`, then `.container.container.name()`, until
+    ///   a level is entirely null. Bob's 30 mailboxes, 4 levels deep: 6 Apple
+    ///   Events, ~100ms -- against ~520ms for the 30 `exists()` probes this
+    ///   replaces.
+    ///
+    /// **A collection read twice is not the same collection.** Every collection
+    /// Mail hands back is indexed by **position**, and JXA re-evaluates a
+    /// specifier on every property access rather than snapshotting the object
+    /// behind it. `boxes[i]` therefore means "whatever is at position i right
+    /// now". The names and the container columns are separate Apple Events read
+    /// in lockstep by index, exactly like the message scan's columns, so they
+    /// get exactly the message scan's guard: the name column is read again at
+    /// the end and has to come back identical, and every container column has
+    /// to be the same length. The `exists()` probes that used to sit *between*
+    /// the two reads -- ~386ms of the ~400ms window measured on Bob -- are gone
+    /// from it entirely.
+    ///
+    /// The binding is `collection.byName(path)`, which re-resolves by identity
+    /// and so answers for the same mailbox every time or raises. Two guards on
+    /// it, neither costing more than one Apple Event:
+    ///
+    /// * A path that is not unique in the collection keeps the positional
+    ///   specifier. Mail cannot produce one (siblings are unique) but a
+    ///   collection with no containers at all can -- `mail.accounts` reaches
+    ///   this helper too, and two accounts may share a name.
+    /// * One probe per collection, on the deepest path, says whether this Mail
+    ///   resolves paths at all; if it does not, the whole collection falls back
+    ///   to positional specifiers, which is what it used before. Per-element
+    ///   probes are what made the old window 400ms wide, and what the probe
+    ///   guards against is a property of the collection rather than of one
+    ///   mailbox.
+    ///
+    /// `boundByName` returns `null` when the collection would not hold still
+    /// across three attempts. Callers turn that into an `unstable` report or a
+    /// refusal; none of them guess.
+    /// Not private: several generated scripts are only meaningful with these
+    /// helpers in scope, so a test that runs one has to emit them too.
+    static let boundByNameJXA = """
+    var MB_MAX_DEPTH = 16;
+    var MB_ATTEMPTS = 3;
+    function mbSameNames(before, after) {
+        if (before.length !== after.length) return false;
+        for (var i = 0; i < before.length; i++) {
+            if ((before[i] == null) !== (after[i] == null)) return false;
+            if (before[i] != null && ('' + before[i]) !== ('' + after[i])) return false;
         }
+        return true;
+    }
+    // The path of one already-resolved mailbox, asked of the mailbox itself.
+    // Used where there is no collection to read a column from -- a message
+    // saying which mailbox it is in. Costs one Apple Event per level plus one:
+    // the container of a top-level mailbox answers `name()` with null rather
+    // than raising, which is the stop condition.
+    function mbPathOf(box) {
+        var parts = [];
+        var cur = box;
+        for (var d = 0; d <= MB_MAX_DEPTH; d++) {
+            var nm = null;
+            try { nm = cur.name(); } catch (e) { return null; }
+            if (nm == null) break;
+            parts.unshift('' + nm);
+            try { cur = cur.container; } catch (e) { break; }
+            if (cur == null) break;
+        }
+        return parts.length === 0 ? null : parts.join('/');
+    }
+    function boundByName(collection) {
+        for (var attempt = 0; attempt < MB_ATTEMPTS; attempt++) {
+            // --- the window. Bulk column fetches and nothing else: no probe,
+            // no per-element access, nothing that can block.
+            var names = collection.name();
+            var levels = [];
+            var up = collection;
+            for (var d = 0; d < MB_MAX_DEPTH; d++) {
+                var level = null;
+                // A collection with no container chain (mail.accounts) raises
+                // here, which is the same answer as "everything is top level".
+                try { up = up.container; level = up.name(); } catch (e) { break; }
+                if (level == null || level.length !== names.length) { levels = null; break; }
+                levels.push(level);
+                var deeper = false;
+                for (var i = 0; i < level.length; i++) { if (level[i] != null) { deeper = true; break; } }
+                if (!deeper) break;
+            }
+            var recheck = collection.name();
+            // --- window closed. Everything below is arithmetic on what came
+            // back, or one probe that cannot mispair anything.
+            if (levels === null) continue;
+            if (!mbSameNames(names, recheck)) continue;
+
+            var out = [];
+            for (var i = 0; i < names.length; i++) {
+                var parts = ['' + names[i]];
+                for (var d = 0; d < levels.length; d++) {
+                    if (levels[d][i] == null) break;
+                    parts.unshift('' + levels[d][i]);
+                }
+                out.push({element: null, name: '' + names[i], path: parts.join('/'), depth: parts.length - 1});
+            }
+            var once = Object.create(null);
+            for (var i = 0; i < out.length; i++) once[out[i].path] = (once[out[i].path] || 0) + 1;
+
+            var deepest = -1;
+            for (var i = 0; i < out.length; i++) {
+                if (once[out[i].path] !== 1) continue;
+                if (deepest < 0 || out[i].depth > out[deepest].depth) deepest = i;
+            }
+            var pathsBind = false;
+            if (deepest >= 0) {
+                try { pathsBind = collection.byName(out[deepest].path).exists() === true; } catch (e) { pathsBind = false; }
+            }
+            var needElements = !pathsBind;
+            for (var i = 0; i < out.length && !needElements; i++) {
+                if (once[out[i].path] !== 1) needElements = true;
+            }
+            var elements = null;
+            if (needElements) {
+                // The fallback, and a second window of its own. Positional
+                // specifiers are what this helper exists to avoid, so they are
+                // fetched only when there is nothing better -- and then under
+                // the same guard, because fetching them lazily further down
+                // would reopen exactly the window this closes.
+                elements = collection();
+                if (elements.length !== names.length) continue;
+                if (!mbSameNames(names, collection.name())) continue;
+            }
+            for (var i = 0; i < out.length; i++) {
+                out[i].element = (pathsBind && once[out[i].path] === 1)
+                    ? collection.byName(out[i].path)
+                    : elements[i];
+            }
+            return out;
+        }
+        return null;
+    }
+    // What a caller does with a collection that would not hold still. Nothing
+    // here guesses: a scan reports the mailboxes it could not read, and
+    // anything that acts on one mailbox refuses outright.
+    var MB_UNSTABLE = MB_UNSTABLE || [];
+    function boundByNameOrReport(collection, label) {
+        var bound = boundByName(collection);
+        if (bound !== null) return bound;
+        // Nothing in it can be bound, but the names are still readable, and
+        // naming the mailboxes that could not be read is the difference
+        // between a short answer and a short answer presented as a complete
+        // one. The entries are carried through with no element so that the
+        // caller's own filter applies to them: what comes back then names the
+        // mailboxes in scope rather than every mailbox the account holds.
+        var names = null;
+        try { names = collection.name(); } catch (e) { names = null; }
+        if (names === null || names.length === 0) { MB_UNSTABLE.push(label); return []; }
         var out = [];
         for (var i = 0; i < names.length; i++) {
-            var nm = '' + names[i];
-            var unique = true;
-            for (var q = 0; q < names.length; q++) {
-                if (q !== i && ('' + names[q]) === nm) { unique = false; break; }
-            }
-            var bound = null;
-            if (unique) {
-                var candidate = collection.byName(nm);
-                var resolves = false;
-                try { resolves = candidate.exists(); } catch (e) { resolves = false; }
-                if (resolves) bound = candidate;
-            }
-            if (bound === null) bound = positional(i);
-            if (bound !== null) out.push({element: bound, name: nm});
+            out.push({element: null, name: '' + names[i], path: '' + names[i], depth: 0});
         }
         return out;
+    }
+    function boundByNameOrThrow(collection, what) {
+        var bound = boundByName(collection);
+        if (bound !== null) return bound;
+        throw new Error(what + ' kept changing while it was being read, so no mailbox could be identified; nothing was done. This is transient: try again in a moment.');
     }
     """
 
     private static func collectBoxesJXA(_ scope: BoxScope, varName: String) -> String {
         let pushAccountBoxes = """
                 var acctName = accts[ai].name;
-                var mboxes = boundByName(accts[ai].element.mailboxes);
+                var mboxes = boundByNameOrReport(accts[ai].element.mailboxes, acctName + ':<mailbox list>');
                 for (var mj = 0; mj < mboxes.length; mj++) {
-                    sink.push({mbox: mboxes[mj].element, acctName: acctName, name: mboxes[mj].name});
+                    sink.push({mbox: mboxes[mj].element, acctName: acctName, name: mboxes[mj].name, path: mboxes[mj].path});
                 }
         """
         let pushLocalBoxes = """
-            var localBoxes = boundByName(mail.mailboxes);
+            var localBoxes = boundByNameOrReport(mail.mailboxes, 'On My Mac:<mailbox list>');
             for (var lj = 0; lj < localBoxes.length; lj++) {
-                sink.push({mbox: localBoxes[lj].element, acctName: 'On My Mac', name: localBoxes[lj].name});
+                sink.push({mbox: localBoxes[lj].element, acctName: 'On My Mac', name: localBoxes[lj].name, path: localBoxes[lj].path});
             }
         """
 
@@ -449,7 +583,7 @@ enum MailService {
         case .account(let account):
             let escapedAccount = escapeJSString(account)
             body = """
-            var accts = boundByName(mail.accounts);
+            var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             for (var ai = 0; ai < accts.length; ai++) {
                 if (accts[ai].name.toLowerCase() === '\(escapedAccount)'.toLowerCase()) {
         \(pushAccountBoxes)
@@ -465,7 +599,7 @@ enum MailService {
         """
         case .everything:
             body = """
-            var accts = boundByName(mail.accounts);
+            var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             for (var ai = 0; ai < accts.length; ai++) {
         \(pushAccountBoxes)
             }
@@ -542,14 +676,51 @@ enum MailService {
         var SKIP = Object.create(null);
         ['trash','junk','spam','junk email','deleted items','deleted messages','drafts','outbox']
             .forEach(function(n) { SKIP[n] = 1; });
-        var entries = allBoxes.filter(function(b) { return !SKIP[b.name.toLowerCase()]; });
+        // Excluded by **identity**, not by leaf name. An account's own Trash is
+        // the one at the root of it; a folder a user made called `Trash` three
+        // levels down inside a project is ordinary mail, and matching the leaf
+        // name dropped it from every scan. Measured on the fixture: 35 messages
+        // reported against 38 on disk, `scan_complete: true`,
+        // `skipped_mailboxes: []`.
+        //
+        // What is left out is now named. `all` means "everything except the
+        // account's own Trash, Junk, Drafts and Outbox", and a caller who is
+        // not told which mailboxes those were cannot tell a short count from a
+        // complete one -- the same thing #57 fixed for mailboxes that could not
+        // be read.
+        var excluded = [];
+        var entries = [];
+        for (var f = 0; f < allBoxes.length; f++) {
+            var box = allBoxes[f];
+            if (box.path.indexOf('/') < 0 && SKIP[box.name.toLowerCase()]) {
+                excluded.push(box.acctName + ':' + box.path);
+            } else {
+                entries.push(box);
+            }
+        }
         """
         } else {
             let escaped = escapeJSString(mailbox)
             // A miss here is normal -- the caller scans each account separately
             // and only reports "no such mailbox" if every account came up empty.
+            //
+            // A path wins over a leaf name, and a bare name is a path with one
+            // component, so `mailbox: "Archive"` is the mailbox at the root of
+            // the account rather than whichever `Archive` Mail lists first --
+            // the same rule `mailboxInAccountJXA` resolves a destination by, so
+            // a name means the same mailbox to a read as it does to a move.
+            // The leaf fallback is what lets `Sub` reach `Archive/Sub`; unlike
+            // the move path it does not refuse when several mailboxes carry the
+            // name, because rows come back labelled with their own paths and
+            // reading two mailboxes is not a wrong answer, while filing into
+            // one of two is.
             filter = """
-        var entries = allBoxes.filter(function(b) { return b.name.toLowerCase() === '\(escaped)'.toLowerCase(); });
+        var excluded = [];
+        var WANT = '\(escaped)'.toLowerCase();
+        var entries = allBoxes.filter(function(b) { return b.path.toLowerCase() === WANT; });
+        if (entries.length === 0) {
+            entries = allBoxes.filter(function(b) { return b.name.toLowerCase() === WANT; });
+        }
         """
         }
 
@@ -597,7 +768,12 @@ enum MailService {
         }
 
         for (var e = 0; e < entries.length; e++) {
-            var label = entries[e].acctName + ':' + entries[e].name;
+            var label = entries[e].acctName + ':' + entries[e].path;
+            // A mailbox whose collection would not hold still long enough to be
+            // identified. It is reported here rather than where it was read, so
+            // the caller is told about the mailboxes in scope and not about
+            // every mailbox the account happens to hold.
+            if (entries[e].mbox === null) { unstable.push(label); continue; }
             try {
                 var mb = entries[e].mbox;
                 var ids = null, su = null, se = null, dt = null, rd = null;
@@ -634,7 +810,7 @@ enum MailService {
                         local.push({
                             id: id,
                             account: entries[e].acctName,
-                            mailbox: entries[e].name,
+                            mailbox: entries[e].path,
                             subject: su[i] == null ? '' : '' + su[i],
                             sender: se[i] == null ? '' : '' + se[i],
                             date_received: dt[i] ? '' + dt[i] : '',
@@ -652,7 +828,8 @@ enum MailService {
                 skipped.push(label);
             }
         }
-        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, unstable: unstable, matched: entries.length, messages_scanned: messagesScanned});
+        for (var u = 0; u < MB_UNSTABLE.length; u++) unstable.push(MB_UNSTABLE[u]);
+        JSON.stringify({rows: rows, total: total, scanned: scanned, skipped: skipped, unstable: unstable, excluded: excluded, matched: entries.length, messages_scanned: messagesScanned});
         """
     }
 
@@ -686,6 +863,17 @@ enum MailService {
         /// subject. Reported rather than silently dropped.
         var unstable: [String] = []
         var failed: [String] = []
+        /// Mailboxes `mailbox: "all"` deliberately left out: an account's own
+        /// Trash, Junk, Drafts and Outbox.
+        ///
+        /// They are out of scope rather than unread, so they do not make
+        /// `scan_complete` false -- a flag that is false for every `all` scan
+        /// would say nothing, which is why the summary boolean on
+        /// `mail_get_source` was removed. But leaving them unnamed is what let
+        /// a nested `R4-PROBE-Deep/Trash` disappear from a scan that reported
+        /// `scan_complete: true` and `skipped_mailboxes: []`, so they are
+        /// named.
+        var excluded: [String] = []
         var matchedMailbox = false
 
         /// Whether every mailbox in scope was actually read.
@@ -796,6 +984,7 @@ enum MailService {
             outcome.scanned.append(contentsOf: obj["scanned"] as? [String] ?? [])
             outcome.skipped.append(contentsOf: obj["skipped"] as? [String] ?? [])
             outcome.unstable.append(contentsOf: obj["unstable"] as? [String] ?? [])
+            outcome.excluded.append(contentsOf: obj["excluded"] as? [String] ?? [])
             if (obj["matched"] as? Int ?? 0) > 0 { outcome.matchedMailbox = true }
         }
         sortNewestFirst(&outcome.rows)
@@ -864,6 +1053,19 @@ enum MailService {
     /// underneath it. The same allowance the scan takes, for the same reason: a
     /// mailbox changing under a read is a moment, not a state.
     private static let findAttempts = 3
+
+    /// How many times a script that **changes** something may be re-run.
+    ///
+    /// Zero, and that is the whole point. `runJXAData` retries by running the
+    /// *entire* script again, so a -1728 raised after `found.mailbox =
+    /// destMbox` has already executed re-runs the move. Same-account that is
+    /// merely wasteful; across accounts the move is a re-upload and the
+    /// numeric id does not survive it, so the retry's `findMessageJXA` finds
+    /// nothing and the caller is told "message not found with id: N" for a
+    /// move that succeeded. `mail_send` and `mail_create_draft` have always
+    /// passed 0 for the same reason; `mail_move` and `mail_mark_read` were
+    /// left on the default.
+    static let mutatingRetries = 0
 
     /// What a caller's `message_id` can be matched against.
     enum MessageHandle: Equatable {
@@ -958,21 +1160,31 @@ enum MailService {
         } ?? ""
 
         let preamble = """
+    \(boundByNameJXA)
     var found = null; var foundAccount = null; var foundMailbox = null;
     var FM_ACCOUNT = \(accountExpr);
     function fmBare(v) { return v == null ? null : ('' + v).replace(/^</, '').replace(/>$/, ''); }
     // Where a message actually is, asked of the message rather than of the
     // collection it was reached through: `byId` resolves across every account,
     // so the specifier used to reach it says nothing about the answer.
+    //
+    // `mailbox` is the **path**, because the leaf name does not identify the
+    // mailbox: an account holding `Projects/Archive` beside a top-level
+    // `Archive` answered `"mailbox": "Archive"` for a message in either, and
+    // that string is what `moved_from` reported and what a caller would pass
+    // back as a scope. Walking the containers costs one Apple Event per level
+    // plus one -- ~35ms for a top-level mailbox, ~80ms four deep.
     function fmLocate(msg) {
         var box = null;
         try { box = msg.mailbox; } catch (e) { return null; }
         var boxName = null;
         try { boxName = '' + box.name(); } catch (e) { return null; }
+        var boxPath = mbPathOf(box);
+        if (boxPath === null) boxPath = boxName;
         // A local On My Mac mailbox has no account and raises here.
         var acctName = 'On My Mac';
         try { acctName = '' + box.account.name(); } catch (e) { acctName = 'On My Mac'; }
-        return {account: acctName, mailbox: boxName};
+        return {account: acctName, mailbox: boxPath, leaf: boxName};
     }
     function fmInScope(at) {
         return FM_ACCOUNT === null
@@ -1043,9 +1255,15 @@ enum MailService {
             }
             return false;
         }
+        // The caller's `mailbox` is only a hint about where to look first, so
+        // it matches either the identity (a path, and a bare name is a path
+        // with one component) or the leaf name -- and a mailbox that could not
+        // be identified at all is skipped rather than searched, since nothing
+        // read out of it could be trusted.
         var named = []; var rest = [];
         for (var i = 0; i < fmBoxes.length; i++) {
-            if (fmBoxes[i].name.toLowerCase() === targetLC) named.push(fmBoxes[i]); else rest.push(fmBoxes[i]);
+            if (fmBoxes[i].mbox === null) continue;
+            if (fmBoxes[i].path.toLowerCase() === targetLC || fmBoxes[i].name.toLowerCase() === targetLC) named.push(fmBoxes[i]); else rest.push(fmBoxes[i]);
         }
         if (!searchIn(named)) searchIn(rest);
     })();
@@ -1053,7 +1271,7 @@ enum MailService {
         }
     }
 
-    /// JXA snippet resolving a mailbox by name *inside one account*, named by a
+    /// JXA snippet resolving a mailbox *inside one account*, named by a
     /// JavaScript expression evaluated at run time.
     ///
     /// The run-time expression is the whole point. A destination mailbox has to
@@ -1065,17 +1283,43 @@ enum MailService {
     /// every account has an `Archive`, a `Sent`, a `Trash` and a `Drafts`, so
     /// the collision is the normal case rather than an unlucky one.
     ///
-    /// Both the account and the mailbox are bound by name rather than by
-    /// position (`boundByNameJXA`), because the destination is resolved and then
-    /// held across the assignment that does the move -- the widest window in the
-    /// service, and the same #50 shape one level up from messages.
+    /// **The same collision happens inside one account, and it used to be
+    /// resolved by taking the first match.** Mail reports leaf names for a
+    /// flattened tree, so an account holding `Projects/Archive` beside a
+    /// top-level `Archive` offers two mailboxes called `Archive` — and Mail
+    /// enumerates children before parents with the special mailboxes last, so
+    /// "the first one" was systematically the nested one. Measured against the
+    /// fixture: `mail_move` to `"Archive"` filed into `Projects/Archive`, and
+    /// `mail_move` to `"Trash"` filed into `R4-PROBE-Deep/Trash` — a "delete
+    /// this" that leaves the message undeleted in a user's project folder,
+    /// reported as `{"mailbox": "Trash", "verified": true}`.
     ///
-    /// Sets `<varName>` to the mailbox and `<varName>Account` to the name of the
-    /// account it came from, so the caller can report where the message went.
-    /// Throws when the account has no mailbox of that name — deliberately,
-    /// rather than falling back to another account's copy. The throw reaches
-    /// the caller as prose because `runJXAData` unwraps osascript's wrapper
-    /// (`scriptErrorMessage`); it used to arrive as
+    /// Resolution is now in two steps, and neither of them guesses:
+    ///
+    /// 1. **An exact path wins.** A bare name is a path with one component, so
+    ///    `Archive` names the mailbox at the root of the account and
+    ///    `Projects/Archive` names the nested one. That is not a convention
+    ///    invented here: it is how Mail's own `byName` reads the string, which
+    ///    is why the resolved mailbox can then be *bound* by it. It also
+    ///    answers the special-mailbox question without a special case — the
+    ///    account's `Trash` wins over a user folder called `Trash` because it
+    ///    is the one at the root, not because it is special.
+    /// 2. **Otherwise the leaf name, and only when exactly one mailbox carries
+    ///    it.** This is what lets `Sub` reach `Archive/Sub`, a mailbox no bare
+    ///    name of Mail's own would resolve. When more than one carries it the
+    ///    call is **refused and both paths are named**, in the same shape as
+    ///    the refusal for a name no mailbox carries: filing into one of two
+    ///    mailboxes is a coin toss whose result the caller cannot see, and the
+    ///    caller can say which they meant with one more path component.
+    ///
+    /// Sets `<varName>` to the mailbox, `<varName>Account` to the account it
+    /// came from and `<varName>Path` to the path that identifies it, so the
+    /// caller can report where the message went and check it against what was
+    /// asked for. Every list in an error message is a list of paths, because a
+    /// list of leaf names is where this started: `Archive, ..., Archive`.
+    ///
+    /// The throw reaches the caller as prose because `runJXAData` unwraps
+    /// osascript's wrapper (`scriptErrorMessage`); it used to arrive as
     /// `execution error: Error: Error: … (-2700)`.
     private static func mailboxInAccountJXA(
         mailbox: String,
@@ -1086,50 +1330,121 @@ enum MailService {
         return """
     \(boundByNameJXA)
     var \(varName)Account = null;
+    var \(varName)Path = null;
     var \(varName) = (function() {
         var wantName = '\(escapedMailbox)'.toLowerCase();
         var wantAcct = \(accountExpr);
-        function pick(boxes) {
-            for (var i = 0; i < boxes.length; i++) {
-                if (boxes[i].name.toLowerCase() === wantName) return boxes[i];
-            }
-            return null;
-        }
-        // Name what the account does have. The mailboxes are already fetched by
-        // then, so it costs nothing, and "no mailbox named X" on its own leaves
-        // a caller guessing at spelling, localisation and which account owns
-        // the folder they meant.
-        function nameList(boxes) {
+        // Name what the account does have, by path. The mailboxes are already
+        // fetched by then, so it costs nothing, and "no mailbox named X" on its
+        // own leaves a caller guessing at spelling, localisation and which
+        // account owns the folder they meant.
+        function pathList(boxes) {
             var names = [];
-            for (var n = 0; n < boxes.length && n < 25; n++) names.push(boxes[n].name);
+            for (var n = 0; n < boxes.length && n < 25; n++) names.push(boxes[n].path);
             if (boxes.length > names.length) names.push('...');
             return names.join(', ');
         }
+        function pathsOf(boxes) {
+            var names = [];
+            for (var n = 0; n < boxes.length; n++) names.push('"' + boxes[n].path + '"');
+            return names.join(' and ');
+        }
+        function pick(boxes, where) {
+            var exact = [], leaf = [];
+            for (var i = 0; i < boxes.length; i++) {
+                if (boxes[i].element === null) continue;
+                if (boxes[i].path.toLowerCase() === wantName) exact.push(boxes[i]);
+                else if (boxes[i].name.toLowerCase() === wantName) leaf.push(boxes[i]);
+            }
+            if (exact.length === 1) return exact[0];
+            // Mail cannot produce two mailboxes at the same path -- siblings
+            // are unique and `/` is its own separator -- so this is here
+            // because refusing costs nothing and resolving it would be a guess.
+            if (exact.length > 1) {
+                throw new Error(where + ' has ' + exact.length + ' mailboxes at the path "\(escapedMailbox)"; it is ambiguous and nothing was done');
+            }
+            if (leaf.length === 1) return leaf[0];
+            if (leaf.length > 1) {
+                throw new Error(where + ' has ' + leaf.length + ' mailboxes named "\(escapedMailbox)": ' + pathsOf(leaf)
+                    + '. Name the one you mean by its full path -- nothing was done');
+            }
+            throw new Error(where + ' has no mailbox named "\(escapedMailbox)"; it has: ' + pathList(boxes));
+        }
         if (wantAcct !== null && ('' + wantAcct).toLowerCase() !== 'on my mac') {
-            var accts = boundByName(mail.accounts);
+            var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             for (var a = 0; a < accts.length; a++) {
                 if (accts[a].name.toLowerCase() === ('' + wantAcct).toLowerCase()) {
-                    var boxes = boundByName(accts[a].element.mailboxes);
-                    var hit = pick(boxes);
-                    if (hit) { \(varName)Account = accts[a].name; return hit.element; }
-                    throw new Error('account "' + accts[a].name + '" has no mailbox named "\(escapedMailbox)"; it has: ' + nameList(boxes));
+                    var boxes = boundByNameOrThrow(accts[a].element.mailboxes, 'the mailbox list of account "' + accts[a].name + '"');
+                    var hit = pick(boxes, 'account "' + accts[a].name + '"');
+                    \(varName)Account = accts[a].name;
+                    \(varName)Path = hit.path;
+                    return hit.element;
                 }
             }
             throw new Error('account not found: ' + wantAcct);
         }
-        var localBoxes = boundByName(mail.mailboxes);
-        var localHit = pick(localBoxes);
-        if (localHit) { \(varName)Account = 'On My Mac'; return localHit.element; }
-        throw new Error('no mailbox named "\(escapedMailbox)" in On My Mac; it has: ' + nameList(localBoxes));
+        var localBoxes = boundByNameOrThrow(mail.mailboxes, 'the mailbox list of On My Mac');
+        var localHit = pick(localBoxes, 'On My Mac');
+        \(varName)Account = 'On My Mac';
+        \(varName)Path = localHit.path;
+        return localHit.element;
     })();
     """
     }
 
-    /// Returns JXA snippets to set the sender address. `from` takes precedence over `account` lookup.
-    private static func senderJXA(from: String?, account: String?) -> (lines: String, prop: String) {
+    /// Returns JXA that resolves the sender address, plus the assignment that
+    /// puts it on the message. `from` takes precedence over `account`.
+    ///
+    /// **Both forms are checked against the accounts Mail actually holds, and
+    /// both refuse rather than fall back.** `from` used to be passed straight
+    /// through to `msg.sender`, and Mail does not reject an address no account
+    /// owns -- it quietly sends from the default account instead. A send with
+    /// `from: "nosuch@relaytest.local"` therefore returned `{"status":
+    /// "sent"}` and went out as `From: Alice Tester <alice@relaytest.local>`,
+    /// Return-Path `alice@`, filed in Alice's Sent: a caller asking to send as
+    /// one identity sent as another, with nothing in the response saying so
+    /// and the message already gone. The `account` form has always thrown
+    /// `account not found` for the same class of mistake; this is that
+    /// refusal, for the other argument.
+    ///
+    /// The check runs **before** `mail.OutgoingMessage` is created, so a
+    /// rejected sender leaves nothing behind at all -- no compose message, and
+    /// therefore no draft for Mail to autosave.
+    ///
+    /// `emailAddresses()` is the right set to check against because it holds
+    /// every address an account can send as, aliases included. A display name
+    /// is allowed (`"A Tester" <alice@…>`): the address is what is matched,
+    /// and the whole string is what is assigned, which is the form Mail wants.
+    ///
+    /// `senderAddr` is defined on every path, `null` when the caller named no
+    /// sender, because `preSendGuardJXA` reads it back.
+    ///
+    /// Not private: whether an unowned sender is refused is a property of the
+    /// generated script, and only running it can pin it.
+    static func senderJXA(from: String?, account: String?) -> (lines: String, prop: String) {
         if let from = from {
             let escapedFrom = escapeJSString(from)
-            return ("var senderAddr = '\(escapedFrom)';", "msg.sender = senderAddr;")
+            let wanted = escapeJSString(parseAddress(from).address.lowercased())
+            let lines = """
+            var senderAddr = (function() {
+                var want = '\(wanted)';
+                var known = [];
+                var accts = mail.accounts();
+                for (var i = 0; i < accts.length; i++) {
+                    var addrs = [];
+                    try { addrs = accts[i].emailAddresses(); } catch (e) { addrs = []; }
+                    for (var a = 0; a < addrs.length; a++) {
+                        var one = ('' + addrs[a]).trim();
+                        if (one.length === 0) continue;
+                        known.push(one);
+                        if (one.toLowerCase() === want) return '\(escapedFrom)';
+                    }
+                }
+                throw new Error('no account in Mail sends as "' + want + '", and Mail does not refuse an unknown sender -- it sends from the default account instead, so this would have gone out as someone else. Nothing was composed. Mail can send as: '
+                    + (known.length ? known.join(', ') : '(no account has an address)'));
+            })();
+            """
+            return (lines, "msg.sender = senderAddr;")
         }
         if let account = account {
             let escapedAccount = escapeJSString(account)
@@ -1148,7 +1463,11 @@ enum MailService {
             """
             return (lines, "msg.sender = senderAddr;")
         }
-        return ("", "")
+        // No sender named: Mail uses its default account, which is the right
+        // answer for a caller with one account. `senderAddr` is still declared
+        // so the guard has something to read, and the account the message
+        // really went out from is reported back either way.
+        return ("var senderAddr = null;", "")
     }
 
     // MARK: - Tool Handlers
@@ -1175,54 +1494,66 @@ enum MailService {
     /// The entry is emitted whether or not there are any: "this account holds no
     /// mailboxes" is an answer, and omitting it puts a caller back to having to
     /// know the name before they can ask.
+    ///
+    /// **What it lists are paths.** Mail flattens the tree and reports leaf
+    /// names, so this used to answer with `Archive, ..., Archive` and
+    /// `Drafts, ..., Drafts` — two entries a caller cannot tell apart, for two
+    /// different mailboxes — beside a `Sub` and an `L4` that no other tool
+    /// would resolve, because a bare leaf name reaches a nested mailbox only
+    /// when it is the only one of its kind. Every name here is now the string
+    /// that identifies the mailbox and that every other mail tool accepts as
+    /// `mailbox`, `source_mailbox` or `target_mailbox`.
     private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
         let account = args?["account"]?.stringValue
-        let localNames = """
-        var localNames = [];
-        (function() {
-            var boxes = mail.mailboxes.name();
-            for (var i = 0; i < boxes.length; i++) localNames.push('' + boxes[i]);
-        })();
+        // One bulk build per collection rather than a `mailboxes[i].name()`
+        // walk. The walk was one Apple Event per mailbox -- 436ms against 15ms
+        // for Bob's 30 -- and it had no try/catch, so a mailbox vanishing
+        // mid-walk cost the caller the whole listing including the accounts
+        // already enumerated.
+        let pathsOf = """
+        function pathsOf(collection) {
+            var bound = boundByName(collection);
+            if (bound === null) throw new Error('the mailbox list kept changing while it was being read; try again in a moment');
+            var out = [];
+            for (var i = 0; i < bound.length; i++) out.push(bound[i].path);
+            return out;
+        }
         """
         let script: String
         if let account, isLocalAccount(account) {
             script = """
             var mail = Application('Mail');
-            \(localNames)
-            JSON.stringify(localNames);
+            \(boundByNameJXA)
+            \(pathsOf)
+            JSON.stringify(pathsOf(mail.mailboxes));
             """
         } else if let account {
             let escaped = escapeJSString(account)
             script = """
             var mail = Application('Mail');
-            var accts = mail.accounts();
-            var acct = null;
-            for (var i = 0; i < accts.length; i++) {
-                if (accts[i].name().toLowerCase() === '\(escaped)'.toLowerCase()) { acct = accts[i]; break; }
-            }
-            if (!acct) throw new Error('account not found: \(escaped)');
-            var mailboxes = acct.mailboxes();
-            var names = [];
-            for (var i = 0; i < mailboxes.length; i++) {
-                names.push(mailboxes[i].name());
-            }
-            JSON.stringify(names);
+            \(boundByNameJXA)
+            \(pathsOf)
+            (function() {
+                var accts = boundByNameOrThrow(mail.accounts, 'the account list');
+                for (var i = 0; i < accts.length; i++) {
+                    if (accts[i].name.toLowerCase() === '\(escaped)'.toLowerCase()) {
+                        return JSON.stringify(pathsOf(accts[i].element.mailboxes));
+                    }
+                }
+                throw new Error('account not found: \(escaped)');
+            })();
             """
         } else {
             script = """
             var mail = Application('Mail');
-            var accts = mail.accounts();
+            \(boundByNameJXA)
+            \(pathsOf)
+            var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             var results = [];
             for (var i = 0; i < accts.length; i++) {
-                var mboxes = accts[i].mailboxes();
-                var names = [];
-                for (var j = 0; j < mboxes.length; j++) {
-                    names.push(mboxes[j].name());
-                }
-                results.push({account: accts[i].name(), mailboxes: names});
+                results.push({account: accts[i].name, mailboxes: pathsOf(accts[i].element.mailboxes)});
             }
-            \(localNames)
-            results.push({account: '\(escapeJSString(localAccountName))', mailboxes: localNames});
+            results.push({account: '\(escapeJSString(localAccountName))', mailboxes: pathsOf(mail.mailboxes)});
             JSON.stringify(results);
             """
         }
@@ -1263,6 +1594,7 @@ enum MailService {
         ]
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
         if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
+        if !outcome.excluded.isEmpty { payload["excluded_mailboxes"] = outcome.excluded }
         if let note = outcome.incompleteNote { payload["note"] = note }
         return jsonResult(payload)
     }
@@ -1406,10 +1738,27 @@ enum MailService {
         var payload = message
         payload["fidelity"] = fidelity.dict
 
-        var attachments = fidelity.complete
-            ? declaredAttachmentTypes(listedByMail, source: source)
-            : listedByMail.map(withFilenameGuess)
-        let missed = fidelity.complete ? attachmentsMailDidNotList(listedByMail, source: source) : []
+        // Parsed once and handed to both readers below. It used to be parsed
+        // twice, which on a 70 MB source is not free, and the two could not have
+        // disagreed about the message's structure without disagreeing silently.
+        //
+        // `structure` reports what the reader could and could not read, on the
+        // same principle as `fidelity` beside it: a message whose parts nest
+        // deeper than `MIME.maxDepth` yields a *shorter* attachment list, and a
+        // short list is indistinguishable from a message with fewer
+        // attachments. It appears only on the complete path because that is the
+        // only path on which anything was parsed -- an incomplete fetch reports
+        // Mail's own list, and `omitted` already covers it.
+        var attachments: [[String: Any]]
+        var missed: [[String: Any]] = []
+        if fidelity.complete {
+            let parsed = MIME.parseReporting(source)
+            payload["structure"] = parsed.report.dict
+            attachments = declaredAttachmentTypes(listedByMail, parsed: parsed.part)
+            missed = attachmentsMailDidNotList(listedByMail, parsed: parsed.part)
+        } else {
+            attachments = listedByMail.map(withFilenameGuess)
+        }
         attachments += missed
         if !missed.isEmpty {
             payload["attachments_note"] = "\(missed.count) attachment(s) here are declared by the message but are not in Mail's own list for it, which is what mail_save_attachment reads and Mail can leave empty for good once a message has been read while it was still downloading. They carry listed_by_mail: false, and size is the decoded size of the part."
@@ -1449,12 +1798,19 @@ enum MailService {
         _ listedByMail: [[String: Any]],
         source: Data
     ) -> [[String: Any]] {
+        attachmentsMailDidNotList(listedByMail, parsed: MIME.parse(source))
+    }
+
+    static func attachmentsMailDidNotList(
+        _ listedByMail: [[String: Any]],
+        parsed: MIME.Part
+    ) -> [[String: Any]] {
         func key(_ name: Any?) -> String { (name as? String ?? "").lowercased() }
         var listed: [String: Int] = [:]
         for attachment in listedByMail { listed[key(attachment["name"]), default: 0] += 1 }
 
         var out: [[String: Any]] = []
-        for part in MIME.attachments(of: MIME.parse(source)) where !part.inline {
+        for part in MIME.attachments(of: parsed) where !part.inline {
             if let count = listed[part.name.lowercased()], count > 0 {
                 listed[part.name.lowercased()] = count - 1
                 continue
@@ -1511,8 +1867,15 @@ enum MailService {
         _ attachments: [[String: Any]],
         source: Data
     ) -> [[String: Any]] {
+        declaredAttachmentTypes(attachments, parsed: MIME.parse(source))
+    }
+
+    static func declaredAttachmentTypes(
+        _ attachments: [[String: Any]],
+        parsed: MIME.Part
+    ) -> [[String: Any]] {
         var declared: [String: [String]] = [:]
-        for part in MIME.attachments(of: MIME.parse(source)) {
+        for part in MIME.attachments(of: parsed) {
             declared[part.name.lowercased(), default: []].append(part.mimeType)
         }
         return attachments.map { attachment in
@@ -1555,13 +1918,17 @@ enum MailService {
 var WANT = [\(wantedLiteral)];
 var mb = (function() {
     var boxes = [];
-    var accts = boundByName(mail.accounts);
+    var accts = boundByNameOrThrow(mail.accounts, 'the account list');
     for (var i = 0; i < accts.length; i++) {
-        if (accts[i].name === '\(escapedAccount)') { boxes = boundByName(accts[i].element.mailboxes); break; }
+        if (accts[i].name === '\(escapedAccount)') { boxes = boundByNameOrReport(accts[i].element.mailboxes, accts[i].name); break; }
     }
-    if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = boundByName(mail.mailboxes);
+    if (boxes.length === 0 && '\(escapedAccount)' === 'On My Mac') boxes = boundByNameOrReport(mail.mailboxes, 'On My Mac');
+    // The mailbox comes from a row this pass is following up, and a row is
+    // stamped with the mailbox's **path**. Matching the leaf name here would
+    // reach whichever `Archive` came first, which is a different mailbox from
+    // the one the row came out of.
     for (var j = 0; j < boxes.length; j++) {
-        if (boxes[j].name === '\(escapedMailbox)') return boxes[j].element;
+        if (boxes[j].element !== null && boxes[j].path === '\(escapedMailbox)') return boxes[j].element;
     }
     return null;
 })();
@@ -1572,7 +1939,7 @@ if (mb) {
         if (!isFinite(numeric)) continue;
         try {
             var m = mb.messages.byId(numeric);
-            if (('' + m.mailbox.name()) !== '\(escapedMailbox)') continue;
+            if (mbPathOf(m.mailbox) !== '\(escapedMailbox)') continue;
             out.push({id: WANT[i], body: '' + m.content()});
         } catch (e) {}
     }
@@ -1746,6 +2113,7 @@ JSON.stringify(out);
         if let bodyInfo { payload["body_search"] = bodyInfo }
         if !outcome.failed.isEmpty { payload["failed_accounts"] = outcome.failed }
         if !outcome.unstable.isEmpty { payload["unstable_mailboxes"] = outcome.unstable }
+        if !outcome.excluded.isEmpty { payload["excluded_mailboxes"] = outcome.excluded }
         if let note = outcome.incompleteNote { payload["note"] = note }
         return jsonResult(payload)
     }
@@ -1883,23 +2251,76 @@ JSON.stringify(out);
         """
     }
 
-    /// JXA that refuses to hand the message on unless it is addressed to
-    /// exactly who the caller asked for.
+    /// JXA that refuses to hand the message on unless Mail holds exactly the
+    /// message the caller asked for: the same recipients, the same subject and
+    /// the same sender.
     ///
-    /// This is the last line of defence against sending to the wrong person.
-    /// It has already happened once: with several compose windows open, the
-    /// reference returned by `OutgoingMessage()` bound to a pre-existing window
-    /// instead of the new message, and `send()` delivered that window's
-    /// recipient. `resolveOutgoingJXA` should make that impossible, but the
-    /// cost of being wrong is mail leaving the machine, so what Mail actually
-    /// holds is read back and compared before anything is sent or saved.
-    private static func recipientGuardJXA(to: [String], cc: [String], bcc: [String], subject: String) -> String {
+    /// This is the last line of defence against mail leaving the machine as
+    /// something other than what was requested, and both halves of that have
+    /// happened. With several compose windows open, the reference returned by
+    /// `OutgoingMessage()` bound to a pre-existing window instead of the new
+    /// message and `send()` delivered that window's recipient;
+    /// `resolveOutgoingJXA` should make that impossible, but the cost of being
+    /// wrong is a message that cannot be recalled. And a `from` naming an
+    /// address no account owns used to be accepted in silence, Mail
+    /// substituting its default account -- so the sender is read back here
+    /// too, not only validated up front. What Mail holds is the evidence;
+    /// what was asked for is only the request.
+    ///
+    /// **The abort names the field that differed.** It used to render the two
+    /// recipient lists whatever the mismatch was, so a subject carrying a CR
+    /// (Mail normalises it to a space, correctly tripping the guard) aborted
+    /// with two *identical* recipient lists printed side by side -- reading
+    /// like a recipient-tampering alarm, which is the scariest false positive
+    /// this guard can raise.
+    ///
+    /// **And it does not claim more than it knows.** The tail sentence comes
+    /// from `composeLeftBehind` when compose defines it, because Mail
+    /// autosaves the message being composed and `close({saving: 'no'})` does
+    /// not remove a copy already written: "Nothing was sent or saved" was
+    /// false every time this fired. Standing alone -- which is how the tests
+    /// run it -- it says only that nothing was sent, which is always true at
+    /// this point.
+    ///
+    /// Not private: this is the guard, and a guard that has never been run
+    /// against a message it should refuse is not known to work.
+    static func preSendGuardJXA(
+        to: [String],
+        cc: [String],
+        bcc: [String],
+        subject: String,
+        from: String?,
+        account: String?
+    ) -> String {
         let expected = (to + cc + bcc)
             .map { parseAddress($0).address.lowercased() }
             .map { "'\(escapeJSString($0))'" }
             .joined(separator: ", ")
+        // What the sender is expected to be. A `from` is known here in full. An
+        // `account` resolves to an address only at run time, in `senderAddr`,
+        // which `senderJXA` has already defined by the time this runs. Naming
+        // neither leaves nothing to check: Mail's default account is a correct
+        // answer to a request that expressed no preference, and the address it
+        // chose is reported in the result instead.
+        let expectedSender: String
+        if let from {
+            expectedSender = "'\(escapeJSString(parseAddress(from).address.lowercased()))'"
+        } else if account != nil {
+            expectedSender = "(typeof senderAddr === 'undefined' || senderAddr === null) ? null : mailAddressOf(senderAddr)"
+        } else {
+            expectedSender = "null"
+        }
         return """
         (function() {
+            // Mail hands back a sender as `Display Name <addr>` or as a bare
+            // address depending on how the account is configured, so the
+            // address is what is compared.
+            function mailAddressOf(v) {
+                var s = ('' + (v == null ? '' : v)).trim();
+                var lt = s.lastIndexOf('<'), gt = s.lastIndexOf('>');
+                if (lt >= 0 && gt > lt) s = s.slice(lt + 1, gt).trim();
+                return s.toLowerCase();
+            }
             function addressesOf(list) {
                 var out = [];
                 for (var i = 0; i < list.length; i++) {
@@ -1915,14 +2336,354 @@ JSON.stringify(out);
             var expected = [\(expected)];
             var missing = expected.filter(function(a) { return actual.indexOf(a) === -1; });
             var extra = actual.filter(function(a) { return expected.indexOf(a) === -1; });
-            var wrongSubject = ('' + msg.subject()) !== '\(escapeJSString(subject))';
-            if (missing.length || extra.length || wrongSubject) {
+            var wantSubject = '\(escapeJSString(subject))';
+            var gotSubject = '' + msg.subject();
+            var wantSender = \(expectedSender);
+            var gotSender = null;
+            try { gotSender = mailAddressOf(msg.sender()); } catch (e) { gotSender = null; }
+
+            var problems = [];
+            if (missing.length || extra.length) {
+                problems.push('Mail has it addressed to [' + actual.join(', ')
+                    + '] rather than [' + expected.join(', ') + ']');
+            }
+            if (gotSubject !== wantSubject) {
+                problems.push('Mail has the subject as "' + gotSubject + '" rather than "' + wantSubject + '"');
+            }
+            if (wantSender !== null && gotSender !== wantSender) {
+                problems.push('Mail would send it from ' + (gotSender ? gotSender : '(no sender)')
+                    + ' rather than ' + wantSender);
+            }
+            if (problems.length) {
+                // Close first, then say what is there: closing stops Mail
+                // writing any further copy, so what Drafts holds afterwards is
+                // final rather than a value that can still change.
                 try { msg.close({saving: 'no'}); } catch (e) {}
-                throw new Error('aborted before sending: Mail has this message addressed to ['
-                    + actual.join(', ') + '] with subject "' + msg.subject() + '", not ['
-                    + expected.join(', ') + ']. Nothing was sent or saved.');
+                var tail = (typeof composeLeftBehind === 'function')
+                    ? composeLeftBehind()
+                    : 'Nothing was sent.';
+                throw new Error('aborted before sending: ' + problems.join('; ') + '. ' + tail);
             }
         })();
+        """
+    }
+
+    /// JXA that owns the draft Mail writes behind a compose message's back.
+    ///
+    /// Mail autosaves whatever it is composing. A message typed by hand has
+    /// that copy removed when its window closes; `visible: false` plus a
+    /// scripted `send()` means the close never happens, so **every** send left
+    /// a permanent full copy -- body, recipients, subject, and an
+    /// `X-Apple-Auto-Saved: 1` header -- in the sending account's Drafts.
+    /// Three copies on disk per send instead of two, Alice's Drafts going
+    /// 13 -> 14 -> 15 across two sends, in a folder `mailbox: "all"` excludes,
+    /// so no tool here would have shown a caller it happened. The abort path
+    /// was worse: it already called `close({saving: 'no'})` and told the
+    /// caller "Nothing was sent or saved" while the draft -- carrying the very
+    /// recipient the guard had just refused -- sat on the server.
+    ///
+    /// Three measurements against Mail 16.0 on the fixture shape this, and the
+    /// design follows from them rather than from guessing:
+    ///
+    /// * `send()` and `save()` each clear the autosaved copy that exists at
+    ///   that moment, and Mail writes a **new** one for the message that is
+    ///   still open a few seconds later (the leaked draft's own `Date` header
+    ///   was 7s *after* the sent copy's). Closing the message stops that: a
+    ///   send followed immediately by `close({saving: 'no'})` left Drafts
+    ///   unchanged at 20 while delivering the message and filing it in Sent.
+    /// * `close({saving: 'no'})` prevents any further autosave but does
+    ///   **not** delete one already written. A compose message left open for
+    ///   14s autosaved at ~0.3s, and closing it afterwards left the draft
+    ///   exactly where it was. That is why the abort path leaked despite
+    ///   already closing, and it is why closing alone is not the whole fix.
+    /// * A draft saved on purpose carries no `X-Apple-Auto-Saved` header and
+    ///   an autosaved one always does, so the two can be told apart. Verified
+    ///   across 22 drafts on the fixture: every deliberate `mail.save` draft
+    ///   lacked it, every leaked one had it.
+    ///
+    /// So compose closes the message it opened, and then **checks**. The check
+    /// is not decoration: it is what turns "closing prevents the leak" from
+    /// something believed into something established on each call, and it is
+    /// the only thing that can clean up the abort path, where the copy already
+    /// exists by the time anything goes wrong.
+    ///
+    /// A draft is removed only when all three of these hold, because the
+    /// alternative to being sure is deleting a draft the user wrote:
+    ///
+    /// 1. its id was **not** in that account's Drafts before the compose
+    ///    message was created (the snapshot below, taken first for that
+    ///    reason),
+    /// 2. its subject is this message's subject, and
+    /// 3. it carries `X-Apple-Auto-Saved`.
+    ///
+    /// `mail.delete` moves the draft to Trash rather than erasing it, and the
+    /// result says so -- reporting a removal as more final than it is would be
+    /// the same kind of claim this exists to stop making.
+    ///
+    /// Not private: what the sweep will and will not delete is the whole of
+    /// its correctness, and it is generated JavaScript, so it is pinned by
+    /// running it.
+    static func composeDraftHygieneJXA(subject: String) -> String {
+        """
+        var COMPOSE_SUBJECT = '\(escapeJSString(subject))';
+        function mailAddressOf(v) {
+            var s = ('' + (v == null ? '' : v)).trim();
+            var lt = s.lastIndexOf('<'), gt = s.lastIndexOf('>');
+            if (lt >= 0 && gt > lt) s = s.slice(lt + 1, gt).trim();
+            return s.toLowerCase();
+        }
+        function composeAccounts() {
+            var out = [];
+            try {
+                var accts = mail.accounts();
+                for (var i = 0; i < accts.length; i++) out.push(accts[i]);
+            } catch (e) {}
+            return out;
+        }
+        // The account's own Drafts. A bare name is a path with one component,
+        // so `byName('Drafts')` reaches the mailbox at the root rather than a
+        // project folder that happens to be called Drafts -- one Apple Event,
+        // and Mail's own reading of the string. The full path build is the
+        // fallback for an account that does not answer to it, and costs
+        // nothing until then.
+        function composeDraftsBox(acct) {
+            try {
+                var direct = acct.mailboxes.byName('Drafts');
+                if (direct.exists() === true) return direct;
+            } catch (e) {}
+            var bound = null;
+            try { bound = boundByName(acct.mailboxes); } catch (e) { bound = null; }
+            if (bound === null) return null;
+            for (var i = 0; i < bound.length; i++) {
+                if (bound[i].element !== null && ('' + bound[i].path).toLowerCase() === 'drafts') return bound[i].element;
+            }
+            return null;
+        }
+        // Taken before the compose message exists, which is the only moment at
+        // which "this draft is not ours" can be established. One bulk id
+        // column per account.
+        var COMPOSE_DRAFTS_BEFORE = (function() {
+            var snap = [];
+            var accts = composeAccounts();
+            for (var i = 0; i < accts.length; i++) {
+                var name = null;
+                try { name = '' + accts[i].name(); } catch (e) { continue; }
+                var box = composeDraftsBox(accts[i]);
+                if (box === null) { snap.push({account: name, box: null, ids: null}); continue; }
+                var ids = null;
+                try { ids = box.messages.id(); } catch (e) { ids = null; }
+                var seen = null;
+                if (ids !== null) {
+                    seen = Object.create(null);
+                    for (var k = 0; k < ids.length; k++) seen['' + ids[k]] = true;
+                }
+                snap.push({account: name, box: box, ids: seen});
+            }
+            return snap;
+        })();
+        // Which account Mail is actually sending from, read off the message
+        // rather than off the request. With no `from` and no `account` this is
+        // the only way to know, and it is what tells the sweep and the saved
+        // draft lookup where to look.
+        function composeResolveSenderAccount() {
+            var addr = null;
+            try { addr = mailAddressOf(msg.sender()); } catch (e) { addr = null; }
+            if (addr === null || addr.length === 0) return {address: null, account: null};
+            var accts = composeAccounts();
+            for (var i = 0; i < accts.length; i++) {
+                var addrs = [];
+                try { addrs = accts[i].emailAddresses(); } catch (e) { continue; }
+                for (var a = 0; a < addrs.length; a++) {
+                    if (('' + addrs[a]).trim().toLowerCase() === addr) {
+                        try { return {address: addr, account: '' + accts[i].name()}; } catch (e) { return {address: addr, account: null}; }
+                    }
+                }
+            }
+            return {address: addr, account: null};
+        }
+        // Everything the cleanup needs off the live message, taken while it is
+        // still open. Two reasons it cannot be left until afterwards. The
+        // abort path closes the message before it reports, and a closed
+        // message answers nothing. And the subject an autosaved copy carries
+        // is the one **Mail** holds, not the one that was asked for: a subject
+        // with a CR in it reaches Drafts with a space, so matching on the
+        // request alone found no copy and reported a leak as a clean abort --
+        // measured, 19 -> 20 drafts under "Nothing was sent or saved".
+        var COMPOSE_SENDER = {address: null, account: null};
+        var COMPOSE_SUBJECT_SEEN = null;
+        function composeObserve() {
+            COMPOSE_SENDER = composeResolveSenderAccount();
+            try { COMPOSE_SUBJECT_SEEN = '' + msg.subject(); } catch (e) { COMPOSE_SUBJECT_SEEN = null; }
+            return COMPOSE_SENDER;
+        }
+        function composeSubjectMatches(v) {
+            var got = '' + v;
+            return got === COMPOSE_SUBJECT
+                || (COMPOSE_SUBJECT_SEEN !== null && got === COMPOSE_SUBJECT_SEEN);
+        }
+        // The snapshot entry for one account, or null with `out.detail` saying
+        // why there is none.
+        function composeDraftEntry(acctName, out) {
+            if (acctName === null) {
+                out.detail = 'the account Mail composed from could not be identified, so its Drafts was not checked';
+                return null;
+            }
+            for (var i = 0; i < COMPOSE_DRAFTS_BEFORE.length; i++) {
+                if (('' + COMPOSE_DRAFTS_BEFORE[i].account).toLowerCase() === ('' + acctName).toLowerCase()) {
+                    var entry = COMPOSE_DRAFTS_BEFORE[i];
+                    out.account = entry.account;
+                    if (entry.box === null || entry.ids === null) {
+                        out.detail = 'the Drafts mailbox of account "' + entry.account + '" could not be read';
+                        return null;
+                    }
+                    return entry;
+                }
+            }
+            out.detail = 'account "' + acctName + '" was not in the account list when the message was created';
+            return null;
+        }
+        // The drafts in `entry` that were not there before this message was
+        // composed and that carry its subject. Returns null, with
+        // `out.detail`, if the mailbox would not hold still.
+        //
+        // Two columns, two Apple Events, walked by index -- so they are paired
+        // only if they came back the same length, the same rule the scan lives
+        // by. A mismatch would pair one message's id with another's subject,
+        // and this one deletes. It is not hypothetical: this runs moments
+        // after `send()`, which is itself removing the autosaved copy, and the
+        // first send measured against the fixture caught Drafts mid-change. So
+        // it is retried rather than abandoned -- the churn is Mail finishing
+        // what the send started, and it settles.
+        function composeNewMatchingDrafts(entry, out) {
+            var ids = null, subs = null;
+            for (var attempt = 0; attempt < \(findAttempts); attempt++) {
+                ids = null; subs = null;
+                try {
+                    ids = entry.box.messages.id();
+                    subs = entry.box.messages.subject();
+                } catch (e) {
+                    out.detail = 'the Drafts mailbox of account "' + entry.account + '" could not be read back: ' + e;
+                    return null;
+                }
+                if (ids.length === subs.length) break;
+                ids = null;
+                delay(0.4);
+            }
+            if (ids === null) {
+                out.detail = 'the Drafts mailbox of account "' + entry.account + '" kept changing while it was being read';
+                return null;
+            }
+            var hits = [];
+            for (var k = 0; k < ids.length; k++) {
+                if (entry.ids['' + ids[k]]) continue;
+                if (!composeSubjectMatches(subs[k])) continue;
+                var numeric = parseInt('' + ids[k], 10);
+                if (!isFinite(numeric)) continue;
+                hits.push({id: '' + ids[k], numeric: numeric});
+            }
+            return hits;
+        }
+        // Finds the copy Mail autosaved, and removes it **only when Mail has
+        // let go of the message it was composing**.
+        //
+        // `mayRemove` is that condition, and it is narrow on purpose. Measured
+        // against Mail 16.0: delete the autosaved draft of a compose message
+        // Mail still holds and Mail writes it straight back -- 3s later in one
+        // run, 12s in another, 15s in a third -- so the delete does not remove
+        // a copy, it adds one in Trash beside the copy that returns. That was
+        // watched happen end to end: an abort that deleted what it found
+        // reported "that copy has been moved to Trash" and Drafts went from 21
+        // to 22, one in Trash and a fresh one in Drafts, where doing nothing
+        // would have left exactly one.
+        //
+        // Closing first does not help -- closing stops Mail *updating* the
+        // draft, not re-creating one that has gone -- and neither does
+        // `mail.delete` on the outgoing message, nor setting it visible and
+        // closing it. Every sequence tried ends with one copy in Drafts.
+        // `send()` is the one thing that ends Mail's interest in the message,
+        // which is why a send followed immediately by a close leaves Drafts
+        // untouched, and why removing a leftover is sound only after one.
+        //
+        // So an abort deletes nothing, and there is a second reason not to:
+        // this guard fires when what Mail is holding is not what was asked
+        // for, which is the worst possible moment to start deleting things on
+        // the strength of having identified them. What it does instead is say
+        // what is there, which is all "Nothing was sent or saved" was ever
+        // standing in for.
+        // Of those, the ones Mail wrote by itself. Without the header a draft
+        // is one something else saved on purpose -- including the one
+        // `mail_create_draft` just asked for, which is new since the snapshot
+        // and carries the same subject -- and it is none of this code's
+        // business. Verified across the fixture's 22 drafts: every deliberate
+        // save lacks the header, every autosave has it.
+        function composeAutosavedOnly(entry, hits) {
+            var out = [];
+            for (var k = 0; k < hits.length; k++) {
+                var bound = entry.box.messages.byId(hits[k].numeric);
+                var headers = null;
+                try { headers = '' + bound.allHeaders(); } catch (e) { headers = null; }
+                if (headers === null || !/^X-Apple-Auto-Saved:/im.test(headers)) continue;
+                out.push({id: hits[k].id, element: bound});
+            }
+            return out;
+        }
+        function composeSweepDrafts(acctName, mayRemove) {
+            var out = {checked: false, removed: 0};
+            var entry = composeDraftEntry(acctName, out);
+            if (entry === null) return out;
+            var hits = composeNewMatchingDrafts(entry, out);
+            if (hits === null) return out;
+            var autosaved = composeAutosavedOnly(entry, hits);
+            out.checked = true;
+            out.found = autosaved.length;
+            var leftAlone = [];
+            var failures = [];
+            for (var k = 0; k < autosaved.length; k++) {
+                if (!mayRemove) { leftAlone.push(autosaved[k].id); continue; }
+                try { mail.delete(autosaved[k].element); out.removed++; }
+                catch (e) { failures.push('' + autosaved[k].id + ': ' + e); }
+            }
+            if (failures.length) out.not_removed = failures;
+            if (leftAlone.length) out.left_in_drafts = leftAlone;
+            if (out.found > 0) {
+                if (out.removed === out.found) {
+                    out.note = 'Mail autosaved a copy of this message while composing it; that copy has been moved to Trash';
+                } else if (!mayRemove) {
+                    out.note = 'Mail autosaved a copy of this message and it is still in Drafts. It is left alone deliberately: Mail re-creates the autosaved copy of a message it is still holding, so deleting it leaves two copies rather than none';
+                } else {
+                    out.note = 'Mail autosaved a copy of this message while composing it and it could not be removed; it is still in Drafts';
+                }
+            }
+            return out;
+        }
+        // The sentence the pre-send guard puts after what went wrong. It says
+        // what was left behind rather than asserting that nothing was.
+        var COMPOSE_SWEEP = null;
+        function composeLeftBehind() {
+            // Nothing is deleted here -- see composeSweepDrafts.
+            COMPOSE_SWEEP = composeSweepDrafts(COMPOSE_SENDER.account, false);
+            if (!COMPOSE_SWEEP.checked) {
+                return 'Nothing was sent. Mail autosaves the message it is composing, and whether it left a copy in Drafts could not be checked: '
+                    + COMPOSE_SWEEP.detail + '.';
+            }
+            // Never "nothing was saved". An abort is the one path that hands
+            // the message to Mail neither by sending it nor by saving it, so
+            // Mail keeps the compose message -- `close` does not remove it
+            // from `outgoingMessages` -- and autosaves it whenever its timer
+            // next comes round. That was measured at under a second on a Mail
+            // that had been running a while and at **30 seconds** on one just
+            // relaunched, which is long enough for this check to look, find
+            // nothing, and say so truthfully about a copy that then appears.
+            // What it can say is what it saw.
+            if (COMPOSE_SWEEP.found === 0) {
+                return 'Nothing was sent, and no draft was saved for it. Mail keeps a compose message it has been told to close, though, and autosaves it into Drafts on its own schedule -- within a second on a busy Mail, 30s on one just relaunched -- so a copy of this message may still appear in the Drafts of account "'
+                    + COMPOSE_SWEEP.account + '". None was there when this was checked.';
+            }
+            return 'Nothing was sent, but Mail had already autosaved a copy of this message in the Drafts of account "'
+                + COMPOSE_SWEEP.account + '" and it is still there (message id '
+                + (COMPOSE_SWEEP.left_in_drafts || []).join(', ')
+                + '). It is not deleted, because Mail re-creates the autosaved copy of a message it is still holding: deleting it would leave two copies rather than none.';
+        }
         """
     }
 
@@ -1951,15 +2712,30 @@ JSON.stringify(out);
     """
 
     /// Shared email composition: validates params, builds JXA, runs it.
+    ///
     /// `visible` controls whether a compose window opens. `finalAction` is the
     /// JXA run once the message is fully built, and must leave a `result`
-    /// object in scope for the caller to return.
+    /// object in scope for the caller to return. `afterClose` runs after the
+    /// compose message has been closed, for work that needs the *saved*
+    /// message rather than the one being composed.
     /// `postProcess` gets the decoded result payload before it is returned, so
     /// a caller can add to it something only a read-back can establish.
+    ///
+    /// **Compose owns the compose message from creation to close.** It is
+    /// created, used, closed, and then the account's Drafts is checked for the
+    /// copy Mail autosaves behind its back -- see `composeDraftHygieneJXA` for
+    /// why each of those steps is there and what was measured to put it there.
+    /// The order is deliberate at both ends: the sender is validated and the
+    /// Drafts snapshot taken **before** `mail.OutgoingMessage` exists, so a
+    /// request that is going to be refused creates nothing at all; and the
+    /// close comes immediately after the send or save, before anything slow,
+    /// because everything between them is time in which Mail can autosave.
     private static func composeEmail(
         _ args: JSONObject?,
         visible: Bool,
         finalAction: String,
+        disposesMessage: Bool,
+        afterClose: String = "",
         postProcess: (([String: Any]) -> [String: Any])? = nil
     ) -> MCPCallResult {
         let to = recipientList(args?["to"])
@@ -2009,7 +2785,7 @@ JSON.stringify(out);
             visibleTextLength(inHTML: html) == 0 ? "" : """
             if (renderedChars === 0) {
                 try { msg.close({saving: 'no'}); } catch (e) {}
-                throw new Error('Mail produced an empty body from html_body — this build of Mail no longer accepts HTML. Resend using body instead.');
+                throw new Error('Mail produced an empty body from html_body — this build of Mail no longer accepts HTML. Resend using body instead. ' + composeLeftBehind());
             }
             """
         } ?? ""
@@ -2017,7 +2793,9 @@ JSON.stringify(out);
         let script = """
         ObjC.import('Foundation');
         var mail = Application('Mail');
+        \(boundByNameJXA)
         \(senderSnippet.lines)
+        \(composeDraftHygieneJXA(subject: subject))
         var draft = mail.OutgoingMessage({
             subject: '\(escapeJSString(subject))',
             \(contentProp)\(visibleProp)
@@ -2027,6 +2805,10 @@ JSON.stringify(out);
         \(recipientLines)
         \(senderSnippet.prop)
         \(attachmentsJXA(attachments))
+        // Read off the live message, before anything can close it: which
+        // identity Mail is really sending as, and the subject Mail really
+        // holds. Both are what the cleanup and the result are then built from.
+        composeObserve();
         // Whitespace is stripped before counting, so this is not the body's
         // length -- 'just one line here' reports 15, not 18. It is deliberate:
         // the question it answers is "did Mail render anything visible", and
@@ -2037,14 +2819,47 @@ JSON.stringify(out);
         var renderedChars = 0;
         try { renderedChars = ('' + msg.content()).replace(/\\s+/g, '').length; } catch (e) {}
         \(htmlGuard)
-        \(recipientGuardJXA(to: to, cc: cc, bcc: bcc, subject: subject))
+        \(preSendGuardJXA(
+            to: to,
+            cc: cc,
+            bcc: bcc,
+            subject: subject,
+            from: args?["from"]?.stringValue,
+            account: args?["account"]?.stringValue
+        ))
+        // With neither `from` nor `account` given this is the only thing that
+        // says which identity the message went out as, and it is what points
+        // the Drafts sweep and the saved-draft lookup at the right account.
+        var composeSenderAccount = COMPOSE_SENDER.account;
         var result = {
             recipients: {to: \(to.count), cc: \(cc.count), bcc: \(bcc.count)},
             attachments: \(attachments.count),
             content_type: '\(htmlBody != nil ? "html" : "text")',
-            rendered_chars: renderedChars
+            rendered_chars: renderedChars,
+            from: COMPOSE_SENDER.address,
+            account: composeSenderAccount
         };
         \(finalAction)
+        // Close the moment the send or save is done, with **nothing** in
+        // between. Mail writes an autosaved copy of the message it is still
+        // holding a few seconds after a send -- the leaked draft's own Date
+        // header was 7s after the sent copy's -- and closing is what stops it.
+        // The width of this gap is the whole of the fix: a send followed
+        // immediately by this close left Drafts unchanged across two sends on
+        // the fixture, and putting the Drafts check in the gap instead (a
+        // second or so of Apple Events) was enough to let the copy through
+        // again, once for Alice and once for Bob.
+        try { msg.close({saving: 'no'}); } catch (e) {}
+        // Then account for it, which is now a reading taken after Mail has
+        // been told to stop. Reported unconditionally, found or not: a leaked
+        // draft is invisible to every other tool here -- `mailbox: "all"`
+        // excludes Drafts -- so "there was none" and "nobody looked" have to
+        // be told apart in the result rather than inferred from a missing
+        // field.
+        result.autosaved_draft = COMPOSE_SWEEP === null
+            ? composeSweepDrafts(composeSenderAccount, \(disposesMessage))
+            : COMPOSE_SWEEP;
+        \(afterClose)
         JSON.stringify(result);
         """
         // Composing has no scope: the message is the message.
@@ -2133,17 +2948,24 @@ JSON.stringify(out);
     }
 
     /// The first `text/plain` part that is a body rather than an attachment.
-    private static func firstPlainTextPart(of part: MIME.Part) -> Data? {
-        if part.isMultipart {
-            for child in part.parts {
-                if let hit = firstPlainTextPart(of: child) { return hit }
+    ///
+    /// Iterative, like `MIME.attachments(of:)` and for the same reason: a walk
+    /// that recurses over a tree whose depth the sender chose is a way to
+    /// exhaust the stack, and this one is reached from a compose path that can
+    /// be handed back a message someone else wrote.
+    private static func firstPlainTextPart(of root: MIME.Part) -> Data? {
+        var stack: [MIME.Part] = [root]
+        while let part = stack.popLast() {
+            if part.isMultipart {
+                stack.append(contentsOf: part.parts.reversed())
+                continue
             }
-            return nil
+            guard part.contentType == "text/plain",
+                  part.filename == nil,
+                  part.disposition != "attachment" else { continue }
+            return part.decodedBody
         }
-        guard part.contentType == "text/plain",
-              part.filename == nil,
-              part.disposition != "attachment" else { return nil }
-        return part.decodedBody
+        return nil
     }
 
     /// Composed invisibly on purpose. Composing with `visible: true` puts a real
@@ -2152,11 +2974,20 @@ JSON.stringify(out);
     /// send once went out to the recipient of an unrelated window the user had
     /// open, rather than the address that was passed in. Nothing is gained by
     /// the window: `send` needs no UI.
+    ///
+    /// The close that `composeEmail` runs straight after this is what stops
+    /// the send leaving a full copy of the message in Drafts. `visible: false`
+    /// is what made it necessary -- there is no window whose closing would
+    /// have done it -- so the two go together, and neither can be dropped in
+    /// favour of the other.
     private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
+        // `disposesMessage: true`: after `send()` Mail has let go of the
+        // compose message, which is the one state in which removing a leftover
+        // autosaved copy sticks rather than provoking another.
         composeEmail(args, visible: false, finalAction: """
         msg.send();
         result.status = 'sent';
-        """)
+        """, disposesMessage: true)
     }
 
     /// After saving, the draft is looked up and its identifiers returned.
@@ -2181,23 +3012,57 @@ JSON.stringify(out);
     /// message rather than out of a third column, which is one Apple Event
     /// fewer and one fewer thing to zip by index.
     ///
+    /// **A caller who named neither `account` nor `from` gets an answer too.**
+    /// The walk used to admit an account only when its name matched `account`
+    /// or one of its addresses matched `from`; with both null nothing could
+    /// ever match, so `savedDraft` came back null and `mail_create_draft`
+    /// answered `{"status": "draft created", "draft": null}` with no
+    /// `body_check` at all -- on the **default** path, which is what a caller
+    /// with one account uses. The draft was written; its `text/plain` part was
+    /// empty, which is exactly the failure `body_check` exists to report.
+    ///
+    /// Two things scope it instead. `composeSenderAccount`, when compose has
+    /// defined it, is the account Mail said it was sending from, read off the
+    /// message -- an answer rather than a guess. Failing that the search is
+    /// unscoped, which is right for the request that named no scope: the draft
+    /// is looked for wherever it is, and the subject plus the read-back off
+    /// the bound message is still what decides.
+    ///
+    /// `includeHelpers` is false where the caller has already emitted
+    /// `boundByNameJXA` -- compose has, since its Drafts snapshot needs it.
+    ///
     /// Not private: this is the fourth place the same positional binding was
     /// found, and it can only be pinned by running it against a mailbox that
     /// changes between two column fetches.
-    static func savedDraftLookupJXA(account: String?, from: String?, subject: String) -> String {
+    static func savedDraftLookupJXA(
+        account: String?,
+        from: String?,
+        subject: String,
+        includeHelpers: Bool = true
+    ) -> String {
         let acctExpr = account.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
         let fromExpr = from.map { "'\(escapeJSString($0))'.toLowerCase()" } ?? "null"
         return """
-\(boundByNameJXA)
+\(includeHelpers ? boundByNameJXA : "")
 var savedDraft = (function() {
     var wantAcct = \(acctExpr);
     var wantFrom = \(fromExpr);
     var SUBJECT = '\(escapeJSString(subject))';
+    // Nothing was named, so ask the message. `composeSenderAccount` is the
+    // account Mail reported as the sender of the message that was just saved;
+    // outside compose there is no such variable and the search stays unscoped.
+    if (wantAcct === null && wantFrom === null
+            && typeof composeSenderAccount !== 'undefined' && composeSenderAccount) {
+        wantAcct = ('' + composeSenderAccount).toLowerCase();
+    }
+    // With no scope of any kind, every account is a candidate. Returning null
+    // instead is what cost the default path its draft id and its body_check.
+    var unscoped = wantAcct === null && wantFrom === null;
     try {
-        var accts = boundByName(mail.accounts);
+        var accts = boundByNameOrThrow(mail.accounts, 'the account list');
         for (var i = 0; i < accts.length; i++) {
             var name = accts[i].name;
-            var match = wantAcct !== null && name.toLowerCase() === wantAcct;
+            var match = unscoped || (wantAcct !== null && name.toLowerCase() === wantAcct);
             if (!match && wantFrom !== null) {
                 var addrs = accts[i].element.emailAddresses();
                 for (var a = 0; a < addrs.length; a++) {
@@ -2205,10 +3070,25 @@ var savedDraft = (function() {
                 }
             }
             if (!match) continue;
-            var mbs = boundByName(accts[i].element.mailboxes);
+            var mbs = boundByNameOrThrow(accts[i].element.mailboxes, 'the mailbox list of account "' + name + '"');
+            // The account's own Drafts is the one at the root of it, so it is
+            // tried first: a user folder called `Drafts` nested inside a
+            // project is enumerated under the same leaf name and Mail lists
+            // children before parents. The loop still falls through to any
+            // other mailbox of that name rather than giving up, which is what
+            // it did before and is why a nested Drafts never shadowed the real
+            // one -- this only stops it costing a wasted pass.
+            var order = [];
             for (var j = 0; j < mbs.length; j++) {
-                if (mbs[j].name.toLowerCase() !== 'drafts') continue;
-                var drafts = mbs[j].element;
+                if (mbs[j].element !== null && mbs[j].path.toLowerCase() === 'drafts') order.push(mbs[j]);
+            }
+            for (var j = 0; j < mbs.length; j++) {
+                if (mbs[j].element !== null && mbs[j].path.toLowerCase() !== 'drafts'
+                    && mbs[j].name.toLowerCase() === 'drafts') order.push(mbs[j]);
+            }
+            for (var j = 0; j < order.length; j++) {
+                var box = order[j];
+                var drafts = box.element;
                 // The id and subject columns are separate Apple Events,
                 // so the newest id carrying this subject is a guess
                 // until the message itself confirms it. Binding by that
@@ -2238,7 +3118,7 @@ var savedDraft = (function() {
                     try { var r = saved.messageId(); rfc = r == null ? '' : '' + r; } catch (e) {}
                     return {
                         account: name,
-                        mailbox: mbs[j].name,
+                        mailbox: box.path,
                         message_id: '' + ids[best],
                         rfc_message_id: rfc
                     };
@@ -2259,9 +3139,15 @@ var savedDraft = (function() {
         let finalAction = """
         mail.save(msg);
         result.status = 'draft created';
+        """
+        // Everything below runs after the compose message has been closed.
+        // The 1.5s wait for the account to file the draft used to sit between
+        // the save and the close, which is a second and a half of Mail being
+        // free to autosave a second copy of the same message.
+        let afterClose = """
         // Let the account file the saved draft before looking for it.
         $.NSThread.sleepForTimeInterval(1.5);
-        \(savedDraftLookupJXA(account: account, from: from, subject: subject))
+        \(savedDraftLookupJXA(account: account, from: from, subject: subject, includeHelpers: false))
         result.draft = savedDraft;
         """
         // Read the saved draft back off the server and compare its text/plain
@@ -2275,7 +3161,10 @@ var savedDraft = (function() {
         //
         // Only for a plain `body`: the plain-text part of an html_body message
         // is Mail's own rendering, and there is nothing to compare it against.
-        return composeEmail(args, visible: false, finalAction: finalAction) { payload in
+        // `disposesMessage: false`: `save` does not end Mail's interest in the
+        // compose message, so an autosaved copy is reported rather than
+        // deleted -- deleting one Mail is still holding brings it back.
+        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, afterClose: afterClose) { payload in
             guard let body = args?["body"]?.stringValue,
                   args?["html_body"]?.stringValue == nil,
                   let draft = payload["draft"] as? [String: Any] else { return payload }
@@ -2680,24 +3569,55 @@ var savedDraft = (function() {
             }
             return (Data(), nil, error)
         }
-        let (size, body) = splitSourceSizeMarker(data)
-        return (decodeSourceBytes(body), size, nil)
+        let marker = splitSourceSizeMarker(data)
+        if let error = marker.error { return (Data(), nil, error) }
+        return (decodeSourceBytes(marker.body), marker.size, nil)
     }
 
     /// Splits the size line off the front of the script's output.
     ///
-    /// Not private, and separate from the fetch, because a first line that only
-    /// *looks* like the marker must not cost the caller a line of their message.
-    /// Anything that is not exactly `MACMCP-SIZE:<digits>\n` is left alone.
-    static func splitSourceSizeMarker(_ raw: Data) -> (size: Int?, body: Data) {
+    /// Not private, and separate from the fetch, because this is where a
+    /// sideband line of macMCP's own can end up inside a caller's message.
+    ///
+    /// **The line is macMCP's, always, and is always at offset 0.**
+    /// `sourceScriptJXA` builds its result as `'MACMCP-SIZE:' + expected + '\n'`
+    /// before a single byte of the message, unconditionally and on every path
+    /// including the one where `messageSize()` threw. So this used to fail
+    /// *open* -- returning the raw bytes untouched when the value on the line
+    /// did not parse, on the reasoning that a message beginning with something
+    /// that merely looks like the marker must not lose its first line. That
+    /// reasoning is void: the caller's first line is never at offset 0, because
+    /// the marker is. What failing open actually did was leave
+    /// `MACMCP-SIZE:null` in the bytes, where it reaches `save_to` files,
+    /// `bytes_total`, `sourceFidelity`'s counts, and `MIME.parse` as a bogus
+    /// `macmcp-size:` header on the message.
+    ///
+    /// So it fails closed, in the two ways it can:
+    ///
+    /// * **The line is stripped whatever is on it.** Losing the size costs a
+    ///   caller `complete_basis: "unchecked"`, which is an answer the result
+    ///   already knows how to give. Keeping the line costs them their message.
+    /// * **A value macMCP did not write is an error**, named as one. `-1` is
+    ///   accepted because the script writes it itself -- it is the initialiser
+    ///   of `expected`, and the documented way to say `messageSize()` raised.
+    ///   Anything else (`null`, `NaN`, a float) means the script's own contract
+    ///   did not hold, and the wait loop that decides whether the source is
+    ///   complete ran on that same value. Nothing here can say what was
+    ///   fetched, so it does not.
+    static func splitSourceSizeMarker(_ raw: Data) -> (size: Int?, body: Data, error: String?) {
         let marker = Data(sourceSizeMarker.utf8)
-        guard raw.starts(with: marker),
-              let newline = raw.firstIndex(of: 0x0A) else { return (nil, raw) }
+        guard raw.starts(with: marker), let newline = raw.firstIndex(of: 0x0A) else {
+            return (nil, Data(), "the source fetch returned output that does not begin with its own \(sourceSizeMarker) line, which the script writes before every message on every path — so nothing here can tell macMCP's own bytes from the message's, and none are returned. This is a bug in macMCP rather than something about the message; please report it.")
+        }
+        let body = Data(raw[(newline + 1)...])
         let digits = raw[(raw.startIndex + marker.count)..<newline]
         guard !digits.isEmpty,
               digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 || $0 == 0x2D }),
-              let size = Int(String(decoding: digits, as: UTF8.self)) else { return (nil, raw) }
-        return (size > 0 ? size : nil, Data(raw[(newline + 1)...]))
+              let size = Int(String(decoding: digits, as: UTF8.self)) else {
+            let text = String(decoding: digits, as: UTF8.self)
+            return (nil, body, "the source fetch reported this message's size as \"\(text)\", which is not a number macMCP wrote — the script writes a count, or -1 when Mail would not give one. The wait that decides whether the whole message had arrived ran against that same value, so whether these bytes are the message or a fragment of it is unknown and they are not returned. Try again in a moment.")
+        }
+        return (size > 0 ? size : nil, body, nil)
     }
 
     /// Strips anything that could steer a filename out of the destination
@@ -2756,8 +3676,16 @@ var savedDraft = (function() {
             return errorResult("Mail has only \(fidelity.wireSize) of this message's \(expectedSize) bytes and did not finish downloading it — attachments cut from that would be truncated. Try again in a moment.")
         }
 
-        let all = MIME.attachments(of: MIME.parse(data))
+        let parsed = MIME.parseReporting(data)
+        let all = MIME.attachments(of: parsed.part)
         guard !all.isEmpty else {
+            // "No attachments" measured against a message the reader could not
+            // read in full is the same class of confident wrong answer as one
+            // measured against a message Mail had not finished downloading, and
+            // is refused for the same reason.
+            guard parsed.report.complete else {
+                return errorResult("no attachment could be read out of message \(messageId), which is not the same as the message having none: \(parsed.report.note ?? "the message could not be read in full")")
+            }
             return errorResult("message \(messageId) has no attachments")
         }
 
@@ -2822,6 +3750,11 @@ var savedDraft = (function() {
             // disk is only as faithful as what Mail handed over, and a caller
             // saving an 8bit part has no other way to learn that.
             "fidelity": fidelity.dict,
+            // Of the parse the attachments were cut out of, on the same footing
+            // as `fidelity` above: an attachment nested below `MIME.maxDepth`
+            // is simply absent from `saved`, and `parsed_complete` is the only
+            // thing that separates that from a message that did not have one.
+            "structure": parsed.report.dict,
             "message_id": messageId
         ])
     }
@@ -3009,7 +3942,24 @@ var savedDraft = (function() {
         var numericId = null;
         try { numericId = '' + found.id(); } catch (e) {}
     \(destination)
-        var destName = '' + destMbox.name();
+        // The destination the caller asked for, checked against the mailbox
+        // that is about to be written to -- asked of that mailbox rather than
+        // of the list it came out of. `destMboxPath` is what the request
+        // resolved to; `mbPathOf` walks the bound mailbox's own containers. If
+        // the two disagree the binding found something other than what was
+        // asked for, and the right answer is to move nothing.
+        //
+        // This is the half of the old verification that was missing. The
+        // read-back below looks for the message in `destMbox`, which confirms
+        // *where it was put* and can never contradict the pick; a move to
+        // "Trash" that filed into `R4-PROBE-Deep/Trash` came back
+        // `verified: true`. Both halves are needed: this one says the mailbox
+        // is the one that was asked for, that one says the message reached it.
+        var destName = mbPathOf(destMbox);
+        if (destName === null || destName.toLowerCase() !== ('' + destMboxPath).toLowerCase()) {
+            moveResult = {error: 'the destination resolved to "' + destMboxPath + '" but reads back as "'
+                + destName + '"; nothing was moved'};
+        } else {
         // Where the message is *now*. Resolving the destination is dozens of
         // Apple Events, and `moved_from` claims to describe the move that is
         // about to happen rather than the state the search left behind. `found`
@@ -3059,6 +4009,7 @@ var savedDraft = (function() {
             verified: verified
         };
         }
+        }
     }
     JSON.stringify(moveResult);
     """
@@ -3083,7 +4034,9 @@ var savedDraft = (function() {
             targetAccount: args?["target_account"]?.stringValue
         ))
         """
-        let (output, error) = runJXA(script)
+        // See `mutatingRetries`: this script moves a message, and a retry
+        // re-runs the move.
+        let (output, error) = runJXA(script, retries: mutatingRetries)
         if let error { return errorResult(error) }
         switch scriptPayload(output) {
         case .failure(let message): return errorResult(message)
@@ -3114,7 +4067,11 @@ var savedDraft = (function() {
             'done';
         }
         """
-        let (output, error) = runJXA(script)
+        // See `mutatingRetries`. Setting the flag twice is harmless in
+        // itself, but a retried mutation is a habit rather than a judgement,
+        // and the id this one binds by is no more guaranteed to still resolve
+        // on the second run than the moved message's was.
+        let (output, error) = runJXA(script, retries: mutatingRetries)
         if let error { return errorResult(error) }
         if case .failure(let message) = scriptPayload(output) { return errorResult(message) }
         return textResult("marked \(read ? "read" : "unread")")
@@ -3134,7 +4091,7 @@ var savedDraft = (function() {
                 "cc": stringOrStringArrayProp("CC recipient address(es), same forms as `to`"),
                 "bcc": stringOrStringArrayProp("BCC recipient address(es), same forms as `to`"),
                 "attachments": stringArrayProp("Absolute POSIX paths of files to attach, e.g. [\"/Users/me/Budget.pdf\"]. Attached after the body so they appear at the end of the message"),
-                "from": stringProp("Sender email address (overrides account lookup)"),
+                "from": stringProp("Sender email address (overrides account lookup). Must be an address one of Mail's accounts sends as; an address no account owns is refused rather than substituted, because Mail's own behaviour is to send from the default account instead. The address the message actually went out as is reported back as `from`"),
                 "account": stringProp("Account name to \(action) (uses default account if omitted)")
             ],
             required: ["to", "subject"]
@@ -3158,7 +4115,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_list_mailboxes",
-                description: "List mailboxes. Groups by account when no account specified. Includes Mail's app-level mailboxes under the account name \"On My Mac\" — those belong to no account, and every mail tool accepts that name wherever an account is taken, so they can be scoped like any other. Nested folders are listed by their leaf name, so one account can show two mailboxes with the same name",
+                description: "List mailboxes. Groups by account when no account specified. Includes Mail's app-level mailboxes under the account name \"On My Mac\" — those belong to no account, and every mail tool accepts that name wherever an account is taken, so they can be scoped like any other. Nested folders are listed by their full path with / separators (Projects/Archive), because Mail reports leaf names for a flattened tree and one account can hold two mailboxes called Archive. Each string here is what identifies that mailbox and is accepted as mailbox, source_mailbox or target_mailbox by every other mail tool",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (lists every account if omitted)")
@@ -3173,11 +4130,11 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (scans every account and the local boxes if omitted)"),
-                        "mailbox": stringProp("Mailbox name, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). Pass 'all' to scan every mailbox except junk/trash/drafts"),
+                        "mailbox": stringProp("Mailbox to read, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. Pass 'all' to scan every mailbox except the account's own junk/trash/drafts/outbox — those are named in excluded_mailboxes, and a nested folder that happens to be called Trash is ordinary mail and is scanned"),
                         "limit": intProp("Maximum number of emails to return (default: 10)")
                     ]
                 ),
@@ -3190,12 +4147,12 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_email",
-                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. Attachments the message declares but Mail does not list are included with listed_by_mail: false, because Mail's own list can stay empty for good for a message first read while it was still arriving, and mail_save_attachment reads the source rather than that list. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
+                description: "Get full email by message ID, including the list of attachments (name, size, mime_type, mime_type_source). mime_type is the Content-Type the message itself declares, read from its raw source, so it agrees with mail_save_attachment; mime_type_source is \"declared\" for that, or \"filename\" when the source could not be read and the type had to be guessed from the extension. The message is checked against its own source, and the result reports fidelity (as mail_get_source does): when Mail has NOT finished downloading it, body, attachments and has_attachments are OMITTED rather than reported empty — an empty body and an empty attachment list from a half-downloaded message are answers a caller acts on — and the omitted field lists what was left out. Attachments the message declares but Mail does not list are included with listed_by_mail: false, because Mail's own list can stay empty for good for a message first read while it was still arriving, and mail_save_attachment reads the source rather than that list. source_check appears instead of fidelity when the source could not be read at all, in which case the body and attachments are Mail's unverified answer. structure reports what the MIME reader made of the source: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), and the attachment list is then short by whatever those parts contain rather than complete — a short list and a message with fewer attachments look identical without it. Searches all accounts when account omitted. Use mail_save_attachment to retrieve attachment contents",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID such as <abc@example.org> (use the RFC form for drafts, whose numeric id goes stale once the server syncs them)"),
                         "account": stringProp("Account name from results (optional, speeds up lookup)"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name")
                     ],
                     required: ["message_id"]
                 ),
@@ -3208,12 +4165,12 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. A mailbox that changed while it was being read is reported in unstable_mailboxes and contributes no results, because the columns a scan reads arrive in separate calls and a mailbox that changes between them would pair one message's id with another message's subject. If that was the whole of the scope the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched",
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (searches every account and the local boxes if omitted)"),
-                        "mailbox": stringProp("Mailbox name to search (default: 'all' — every mailbox except junk/trash/drafts)"),
+                        "mailbox": stringProp("Mailbox to search (default: 'all' — every mailbox except the account's own junk/trash/drafts/outbox, which are named in excluded_mailboxes; a nested folder called Trash is ordinary mail and is searched). A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one"),
                         "limit": intProp("Maximum number of results, newest first (default: 10)"),
                         "search_recipients": boolProp("Also match To/CC recipient names and addresses (adds roughly 1s per 1000 messages scanned)"),
                         "search_body": boolProp("Also match body text. Mail can only supply bodies one at a time (~1.2s each), so this is a capped second pass over the newest messages in scope — it does NOT search every body. Coverage is reported in the body_search field of the result"),
@@ -3230,7 +4187,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_send",
-                description: "Send an email via Mail.app, optionally as HTML and with file attachments. The result reports rendered_chars: the length of the body Mail composed with all whitespace removed, so an 18-character body of \"just one line here\" reports 15. It exists to catch a body Mail rendered as empty, not to match the length of what was sent. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced",
+                description: "Send an email via Mail.app, optionally as HTML and with file attachments. The result reports rendered_chars: the length of the body Mail composed with all whitespace removed, so an 18-character body of \"just one line here\" reports 15. It exists to catch a body Mail rendered as empty, not to match the length of what was sent. Note: Mail rewrites the body of anything composed through its scripting interface — the delivered message carries the text inside <blockquote type=\"cite\">, so its text/plain alternative arrives with \"> \" on every line. This is Mail's own behaviour (a message typed by hand in Mail is unaffected, and plain AppleScript produces the same result), not something this tool can turn off. Use mail_create_draft, whose result reports body_check from the saved message, if you need to see what Mail actually produced. The result also reports from and account (the identity Mail actually sent as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that copy was found in Drafts and removed",
                 inputSchema: composeSchema(action: "send from"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
@@ -3241,7 +4198,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML",
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts and removed — the draft you asked for is never touched by it",
                 inputSchema: composeSchema(action: "save the draft in"),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
@@ -3252,7 +4209,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Saves every attachment when neither attachment_name nor index is given. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -3260,7 +4217,7 @@ var savedDraft = (function() {
                         "attachment_name": stringProp("Name of the attachment to save, as reported by mail_get_email (exact match preferred, substring accepted)"),
                         "index": intProp("Zero-based index of the attachment to save, as an alternative to attachment_name"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "overwrite": boolProp("Overwrite an existing file instead of saving alongside it as \"name (2).ext\" (default: false)")
                     ],
                     required: ["message_id", "destination"]
@@ -3278,7 +4235,7 @@ var savedDraft = (function() {
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
                         "account": stringProp("Account name (optional, speeds up lookup)"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
                         "save_to": stringProp("Absolute POSIX path to write the full source to. Prefer this for large messages"),
                         "max_bytes": intProp("How much source to return inline when save_to is omitted (default: 100000, max: 2000000). The cut is moved back to the nearest character boundary, so bytes_returned can be up to 3 less than this")
                     ],
@@ -3297,8 +4254,8 @@ var savedDraft = (function() {
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
-                        "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes"),
-                        "target_mailbox": stringProp("Destination mailbox name, resolved within the message's own account"),
+                        "source_mailbox": stringProp("Source mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
+                        "target_mailbox": stringProp("Destination mailbox, resolved within the message's own account. A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. If two mailboxes in the account carry the name and neither is at the root, the move is refused and both paths are named rather than one being guessed at"),
                         "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
                         "target_account": stringProp("Account to move the message INTO. Omit to keep it in its own account — which is almost always what you want, since every account has an Archive, Sent, Trash and Drafts. Setting this to another account uploads the message to that account and removes it from this one. That upload is a re-send of Mail's own copy, not a server-side move, so the bytes change: headers, content and RFC Message-Id survive, but the numeric message_id does not, line endings arrive as LF, and any NUL byte is lost — the same caveats mail_get_source reports as fidelity. Mail does fetch a message it holds only partially before uploading it, so nothing is truncated")
                     ],
@@ -3318,7 +4275,7 @@ var savedDraft = (function() {
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),
                         "read": boolProp("true to mark as read, false to mark as unread"),
                         "account": stringProp("Account name"),
-                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes")
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name")
                     ],
                     required: ["message_id", "read"]
                 )

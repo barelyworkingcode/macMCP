@@ -18,9 +18,12 @@ import XCTest
 /// * `mailboxes.byName('Sub')` for `Archive/Sub` gives a specifier whose
 ///   `exists()` is false, while the same mailbox reads fine by position.
 ///
-/// So a name is used only when it is unique *and* resolves; anything else keeps
-/// the positional specifier it came from. These pin both, because getting it
-/// wrong silently drops a mailbox from every scan or merges two into one.
+/// What identifies a mailbox is therefore its **path**, and `byName` takes one:
+/// `byName('Archive/Sub')` resolves where `byName('Sub')` does not, and
+/// `byName('Archive')` resolves to the top-level one. A path that is not unique
+/// in the collection keeps the positional specifier it came from. These pin
+/// both, because getting it wrong silently drops a mailbox from every scan or
+/// merges two into one.
 final class MailMailboxBindingTests: XCTestCase {
     private func scan(_ stub: String, mailbox: String) throws -> [String: Any] {
         try JXA.runJSON("""
@@ -42,18 +45,20 @@ final class MailMailboxBindingTests: XCTestCase {
     var mail = makeMail({accounts: [{name: 'Bob', mailboxes: [
         {name: 'Archive', messages: [{id: 10, subject: 'NESTED-ARCHIVE', date: 2000}]},
         {name: 'Projects', messages: []},
-        {name: 'Sub', byNameHidden: true, messages: [{id: 11, subject: 'in the nested box', date: 3000}]},
+        {name: 'Sub', container: 'Archive', messages: [{id: 11, subject: 'in the nested box', date: 3000}]},
         {name: 'Archive', messages: [{id: 12, subject: 'Decommission plan', date: 1000}]},
         {name: 'INBOX', messages: [{id: 13, subject: 'hello', date: 4000}]}
     ]}]});
     """
 
     func testAMailboxThatCannotBeReachedByItsNameIsStillScanned() throws {
-        // `byName` answers with a specifier that does not exist. Using it would
-        // drop the mailbox out of every scan, and the caller would be told an
-        // empty mailbox rather than an unreadable one.
+        // `byName('Sub')` answers with a specifier that does not exist, because
+        // Mail matches a bare name at the top level only. What does reach the
+        // mailbox is its path, `Archive/Sub`, which is what it is bound and
+        // labelled by — the leaf name it was asked for was never enough to
+        // identify it.
         let payload = try scan(Self.nested, mailbox: "Sub")
-        XCTAssertEqual(payload["scanned"] as? [String] ?? [], ["Bob:Sub"])
+        XCTAssertEqual(payload["scanned"] as? [String] ?? [], ["Bob:Archive/Sub"])
         XCTAssertEqual(payload["skipped"] as? [String] ?? [], [])
         let subjects = (payload["rows"] as? [[String: Any]] ?? []).map { $0["subject"] as? String ?? "" }
         XCTAssertEqual(subjects, ["in the nested box"])

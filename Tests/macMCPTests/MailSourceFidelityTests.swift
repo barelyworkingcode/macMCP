@@ -196,36 +196,67 @@ final class MailSourceFidelityTests: XCTestCase {
     func testTheSizeLineIsSplitOffTheFrontOfTheSource() {
         var raw = Data("MACMCP-SIZE:418\n".utf8)
         raw.append(Data("Return-Path: <a@b.c>\nSubject: x\n".utf8))
-        let (size, body) = MailService.splitSourceSizeMarker(raw)
-        XCTAssertEqual(size, 418)
-        XCTAssertEqual(body, Data("Return-Path: <a@b.c>\nSubject: x\n".utf8))
+        let split = MailService.splitSourceSizeMarker(raw)
+        XCTAssertEqual(split.size, 418)
+        XCTAssertEqual(split.body, Data("Return-Path: <a@b.c>\nSubject: x\n".utf8))
+        XCTAssertNil(split.error)
     }
 
     func testAMessageMailWouldNotSizeComesBackWithNoSizeAndAllItsBytes() {
         // The script prints -1 when `messageSize` raised. That is "unknown",
-        // not "zero bytes", and the source is untouched either way.
+        // not "zero bytes", and it is a value macMCP writes itself, so the
+        // source comes back whole and only the size is missing.
         var raw = Data("MACMCP-SIZE:-1\n".utf8)
         raw.append(Data("Subject: x\n".utf8))
-        let (size, body) = MailService.splitSourceSizeMarker(raw)
-        XCTAssertNil(size)
-        XCTAssertEqual(body, Data("Subject: x\n".utf8))
+        let split = MailService.splitSourceSizeMarker(raw)
+        XCTAssertNil(split.size)
+        XCTAssertEqual(split.body, Data("Subject: x\n".utf8))
+        XCTAssertNil(split.error, "-1 is the script's own sentinel, not a broken contract")
     }
 
-    func testAFirstLineThatMerelyLooksLikeTheMarkerIsNotEaten() {
-        // A message really can begin with anything, and losing its first line to
-        // a loose prefix match would be a new corruption in the code that exists
-        // to stop corruption going unreported.
-        for impostor in [
-            "MACMCP-SIZE:not-a-number\nSubject: x\n",
-            "MACMCP-SIZE\nSubject: x\n",
-            "X-MACMCP-SIZE:418\nSubject: x\n",
-            "Subject: MACMCP-SIZE:418\n"
-        ] {
-            let raw = Data(impostor.utf8)
-            let (size, body) = MailService.splitSourceSizeMarker(raw)
-            XCTAssertNil(size, impostor)
-            XCTAssertEqual(body, raw, impostor)
+    /// The marker is written by `sourceScriptJXA` before a single byte of the
+    /// message, unconditionally and on every path, so it is always at offset 0
+    /// and the caller's own first line never is. This used to fail *open* on the
+    /// reasoning that a first line which merely looks like the marker must not
+    /// cost a caller a line of their message — a case that cannot arise — and
+    /// what it actually did was leave `MACMCP-SIZE:null` inside the message,
+    /// where it reaches `save_to` files, `bytes_total`, `sourceFidelity`'s
+    /// counts, and `MIME.parse` as a bogus `macmcp-size:` header (#R3-7).
+    func testAValueMacMCPDidNotWriteIsRefusedRatherThanLeftInTheMessage() throws {
+        // What `'MACMCP-SIZE:' + expected` prints when `messageSize()` yields
+        // something the script did not expect.
+        for value in ["null", "NaN", "undefined", "418.5", "", "1-2"] {
+            let raw = Data("MACMCP-SIZE:\(value)\nSubject: x\n".utf8)
+            let split = MailService.splitSourceSizeMarker(raw)
+            XCTAssertNil(split.size, value)
+            XCTAssertFalse(
+                split.body.starts(with: Data("MACMCP-SIZE:".utf8)),
+                "macMCP's own sideband line stayed in the message for \"\(value)\""
+            )
+            let error = try XCTUnwrap(split.error, "\"\(value)\" was accepted silently")
+            XCTAssertTrue(error.contains(value.isEmpty ? "size" : value), error)
         }
+    }
+
+    func testOutputWithoutTheMarkerAtAllIsRefused() throws {
+        // The script cannot produce this. If it ever does, nothing here can tell
+        // macMCP's bytes from the message's, so nothing is returned.
+        for impostor in ["X-MACMCP-SIZE:418\nSubject: x\n", "Subject: MACMCP-SIZE:418\n", "MACMCP-SIZE:418"] {
+            let split = MailService.splitSourceSizeMarker(Data(impostor.utf8))
+            XCTAssertNil(split.size, impostor)
+            XCTAssertEqual(split.body, Data(), impostor)
+            XCTAssertNotNil(split.error, impostor)
+        }
+    }
+
+    func testARefusedSizeLineCostsTheCallerAnErrorRatherThanACorruptedMessage() throws {
+        // The sentence has to name what happened: "not a number macMCP wrote"
+        // is the difference between a bug in the plumbing and something about
+        // the message, and only one of the two is worth retrying.
+        let split = MailService.splitSourceSizeMarker(Data("MACMCP-SIZE:null\nSubject: x\n".utf8))
+        let error = try XCTUnwrap(split.error)
+        XCTAssertTrue(error.contains("null"), error)
+        XCTAssertTrue(error.contains("-1"), "the accepted sentinel is worth naming: \(error)")
     }
 
     // MARK: - The shape a caller sees
