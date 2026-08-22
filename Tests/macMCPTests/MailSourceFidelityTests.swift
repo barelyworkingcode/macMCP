@@ -142,6 +142,36 @@ final class MailSourceFidelityTests: XCTestCase {
         XCTAssertTrue(fidelity.complete)
     }
 
+    func testACRLFThatSurvivedIsNotCountedTwice() {
+        // The wire size is the bytes plus one CR for each *bare* LF, because a
+        // bare LF is what a CRLF came back as. A CRLF still in the bytes already
+        // weighs two, and adding another byte for it inflated the wire size by
+        // one per line -- slack in the one direction a completeness guard must
+        // never have. Mail strips every CR today, so nothing measured this;
+        // `line_endings` reports "crlf" and "mixed" as reachable, and
+        // `mail_save_attachment` cuts files out of a message on the strength of
+        // `complete`.
+        let source = Data("From: a@b.c\r\nSubject: x\r\n\r\nbody\r\n".utf8)
+        XCTAssertEqual(source.count, 33)
+        let fidelity = MailService.sourceFidelity(source, expectedSize: 33)
+        XCTAssertEqual(fidelity.lineEndings, "crlf")
+        XCTAssertEqual(fidelity.wireSize, 33, "these bytes are already the wire bytes")
+        XCTAssertTrue(fidelity.complete)
+    }
+
+    func testAFragmentWithCRLFEndingsIsStillShort() {
+        // The consequence of the double count, stated as the caller sees it: 30
+        // lines of slack is 30 bytes a fragment could be missing and still be
+        // called complete, which is `mail_save_attachment` writing a truncated
+        // file and reporting success.
+        let line = "0123456789012345678901234567\r\n"  // 30 bytes
+        let fragment = Data(String(repeating: line, count: 30).utf8)
+        XCTAssertEqual(fragment.count, 900)
+        let fidelity = MailService.sourceFidelity(fragment, expectedSize: 930)
+        XCTAssertEqual(fidelity.completeBasis, "short")
+        XCTAssertFalse(fidelity.complete)
+    }
+
     func testASourceMailCannotSizeIsNotAccusedOfBeingIncomplete() throws {
         // `messageSize` failing is not evidence of anything, and reporting a
         // guess as a fact is what this whole seam exists to stop. But it is not

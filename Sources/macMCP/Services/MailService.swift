@@ -1278,23 +1278,36 @@ enum MailService {
         // unread -- which is the old behaviour, kept for the pathological case
         // and only for it.
         var RV_DEADLINE = Date.now() + \(Int(reverifySeconds * 1000));
-        function reverify(mb, list, acctName, path) {
+        // A row this mailbox cannot stand behind: the message is not here, or
+        // not readable, or does not match after all. It stops being one of this
+        // mailbox's matches -- the count it was added to comes back down, and
+        // the claim it laid on the id is released, so a *different* mailbox
+        // holding the same message can still return it. A message filed in two
+        // mailboxes at once is the normal shape of a Gmail account, and a
+        // mailbox that contributes nothing about one must not be what makes it
+        // disappear.
+        function letGo(claimed, row) {
+            dropped++;
+            total--;
+            delete claimed[row.id];
+        }
+        function reverify(mb, list, acctName, path, claimed) {
             var out = [];
             for (var r = 0; r < list.length; r++) {
                 if (Date.now() > RV_DEADLINE) return null;
                 var row = list[r];
                 var numeric = parseInt(row.id, 10);
-                if (!isFinite(numeric)) { dropped++; continue; }
+                if (!isFinite(numeric)) { letGo(claimed, row); continue; }
                 var m = mb.messages.byId(numeric);
                 var here = false;
                 try { here = m.exists() === true; } catch (e1) { here = false; }
-                if (!here) { dropped++; continue; }
+                if (!here) { letGo(claimed, row); continue; }
                 var subj, sndr, when, rdst;
                 try {
                     subj = m.subject(); sndr = m.sender();
                     when = m.dateReceived(); rdst = m.readStatus();
-                } catch (e2) { dropped++; continue; }
-                if (!mbSamePlace(mbWhere(m), acctName, path)) { dropped++; continue; }
+                } catch (e2) { letGo(claimed, row); continue; }
+                if (!mbSamePlace(mbWhere(m), acctName, path)) { letGo(claimed, row); continue; }
                 row.subject = subj == null ? '' : '' + subj;
                 row.sender = sndr == null ? '' : '' + sndr;
                 row.date_received = when ? '' + when : '';
@@ -1305,7 +1318,7 @@ enum MailService {
                 // subject and sender. Recipients are not re-read: four more
                 // Apple Events a row, for a haystack the caller opted into.
                 if (QUERY !== null && !row.matchedOnRecipients) {
-                    if ((row.subject + ' ' + row.sender).toLowerCase().indexOf(QUERY) === -1) { dropped++; continue; }
+                    if ((row.subject + ' ' + row.sender).toLowerCase().indexOf(QUERY) === -1) { letGo(claimed, row); continue; }
                 }
                 reverified++;
                 out.push(row);
@@ -1343,10 +1356,19 @@ enum MailService {
                     // doubt whatever happened afterwards.
                     messagesScanned += ids.length;
                     var local = [];
+                    // Claimed by this mailbox, committed to `seen` only once
+                    // this mailbox's rows are kept. A message can sit in two
+                    // mailboxes at once (Gmail files one in INBOX and in All
+                    // Mail), and `seen` is what stops it being returned twice
+                    // -- but a mailbox that is then discarded has suppressed
+                    // ids on behalf of an answer it did not contribute, so the
+                    // message appears in no row and is counted in no total even
+                    // though the other mailbox holding it was read cleanly.
+                    var mine = Object.create(null);
                     for (var i = 0; i < ids.length; i++) {
                         var id = '' + ids[i];
-                        if (seen[id]) continue;
-                        seen[id] = true;
+                        if (seen[id] || mine[id]) continue;
+                        mine[id] = true;
                         var onRecipients = false;
                         if (QUERY !== null) {
                             var meta = (su[i] == null ? '' : '' + su[i]) + ' ' + (se[i] == null ? '' : '' + se[i]);
@@ -1372,19 +1394,26 @@ enum MailService {
                     local.sort(function(x, y) { return y.t - x.t; });
                     if (local.length > LIMIT) local = local.slice(0, LIMIT);
                     if (!stable) {
-                        local = reverify(mb, local, entries[e].acctName, entries[e].path);
+                        // What this mailbox's rows were counted on top of.
+                        // `reverify` takes a row's count back off as it lets it
+                        // go, so the rollback below cannot simply subtract
+                        // `counted` -- part of it may already be gone.
+                        var totalBefore = total - counted;
+                        local = reverify(mb, local, entries[e].acctName, entries[e].path, mine);
                         if (local === null) {
                             // Out of budget. Nothing was verified, so nothing is
                             // returned from here and the mailbox is named as
                             // unread -- and a mailbox reported as unread must not
                             // be counted, so both counts are taken back out.
                             messagesScanned -= ids.length;
-                            total -= counted;
+                            total = totalBefore;
                             skipped.push(label + ': it kept changing while it was being read and there was no time left to re-read its messages one by one (transient — try again in a moment)');
                             continue;
                         }
                         changed.push(label);
                     }
+                    // Kept, so the claim stands.
+                    for (var c in mine) seen[c] = true;
                     for (var q = 0; q < local.length; q++) {
                         delete local[q].matchedOnRecipients;
                         rows.push(local[q]);
@@ -2166,8 +2195,37 @@ enum MailService {
     /// when it is the only one of its kind. Every name here is now the string
     /// that identifies the mailbox and that every other mail tool accepts as
     /// `mailbox`, `source_mailbox` or `target_mailbox`.
+    ///
+    /// **One account that will not hold still costs that account and nothing
+    /// else.** The listing used to throw out of the loop, so a single busy
+    /// account returned `the mailbox list kept changing while it was being
+    /// read` in place of every other account's mailboxes -- and this is the
+    /// tool a caller consults to find out what to pass as `mailbox` anywhere
+    /// else. Such an account is carried with an empty list and an `unread`
+    /// sentence saying why, which is the shape the scan uses for
+    /// `skipped_mailboxes`. Naming one account is different: there is nothing
+    /// left to degrade to, so that path still refuses.
     private static func listMailboxes(_ args: JSONObject?) -> MCPCallResult {
         let account = args?["account"]?.stringValue
+        // Naming an account is the only narrowing this tool offers, so once one
+        // has been given there is nothing left to suggest.
+        let (output, error) = runJXA(
+            """
+            var mail = Application('Mail');
+            \(listMailboxesScriptJXA(account: account))
+            """,
+            scopable: account == nil,
+            call: MailCall.forArguments(args, default: Budget.listMailboxes)
+        )
+        if let error { return errorResult(error) }
+        return textResult(output)
+    }
+
+    /// The listing script, minus the `var mail = Application('Mail');` line.
+    ///
+    /// Not private: the degrade-per-account behaviour lives in the generated
+    /// JavaScript, so a test has to run it against the stub.
+    static func listMailboxesScriptJXA(account: String?) -> String {
         // One bulk build per collection rather than a `mailboxes[i].name()`
         // walk. The walk was one Apple Event per mailbox -- 436ms against 15ms
         // for Bob's 30 -- and it had no try/catch, so a mailbox vanishing
@@ -2181,11 +2239,26 @@ enum MailService {
             for (var i = 0; i < bound.length; i++) out.push(bound[i].path);
             return out;
         }
+        // One account that will not hold still costs that account's listing and
+        // nothing else. Throwing out of the loop cost the caller every account
+        // already enumerated -- the same all-or-nothing this file rejects
+        // everywhere else (`boundByNameOrReport`, `skipped_mailboxes`) -- and
+        // this is the discovery tool every other mail tool's `mailbox` argument
+        // depends on, so it is the costliest place to keep it. What could not
+        // be read is named as `unread` rather than shown as an empty account,
+        // because "this account holds no mailboxes" is a different answer.
+        function listingFor(collection) {
+            try {
+                return {mailboxes: pathsOf(collection)};
+            } catch (err) {
+                var m = err == null ? '' : ('' + (err.message == null ? err : err.message));
+                return {mailboxes: [], unread: m.length === 0 ? 'it could not be read' : m};
+            }
+        }
         """
         let script: String
         if let account, isLocalAccount(account) {
             script = """
-            var mail = Application('Mail');
             \(boundByNameJXA)
             \(pathsOf)
             JSON.stringify(pathsOf(mail.mailboxes));
@@ -2193,7 +2266,6 @@ enum MailService {
         } else if let account {
             let escaped = escapeJSString(account)
             script = """
-            var mail = Application('Mail');
             \(boundByNameJXA)
             \(pathsOf)
             (function() {
@@ -2208,27 +2280,20 @@ enum MailService {
             """
         } else {
             script = """
-            var mail = Application('Mail');
             \(boundByNameJXA)
             \(pathsOf)
             var accts = boundByNameOrThrow(mail.accounts, 'the account list');
             var results = [];
             for (var i = 0; i < accts.length; i++) {
-                results.push({account: accts[i].name, mailboxes: pathsOf(accts[i].element.mailboxes)});
+                var one = listingFor(accts[i].element.mailboxes);
+                results.push({account: accts[i].name, mailboxes: one.mailboxes, unread: one.unread});
             }
-            results.push({account: '\(escapeJSString(localAccountName))', mailboxes: pathsOf(mail.mailboxes)});
+            var local = listingFor(mail.mailboxes);
+            results.push({account: '\(escapeJSString(localAccountName))', mailboxes: local.mailboxes, unread: local.unread});
             JSON.stringify(results);
             """
         }
-        // Naming an account is the only narrowing this tool offers, so once one
-        // has been given there is nothing left to suggest.
-        let (output, error) = runJXA(
-            script,
-            scopable: account == nil,
-            call: MailCall.forArguments(args, default: Budget.listMailboxes)
-        )
-        if let error { return errorResult(error) }
-        return textResult(output)
+        return script
     }
 
     private static func getEmails(_ args: JSONObject?) -> MCPCallResult {
@@ -2297,7 +2362,7 @@ enum MailService {
         // downloaded on every call regardless, and the only thing the split
         // bought was a second process, a second bind, and two readings of
         // `messageSize` taken at two moments.
-        let (source, expectedSize, meta, fetchError) = fetchSource(
+        let (source, _, meta, fidelity, fetchError) = fetchSource(
             account: account,
             mailbox: mailbox,
             messageId: messageId,
@@ -2330,7 +2395,7 @@ enum MailService {
             payload,
             listedByMail: listedByMail,
             source: source,
-            fidelity: sourceFidelity(source, expectedSize: expectedSize)
+            fidelity: fidelity
         ))
     }
 
@@ -4329,7 +4394,7 @@ var savedDraft = (function() {
                 ?? (draft["message_id"] as? String)
             guard let identifier else { return payload }
 
-            let (source, _, _, fetchError) = fetchSource(
+            let (source, _, _, _, fetchError) = fetchSource(
                 account: draft["account"] as? String,
                 mailbox: draft["mailbox"] as? String ?? "Drafts",
                 messageId: identifier,
@@ -4639,9 +4704,18 @@ var savedDraft = (function() {
             ambiguousNulBytes: standaloneHighBytes(data),
             expectedSize: expectedSize,
             byteCount: data.count,
-            // Every LF here stood for a CRLF on the wire, so this is what these
-            // bytes weigh in the units `messageSize` is quoted in.
-            wireSize: data.count + crlf + bareLF,
+            // A *bare* LF here stood for a CRLF on the wire, so this is what
+            // these bytes weigh in the units `messageSize` is quoted in. A CRLF
+            // that survived is already two bytes of `data.count` and gets
+            // nothing added: counting it again inflated the wire size by one
+            // byte per line, which is the wrong direction for a guard whose job
+            // is to refuse a fragment — enough slack promotes `short` to
+            // `wire`, and `mail_save_attachment` cuts a file out of a
+            // half-downloaded message on the strength of it. Mail strips every
+            // CR today, so `crlf` is 0 in practice; `line_endings` models
+            // `crlf` and `mixed` as reachable, and this must be right when they
+            // are.
+            wireSize: data.count + bareLF,
             // Free: the bytes are already here, and it is the only evidence of
             // completeness that is not a byte count. See `completeBasis`.
             multipartTerminated: MIME.multipartIsTerminated(data)
@@ -4835,6 +4909,7 @@ var savedDraft = (function() {
         let key: String
         let data: Data
         let expectedSize: Int?
+        let fidelity: SourceFidelity
         let at: Date
     }
     private static var cachedSource: CachedSource?
@@ -4875,11 +4950,18 @@ var savedDraft = (function() {
         call: MailCall,
         timeout: TimeInterval = sourceFetchTimeout,
         meta: String? = nil
-    ) -> (data: Data, expectedSize: Int?, meta: [String: Any]?, error: String?) {
+    ) -> (data: Data, expectedSize: Int?, meta: [String: Any]?, fidelity: SourceFidelity, error: String?) {
+        // Measured once and handed back, not measured once here to decide
+        // whether to cache and again in every caller. Each measurement is two
+        // full walks of the bytes plus `MIME.multipartIsTerminated`, which
+        // starts by copying the whole buffer -- on a 70 MB message that is a
+        // second 70 MB copy and two more passes, paid on every call, for an
+        // answer already in hand.
+        let empty = sourceFidelity(Data())
         let key = sourceCacheKey(account: account, mailbox: mailbox, messageId: messageId)
         if meta == nil, let key, let held = cachedSource,
            held.key == key, Date().timeIntervalSince(held.at) < sourceCacheTTL {
-            return (held.data, held.expectedSize, nil, nil)
+            return (held.data, held.expectedSize, nil, held.fidelity, nil)
         }
         let script = """
         var mail = Application('Mail');
@@ -4888,19 +4970,26 @@ var savedDraft = (function() {
         let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true, call: call)
         if let error {
             if error.contains("message not found") {
-                return (Data(), nil, nil, "message not found with id: \(messageId)")
+                return (Data(), nil, nil, empty, "message not found with id: \(messageId)")
             }
-            return (Data(), nil, nil, error)
+            return (Data(), nil, nil, empty, error)
         }
         let head = splitMetaMarker(data)
-        if let error = head.error { return (Data(), nil, nil, error) }
+        if let error = head.error { return (Data(), nil, nil, empty, error) }
         let marker = splitSourceSizeMarker(head.rest)
-        if let error = marker.error { return (Data(), nil, head.meta, error) }
+        if let error = marker.error { return (Data(), nil, head.meta, empty, error) }
         let source = decodeSourceBytes(marker.body)
-        if let key, sourceFidelity(source, expectedSize: marker.size).complete {
-            cachedSource = CachedSource(key: key, data: source, expectedSize: marker.size, at: Date())
+        let fidelity = sourceFidelity(source, expectedSize: marker.size)
+        if let key, fidelity.complete {
+            cachedSource = CachedSource(
+                key: key,
+                data: source,
+                expectedSize: marker.size,
+                fidelity: fidelity,
+                at: Date()
+            )
         }
-        return (source, marker.size, head.meta, nil)
+        return (source, marker.size, head.meta, fidelity, nil)
     }
 
     /// Splits the properties line off the front of the script's output, when
@@ -5009,7 +5098,7 @@ var savedDraft = (function() {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let overwrite = args?["overwrite"]?.boolValue ?? false
 
-        let (data, expectedSize, _, fetchError) = fetchSource(
+        let (data, expectedSize, _, fidelity, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
@@ -5020,7 +5109,6 @@ var savedDraft = (function() {
         // Refuse rather than write a file cut out of a fragment. An attachment
         // saved from a half-downloaded message is silently wrong on disk, which
         // is worse than a failure the caller can retry.
-        let fidelity = sourceFidelity(data, expectedSize: expectedSize)
         if !fidelity.complete {
             guard let expectedSize else {
                 return errorResult("Mail returned none of this message's bytes — not even its headers — so there is nothing to cut an attachment out of. Try again in a moment.")
@@ -5176,14 +5264,13 @@ var savedDraft = (function() {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let (data, expectedSize, _, fetchError) = fetchSource(
+        let (data, expectedSize, _, fidelity, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
             call: MailCall.forArguments(args, default: Budget.getSource)
         )
         if let fetchError { return errorResult(fetchError) }
-        let fidelity = sourceFidelity(data, expectedSize: expectedSize)
 
         // A fragment is returned, with `fidelity` saying how much of the message
         // it is: headers alone are worth having, and reporting them honestly is

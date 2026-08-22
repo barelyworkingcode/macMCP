@@ -151,9 +151,12 @@ enum MIME {
         var depthLimited = false
         var partLimited = false
         var headerLimited = false
+        /// A `multipart/*` whose declared boundary does not occur in its body,
+        /// so none of its content could be reached.
+        var boundaryMissing = false
 
         /// Whether every part of the message was read.
-        var complete: Bool { !depthLimited && !partLimited && !headerLimited }
+        var complete: Bool { !depthLimited && !partLimited && !headerLimited && !boundaryMissing }
 
         var note: String? {
             guard !complete else { return nil }
@@ -166,6 +169,9 @@ enum MIME {
             }
             if headerLimited {
                 sentences.append("At least one part carries more than \(MIME.maxHeaderBytes) bytes of headers and only the first \(MIME.maxHeaderBytes) were read, so a header declared past that point was not seen.")
+            }
+            if boundaryMissing {
+                sentences.append("At least one multipart part declares a boundary that does not appear in its body, so none of its content could be reached — the message is malformed, or these are not all of its bytes. An empty attachment list here means nothing could be read, not that there is nothing to read.")
             }
             return sentences.joined(separator: " ")
         }
@@ -257,7 +263,8 @@ enum MIME {
             // One more than the remaining budget, so a message that runs past
             // the ceiling is seen to run past it rather than landing on it.
             let budget = maxParts - report.parts
-            let pieces = splitMultipart(nodes[index].part.body, boundary: boundary, limit: budget + 1)
+            let split = splitMultipart(nodes[index].part.body, boundary: boundary, limit: budget + 1)
+            let pieces = split.pieces
             var readAll = true
             for (offset, piece) in pieces.enumerated() {
                 let childPath = path.isEmpty ? "\(offset + 1)" : "\(path).\(offset + 1)"
@@ -267,7 +274,23 @@ enum MIME {
                 }
                 nodes[index].children.append(child)
             }
-            if readAll {
+            if pieces.isEmpty && !split.sawDelimiter {
+                // A `multipart/*` declaring a boundary that never occurs in its
+                // body -- a sender that got it wrong, or a fetch cut before the
+                // first delimiter. Nothing was read, so nothing may be thrown
+                // away and nothing may be reported as read: clearing the body
+                // here lost the only copy of the content while `parsed_complete`
+                // stayed true, and that flag is what `mail_save_attachment`
+                // reads to choose between "no attachment could be read out of
+                // this message" and the flat "this message has no attachments".
+                //
+                // A multipart that really holds no parts is a different message:
+                // its delimiter is there and was read, so it is complete with
+                // nothing in it, which is why `sawDelimiter` is asked.
+                report.boundaryMissing = true
+                report.unparsedMultiparts += 1
+                nodes[index].part.unparsed = true
+            } else if readAll {
                 // A multipart part's own bytes *are* the parts below it, which
                 // are now held separately. Keeping both is what makes a parse
                 // cost O(depth x size) in memory rather than O(size).
@@ -610,8 +633,15 @@ enum MIME {
     ///
     /// The scan cannot stall: `marker` is `--` plus a non-empty boundary, so
     /// every iteration advances `search` by at least three bytes.
-    private static func splitMultipart(_ bytes: [UInt8], boundary: String, limit: Int) -> [[UInt8]] {
-        guard limit > 0 else { return [] }
+    /// `sawDelimiter` separates a multipart with no parts in it from one whose
+    /// boundary does not occur in its body at all. Both yield no pieces, and
+    /// only the second means nothing was read -- see `parseReporting`.
+    private static func splitMultipart(
+        _ bytes: [UInt8],
+        boundary: String,
+        limit: Int
+    ) -> (pieces: [[UInt8]], sawDelimiter: Bool) {
+        guard limit > 0 else { return ([], false) }
         let marker = [UInt8]("--\(boundary)".utf8)
         var delimiters: [(start: Int, afterLine: Int, isClose: Bool)] = []
         var search = 0
@@ -641,7 +671,7 @@ enum MIME {
             if end > start && bytes[end - 1] == 0x0D { end -= 1 }
             if end > start { out.append(Array(bytes[start..<end])) }
         }
-        return out
+        return (out, !delimiters.isEmpty)
     }
 
     // MARK: - Decoding

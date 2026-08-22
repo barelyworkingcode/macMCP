@@ -280,6 +280,56 @@ final class MIMELimitTests: XCTestCase {
 
     // MARK: - The iterative walk answers exactly as the recursive one did
 
+    // MARK: - A multipart whose boundary never appears
+
+    func testAMultipartWhoseBoundaryIsNowhereInItsBodyIsNotReportedAsRead() {
+        // The declared boundary does not occur, so `splitMultipart` yields
+        // nothing. That used to leave `parsed_complete: true` while the part's
+        // own bytes -- the only copy of the content -- were thrown away as
+        // "held by the children", of which there were none.
+        //
+        // `mail_save_attachment` reads exactly this flag to choose between "no
+        // attachment could be read out of this message" and the flat "this
+        // message has no attachments", so a caller was told a message whose
+        // body could not be read simply had nothing in it.
+        let source = Data("""
+        Content-Type: multipart/mixed; boundary="A"\r
+        \r
+        --NOTTHEBOUNDARY\r
+        Content-Type: text/plain\r
+        \r
+        body\r
+        """.utf8)
+        let parsed = MIME.parseReporting(source)
+
+        XCTAssertFalse(parsed.report.complete, "nothing in this multipart was read")
+        XCTAssertTrue(parsed.report.boundaryMissing)
+        XCTAssertTrue(parsed.part.unparsed)
+        XCTAssertFalse(parsed.part.body.isEmpty, "the only copy of the content was discarded")
+        let note = parsed.report.note ?? ""
+        XCTAssertTrue(note.contains("boundary"), note)
+        XCTAssertEqual(parsed.report.dict["parsed_complete"] as? Bool, false)
+    }
+
+    func testAMultipartThatReallyHoldsNoPartsIsCompleteWithNothingInIt() {
+        // The other message that yields no pieces, and the reason the split
+        // reports whether it saw a delimiter at all: this one's boundary is
+        // there and was read. "Read, and there is nothing in it" is a different
+        // answer from "none of it could be read", and only the second is a
+        // coverage failure.
+        let source = Data("""
+        Content-Type: multipart/mixed; boundary="A"\r
+        \r
+        --A--\r
+        """.utf8)
+        let parsed = MIME.parseReporting(source)
+
+        XCTAssertTrue(parsed.report.complete, parsed.report.note ?? "")
+        XCTAssertFalse(parsed.report.boundaryMissing)
+        XCTAssertFalse(parsed.part.unparsed)
+        XCTAssertTrue(parsed.part.parts.isEmpty)
+    }
+
     func testAttachmentsStillComeBackInDocumentOrder() {
         // `mail_save_attachment`'s `index` argument refers to this order, so a
         // rewrite that reversed it would silently save the wrong file.
