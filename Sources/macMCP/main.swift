@@ -67,7 +67,7 @@ while let line = readLine(strippingNewline: true) {
                     "name": .string("macmcp"),
                     "version": .string("1.1.0"),
                     "contextSchemaVersion": .int(2),
-                    "contextSchema": .object(mailContextSchema)
+                    "contextSchema": .object(macmcpContextSchema)
                 ])
             ])
         ))
@@ -181,14 +181,18 @@ while let line = readLine(strippingNewline: true) {
             ))
             break
         }
-        guard let fragment = mailContextSchema[field]?.objectValue else {
+        guard let declared = contextField(named: field) else {
             respond(JSONRPCResponse(
                 id: req.id,
                 error: JSONRPCError(code: -32602, message: "unknown contextSchema field: \(field)")
             ))
             break
         }
-        guard fragment["enumerable"]?.boolValue == true else {
+        // A field is enumerable exactly when it carries an enumerator, so
+        // "declared enumerable but not implemented" is not a state that can be
+        // reached -- it used to be a `default:` branch in a per-service switch
+        // whose only job was to say so.
+        guard let enumerate = declared.enumerate else {
             respond(JSONRPCResponse(
                 id: req.id,
                 error: JSONRPCError(code: -32602, message: "contextSchema field \(field) is not enumerable")
@@ -196,8 +200,13 @@ while let line = readLine(strippingNewline: true) {
             break
         }
         let values = req.params?["values"]?.objectValue
-        let (entries, error) = MailService.enumerateContext(field: field, values: values)
+        let (entries, error) = enumerate(values)
         if let error {
+            // -32000 is JSON-RPC's implementation-defined server-error range,
+            // which relay reads as "could not answer right now": retryable,
+            // text entry stays available. Never an empty list -- a failure and
+            // "there are none" must not look the same, or a profile gets saved
+            // against a host the operator was shown nothing about.
             respond(JSONRPCResponse(id: req.id, error: JSONRPCError(code: -32000, message: error)))
             break
         }

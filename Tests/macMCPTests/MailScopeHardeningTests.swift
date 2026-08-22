@@ -275,7 +275,25 @@ final class MailScopeHardeningTests: XCTestCase {
             restrictFieldsGoverning(tool: "mail_save_attachment"),
             ["file_dirs", "mail_accounts", "mail_mailboxes"]
         )
-        XCTAssertEqual(restrictFieldsGoverning(tool: "contacts_list"), [])
+        // `contacts_list` used to be the "a non-mail tool is governed by
+        // nothing" case. It is governed now -- the calendar/contacts/reminders
+        // fields declare `contacts_*` -- so the original claim moves to a tool
+        // no field names at all, and this line becomes the check that a new
+        // service's `applies_to` reaches its own tools and stops there.
+        XCTAssertEqual(
+            restrictFieldsGoverning(tool: "contacts_list"),
+            ["contact_accounts", "contact_groups"]
+        )
+        XCTAssertEqual(
+            restrictFieldsGoverning(tool: "calendars_list_events"),
+            ["calendar_accounts", "calendars"]
+        )
+        XCTAssertEqual(
+            restrictFieldsGoverning(tool: "reminders_create"),
+            ["reminder_accounts", "reminder_lists"]
+        )
+        XCTAssertEqual(restrictFieldsGoverning(tool: "web_fetch"), [])
+        XCTAssertEqual(restrictFieldsGoverning(tool: "messages_send"), [])
         XCTAssertTrue(globMatches("mail_*", "mail_send"))
         XCTAssertFalse(globMatches("mail_*", "messages_send"))
         XCTAssertTrue(globMatches("mail_get_source", "mail_get_source"))

@@ -192,6 +192,108 @@ enum ContactsService {
         ["id": group.identifier, "name": group.name]
     }
 
+    // MARK: - context/enumerate (ADR-011 decision 6)
+
+    /// An account name for a `CNContainer`.
+    ///
+    /// `CNContainer.name` is non-optional but is routinely **empty** for the
+    /// local container on macOS, and an empty account name is unusable as a
+    /// scope value: it would render as a blank row in the operator's picker,
+    /// and `Account/Group` would come out as `/Family`. The container's type
+    /// is what is left to name it by, and the local one is called `On My Mac`
+    /// for the same reason Mail's app-level mailboxes are (CLAUDE.md: "`On My
+    /// Mac` is an account name every mail tool accepts") -- it is the name the
+    /// user sees in Contacts.app, so an operator recognises it.
+    static func containerName(_ container: CNContainer) -> String {
+        if !container.name.isEmpty { return container.name }
+        switch container.type {
+        case .local: return "On My Mac"
+        case .exchange: return "Exchange"
+        case .cardDAV: return "CardDAV"
+        case .unassigned: return "Unassigned"
+        @unknown default: return "Unknown"
+        }
+    }
+
+    /// Every contact group, as a container/leaf row.
+    ///
+    /// **A group's identity here is `Account/Group`, not `CNGroup.identifier`,
+    /// and that is a decision rather than a convenience.** `CNGroup` carries
+    /// both, and the identifier is the more precise handle -- it is unique by
+    /// construction and survives a rename, which a path does not. It is
+    /// nevertheless the wrong value for this field:
+    ///
+    /// * It is an opaque UUID (`4A2B…`). ADR-011's whole reason for the picker
+    ///   (decision 6, constraint 2) is that an operator must be able to *read*
+    ///   what they granted; a profile whose scope is a list of UUIDs cannot be
+    ///   reviewed, and a review that cannot be done is constraint 2 defeating
+    ///   constraint 1. The audit line (decision 7) records the injected scope,
+    ///   and a security log naming three UUIDs answers "was this call
+    ///   confined?" with a question.
+    /// * It is not stable in the way it looks stable. A container that
+    ///   re-syncs re-issues identifiers -- the same hazard CLAUDE.md records
+    ///   for Mail's numeric ids ("the numeric id dies when the account
+    ///   re-uploads") -- so the UUID's advantage over a name is smaller than
+    ///   it appears, and it fails *silently*: the scope stops matching and the
+    ///   client is confined to nothing, with nothing anywhere saying why. A
+    ///   renamed group at least reads as a renamed group.
+    /// * Nothing else in this schema is a UUID. `mail_mailboxes` is a path,
+    ///   `calendars` is `Source/Title`; one field spelled differently is one
+    ///   more thing an operator has to know.
+    ///
+    /// The bare *name* is refused for the reason `ScopePath` states: it does
+    /// not identify a group. Two accounts can each hold a `Family`, and this
+    /// is the same "a leaf name does not identify a thing" bug the mailbox
+    /// path work fixed. So the container is part of the value, matched whole.
+    /// Where a path really is ambiguous -- two groups of one name in one
+    /// account, which Contacts.app does not prevent -- `ScopePath.entries`
+    /// offers it once and `ScopePath.ambiguousValues` is what phase 2 refuses
+    /// on, exactly as `mail_move` refuses two mailboxes carrying one name.
+    ///
+    /// Groups are read per container rather than through `store.groups(matching:
+    /// nil)` (what `contacts_list_groups` calls) because that call cannot say
+    /// which container a group is in, and the container is half the value.
+    static func groupRows() -> (rows: [ScopePath.Row], error: String?) {
+        guard hasAccess() else { return ([], accessDeniedMsg) }
+        do {
+            var rows: [ScopePath.Row] = []
+            for container in try store.containers(matching: nil) {
+                let predicate = CNGroup.predicateForGroupsInContainer(withIdentifier: container.identifier)
+                for group in try store.groups(matching: predicate) {
+                    rows.append(ScopePath.Row(container: containerName(container), leaf: group.name))
+                }
+            }
+            return (rows, nil)
+        } catch {
+            return ([], "failed to read contact groups: \(error.localizedDescription)")
+        }
+    }
+
+    /// The containers themselves, read directly rather than derived from
+    /// `groupRows`.
+    ///
+    /// A calendar account with no calendars grants nothing and is left out of
+    /// that picker; a contact account with no *groups* is not the same thing,
+    /// because `contact_accounts` governs the cards as well -- `contacts_list`
+    /// and `contacts_search_by_phone` read contacts, which live in a container
+    /// whether or not any group does. Deriving accounts from group rows would
+    /// hide an account holding a thousand cards and no group.
+    static func enumerateAccounts() -> ScopeEnumeration {
+        guard hasAccess() else { return ([], accessDeniedMsg) }
+        do {
+            let containers = try store.containers(matching: nil)
+            return (ScopePath.containerEntries(fromContainers: containers.map(containerName)), nil)
+        } catch {
+            return ([], "failed to read contact accounts: \(error.localizedDescription)")
+        }
+    }
+
+    static func enumerateGroups(accountFilter: [String]?) -> ScopeEnumeration {
+        let (rows, error) = groupRows()
+        if let error { return ([], error) }
+        return (ScopePath.entries(fromRows: rows, containerFilter: accountFilter), nil)
+    }
+
     // MARK: - Fetch helpers
 
     private static func fetchContact(id: String) -> CNContact? {

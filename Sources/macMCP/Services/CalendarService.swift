@@ -96,7 +96,7 @@ enum CalendarService {
             [
                 "title": cal.title,
                 "type": calendarTypeName(cal.type),
-                "source": cal.source?.title ?? "unknown"
+                "source": cal.source?.title ?? unknownSourceName
             ]
         }
         return jsonResult(results)
@@ -197,6 +197,49 @@ enum CalendarService {
         } catch {
             return errorResult("failed to create event: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - context/enumerate (ADR-011 decision 6)
+
+    /// Every event calendar, as a container/leaf row.
+    ///
+    /// Read through `store.calendars(for: .event)` -- the one call
+    /// `calendars_list` and `calendars_list_events` already make -- so the
+    /// picker can never offer a calendar the tools cannot see, or miss one
+    /// they can. Deriving the *accounts* from the same rows rather than from
+    /// `store.sources` is the same rule one level up: a source holding no
+    /// event calendar is not a calendar account this client could reach
+    /// anything through, and offering it would be a permission that grants
+    /// nothing while reading as though it grants something.
+    ///
+    /// The access check is what makes a failure a failure. `-32000` and an
+    /// empty list must not look the same (`relay/docs/context-schema.md`: "a
+    /// failure and 'there are none' must not look the same, or a profile gets
+    /// saved against a host the operator was shown nothing about"), so a Mac
+    /// whose Calendar grant is missing answers with the sentence, never with
+    /// `[]`.
+    static func calendarRows() -> (rows: [ScopePath.Row], error: String?) {
+        guard hasAccess() else { return ([], accessDeniedMsg) }
+        let rows = store.calendars(for: .event).map {
+            ScopePath.Row(container: $0.source?.title ?? unknownSourceName, leaf: $0.title)
+        }
+        return (rows, nil)
+    }
+
+    /// What `calendars_list` reports for a calendar whose source EventKit will
+    /// not name -- the same string, so the two surfaces agree.
+    static let unknownSourceName = "unknown"
+
+    static func enumerateAccounts() -> ScopeEnumeration {
+        let (rows, error) = calendarRows()
+        if let error { return ([], error) }
+        return (ScopePath.containerEntries(fromRows: rows), nil)
+    }
+
+    static func enumerateCalendars(accountFilter: [String]?) -> ScopeEnumeration {
+        let (rows, error) = calendarRows()
+        if let error { return ([], error) }
+        return (ScopePath.entries(fromRows: rows, containerFilter: accountFilter), nil)
     }
 
     // MARK: - Registration

@@ -940,62 +940,18 @@ enum MailService {
         return nil
     }
 
-    /// ADR-011 decision 4's presence requirement, read off macMCP's own
-    /// declaration rather than off a list re-typed per handler.
+    /// ADR-011 decision 4's presence requirement, as an `MCPCallResult`.
     ///
-    /// For every `scope: "restrict"` field whose `applies_to` selects this
-    /// tool, a mediated call must carry a non-empty value or the call refuses.
-    /// The three states `MailScope` keeps apart are what makes it correct:
-    /// `.unscoped` (nobody mediated -- behave exactly as macmcp on a bare
-    /// stdio pipe always has), `.refuse` (mediated, field absent or empty --
-    /// refuse), `.allowed` (proceed, confined).
-    ///
-    /// **`file_dirs` is excluded here, and that is the one judgement in this
-    /// function.** ADR-011 decision 4 says a governed call refuses; relay
-    /// applies that to the whole tool. macMCP applies it to the *parameter*,
-    /// because that is a distinction only macMCP can make and the tool-level
-    /// reading gives a wrong answer at both tools the field names:
-    /// `mail_get_source` reads a message inline perfectly well with nowhere to
-    /// write (its own comment has said so since the field existed), and
-    /// `mail_save_attachment` is unusable without a destination anyway -- so
-    /// the tool-level check would be redundant where it is right and wrong
-    /// where it is not. The parameter checks live at the three places a path
-    /// is actually used (`destination`, `save_to`, `attachments`) and each
-    /// refuses on its own. Selecting by `source` rather than by field name
-    /// keeps that from being a hardcoded exception: an operator-set field is a
-    /// grant of *resources*, and having none of them means there is nothing
-    /// for the tool to act on; a `project_path` field is a filesystem
-    /// foothold, and having none of it means one argument is unavailable.
+    /// The rule -- for every `scope: "restrict"` field whose `applies_to`
+    /// selects this tool, a mediated call must carry a non-empty value or the
+    /// call refuses, and `source: "project_path"` fields are excluded because
+    /// macMCP confines their *parameter* rather than the tool -- lives in
+    /// `ResourceScope.presenceRefusal`, which every scoping service shares.
+    /// What is mail's here is only the shape of the answer: a refusal is a
+    /// scope violation, so it carries the `_meta` marker relay's alerting
+    /// selects on rather than being an ordinary error.
     static func presenceRefusal(tool: String, call: MailCall) -> MCPCallResult? {
-        guard call.scope.isScoped else { return nil }
-        for field in restrictFieldsGoverning(tool: tool) {
-            guard mailContextSchema[field]?.objectValue?["source"]?.stringValue == "operator" else { continue }
-            let access: MailScope.Access
-            switch field {
-            case "mail_accounts": access = call.scope.accountsAccess
-            case "mail_mailboxes": access = call.scope.mailboxesAccess
-            // A restrict field declared and not wired to a value here would
-            // otherwise be silently unenforced -- the fail-open shape this
-            // whole function exists to close -- so it refuses until someone
-            // wires it, which is loud and closed rather than quiet and open.
-            default:
-                return errorResult(
-                    "macmcp declares the resource scope field `\(field)` as governing \(tool) but does "
-                    + "not know how to apply it, so the call is refused rather than run unconfined. "
-                    + "This is a bug in macmcp, not in the access profile."
-                )
-            }
-            if case .refuse = access {
-                let noun = field == "mail_accounts" ? "mail account" : "mailbox"
-                return scopeViolationResult(
-                    "this call carries no `\(field)`, so there is no \(noun) \(tool) may reach. "
-                    + "An absent or empty resource scope is a refusal rather than \"everything\": "
-                    + "the access profile making this call needs \(field) set to the "
-                    + "\(noun)(s) it is allowed to reach."
-                )
-            }
-        }
-        return nil
+        call.scope.presenceRefusal(tool: tool).map(scopeViolationResult)
     }
 
     /// Which mailboxes a generated collection snippet should gather.
@@ -2915,48 +2871,6 @@ enum MailService {
 
     // MARK: - context/enumerate (ADR-011 decision 6)
 
-    /// Backs the `context/enumerate` JSON-RPC method, dispatched directly from
-    /// `main.swift` -- not a tool. It never reaches `tools/list` or
-    /// `tools/call`, takes no `_meta` and applies no `MailScope`: it runs on
-    /// behalf of the operator populating a picker in Relay's Settings UI while
-    /// configuring an access profile, not on behalf of any mediated client
-    /// (ADR-011 decision 6 is explicit that this is deliberate new disclosure,
-    /// not an oversight). It is built by calling exactly the machinery
-    /// `mail_list_accounts` and `mail_list_mailboxes` call -- `accountNames`
-    /// and `listMailboxesScriptJXA` -- with a fresh `MailCall` whose `scope`
-    /// is left at its default `.none`, which is what "no restriction" already
-    /// means everywhere else in this file.
-    ///
-    /// `field` must already have been checked by the caller (`main.swift`)
-    /// against `mailContextSchema` and found `enumerable: true`; only the two
-    /// fields macMCP currently declares as such are handled below, and any
-    /// other name reaching here is a caller error the schema check should
-    /// have caught first.
-    ///
-    /// The tuple return, rather than `Result`, matches every other helper in
-    /// this file (`accountNames`, `runJXA`, ...): a non-nil `error` means the
-    /// underlying Mail read failed outright and must become a JSON-RPC error,
-    /// never an empty `entries` array -- an operator's picker has to be able
-    /// to tell "Mail says there are no more mailboxes" from "could not ask
-    /// Mail at all".
-    static func enumerateContext(
-        field: String,
-        values: JSONObject?
-    ) -> (entries: [(value: String, label: String)], error: String?) {
-        switch field {
-        case "mail_accounts":
-            return enumerateMailAccounts()
-        case "mail_mailboxes":
-            return enumerateMailMailboxes(accountFilter: values?["mail_accounts"]?.stringsValue)
-        default:
-            // Unreached while `mailContextSchema` declares exactly these two
-            // fields `enumerable: true` -- kept as a named failure rather
-            // than a crash so a future enumerable field fails loudly with a
-            // sentence naming the gap, instead of silently returning nothing.
-            return ([], "macmcp declares \"\(field)\" enumerable but does not implement its enumeration")
-        }
-    }
-
     /// The account-name -> `context/enumerate` entry shape: `On My Mac`
     /// (CLAUDE.md: "an account name every mail tool accepts") appended when
     /// Mail's own list did not already carry it.
@@ -2975,7 +2889,7 @@ enum MailService {
     /// Every account Mail holds, plus `On My Mac`, unscoped -- this is the
     /// operator listing what exists on the host, not a client reading what it
     /// may reach.
-    private static func enumerateMailAccounts() -> (entries: [(value: String, label: String)], error: String?) {
+    static func enumerateMailAccounts() -> ScopeEnumeration {
         let call = MailCall(budget: Budget.listAccounts)
         let (names, error) = accountNames(scopable: false, call: call)
         if let error { return ([], error) }
@@ -3026,9 +2940,7 @@ enum MailService {
     /// or "every account", and the picker's dependent field needs "these
     /// several", which is a filter over "every account" and not a new case
     /// in the generator.
-    private static func enumerateMailMailboxes(
-        accountFilter: [String]?
-    ) -> (entries: [(value: String, label: String)], error: String?) {
+    static func enumerateMailMailboxes(accountFilter: [String]?) -> ScopeEnumeration {
         let call = MailCall(budget: Budget.listMailboxes)
         let script = """
         var mail = Application('Mail');

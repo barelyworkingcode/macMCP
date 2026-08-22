@@ -41,6 +41,39 @@ enum RemindersService {
         return f
     }()
 
+    // MARK: - context/enumerate (ADR-011 decision 6)
+
+    /// Every reminder list, as a container/leaf row.
+    ///
+    /// `store.calendars(for: .reminder)` is exactly what `reminders_list` and
+    /// `reminders_create` already resolve `list_name` against, so the picker
+    /// offers what those tools can see and nothing else. The account is the
+    /// EKSource title, the same axis a calendar uses -- Reminders and Calendar
+    /// share EventKit's source model, which is why the two field pairs are
+    /// shaped identically rather than merely looking alike.
+    ///
+    /// A missing grant is the sentence, never an empty list: `-32000` and
+    /// "there are none" must stay distinguishable.
+    static func listRows() -> (rows: [ScopePath.Row], error: String?) {
+        if let err = ensureAccess() { return ([], err) }
+        let rows = store.calendars(for: .reminder).map {
+            ScopePath.Row(container: $0.source?.title ?? CalendarService.unknownSourceName, leaf: $0.title)
+        }
+        return (rows, nil)
+    }
+
+    static func enumerateAccounts() -> ScopeEnumeration {
+        let (rows, error) = listRows()
+        if let error { return ([], error) }
+        return (ScopePath.containerEntries(fromRows: rows), nil)
+    }
+
+    static func enumerateLists(accountFilter: [String]?) -> ScopeEnumeration {
+        let (rows, error) = listRows()
+        if let error { return ([], error) }
+        return (ScopePath.entries(fromRows: rows, containerFilter: accountFilter), nil)
+    }
+
     static func register(_ registry: ToolRegistry) {
         let cat = "Reminders"
 
