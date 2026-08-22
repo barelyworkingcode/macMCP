@@ -2734,6 +2734,136 @@ enum MailService {
         return script
     }
 
+    // MARK: - context/enumerate (ADR-011 decision 6)
+
+    /// Backs the `context/enumerate` JSON-RPC method, dispatched directly from
+    /// `main.swift` -- not a tool. It never reaches `tools/list` or
+    /// `tools/call`, takes no `_meta` and applies no `MailScope`: it runs on
+    /// behalf of the operator populating a picker in Relay's Settings UI while
+    /// configuring an access profile, not on behalf of any mediated client
+    /// (ADR-011 decision 6 is explicit that this is deliberate new disclosure,
+    /// not an oversight). It is built by calling exactly the machinery
+    /// `mail_list_accounts` and `mail_list_mailboxes` call -- `accountNames`
+    /// and `listMailboxesScriptJXA` -- with a fresh `MailCall` whose `scope`
+    /// is left at its default `.none`, which is what "no restriction" already
+    /// means everywhere else in this file.
+    ///
+    /// `field` must already have been checked by the caller (`main.swift`)
+    /// against `mailContextSchema` and found `enumerable: true`; only the two
+    /// fields macMCP currently declares as such are handled below, and any
+    /// other name reaching here is a caller error the schema check should
+    /// have caught first.
+    ///
+    /// The tuple return, rather than `Result`, matches every other helper in
+    /// this file (`accountNames`, `runJXA`, ...): a non-nil `error` means the
+    /// underlying Mail read failed outright and must become a JSON-RPC error,
+    /// never an empty `entries` array -- an operator's picker has to be able
+    /// to tell "Mail says there are no more mailboxes" from "could not ask
+    /// Mail at all".
+    static func enumerateContext(
+        field: String,
+        values: JSONObject?
+    ) -> (entries: [(value: String, label: String)], error: String?) {
+        switch field {
+        case "mail_accounts":
+            return enumerateMailAccounts()
+        case "mail_mailboxes":
+            return enumerateMailMailboxes(accountFilter: values?["mail_accounts"]?.stringsValue)
+        default:
+            // Unreached while `mailContextSchema` declares exactly these two
+            // fields `enumerable: true` -- kept as a named failure rather
+            // than a crash so a future enumerable field fails loudly with a
+            // sentence naming the gap, instead of silently returning nothing.
+            return ([], "macmcp declares \"\(field)\" enumerable but does not implement its enumeration")
+        }
+    }
+
+    /// The account-name -> `context/enumerate` entry shape: `On My Mac`
+    /// (CLAUDE.md: "an account name every mail tool accepts") appended when
+    /// Mail's own list did not already carry it.
+    ///
+    /// Pure and therefore testable without a mailbox or even `osascript` --
+    /// which matters here specifically, because "does `On My Mac` still need
+    /// appending" is exactly the kind of thing a rename or a future Mail that
+    /// starts listing it itself would break silently, with the effect showing
+    /// up only as a picker entry that quietly duplicated or vanished.
+    static func accountEnumerationEntries(fromNames names: [String]) -> [(value: String, label: String)] {
+        var all = names
+        if !all.contains(where: isLocalAccount) { all.append(localAccountName) }
+        return all.map { (value: $0, label: $0) }
+    }
+
+    /// Every account Mail holds, plus `On My Mac`, unscoped -- this is the
+    /// operator listing what exists on the host, not a client reading what it
+    /// may reach.
+    private static func enumerateMailAccounts() -> (entries: [(value: String, label: String)], error: String?) {
+        let call = MailCall(budget: Budget.listAccounts)
+        let (names, error) = accountNames(scopable: false, call: call)
+        if let error { return ([], error) }
+        return (accountEnumerationEntries(fromNames: names), nil)
+    }
+
+    /// Filters and labels the rows `listMailboxesScriptJXA`'s "everything"
+    /// branch produces (`[{account, mailboxes: [path, ...]}]`) into
+    /// `context/enumerate` entries, keeping only the accounts named in
+    /// `accountFilter` (case-insensitively) when it is non-nil *and*
+    /// non-empty -- an empty array means "every account" exactly as absent
+    /// does, per the wire contract's "no values means all accounts", and the
+    /// two must not be allowed to drift apart into "empty means nothing
+    /// matches".
+    ///
+    /// Pure and therefore testable without a mailbox: the filter and the
+    /// label format are the entirety of what this endpoint adds on top of
+    /// the bytes `listMailboxesScriptJXA` already produces and already has
+    /// its own hermetic tests for.
+    static func mailboxEnumerationEntries(
+        fromRows rows: [[String: Any]],
+        accountFilter: [String]?
+    ) -> [(value: String, label: String)] {
+        let wanted: Set<String>? = (accountFilter?.isEmpty == false)
+            ? Set(accountFilter!.map { $0.lowercased() })
+            : nil
+        var entries: [(value: String, label: String)] = []
+        for row in rows {
+            guard let account = row["account"] as? String else { continue }
+            if let wanted, !wanted.contains(account.lowercased()) { continue }
+            for path in row["mailboxes"] as? [String] ?? [] {
+                entries.append((value: path, label: "\(path) (\(account))"))
+            }
+        }
+        return entries
+    }
+
+    /// Every mailbox path in every account (`On My Mac` included), filtered
+    /// to `accountFilter` when the operator has already chosen one or more
+    /// accounts in the picker (`values.mail_accounts`, per `depends_on`).
+    ///
+    /// This runs the same "everything" branch of `listMailboxesScriptJXA`
+    /// that an unscoped, account-less `mail_list_mailboxes` runs -- one
+    /// Apple Event per account, cheap on any real machine -- and filters the
+    /// rows in Swift (`mailboxEnumerationEntries`), rather than adding a
+    /// second script path that accepts a list of accounts:
+    /// `listMailboxesScriptJXA` only ever knew how to enumerate "one account"
+    /// or "every account", and the picker's dependent field needs "these
+    /// several", which is a filter over "every account" and not a new case
+    /// in the generator.
+    private static func enumerateMailMailboxes(
+        accountFilter: [String]?
+    ) -> (entries: [(value: String, label: String)], error: String?) {
+        let call = MailCall(budget: Budget.listMailboxes)
+        let script = """
+        var mail = Application('Mail');
+        \(listMailboxesScriptJXA(account: nil))
+        """
+        let (output, error) = runJXA(script, scopable: false, call: call)
+        if let error { return ([], error) }
+        guard let data = output.data(using: .utf8),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return ([], "could not parse mailbox list from Mail")
+        }
+        return (mailboxEnumerationEntries(fromRows: rows, accountFilter: accountFilter), nil)
+    }
+
     private static func getEmails(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         let limit = max(args?["limit"]?.intValue ?? 10, 0)

@@ -128,6 +128,52 @@ while let line = readLine(strippingNewline: true) {
         }
         respond(JSONRPCResponse(id: req.id, result: .object(resultObj)))
 
+    // ADR-011 decision 6: a separate JSON-RPC method, not a tool. It backs a
+    // picker in relay's operator-facing Settings UI, never a tool call, so it
+    // must stay off `tools/list` (nothing above registers it with `registry`)
+    // and is dispatched here directly. Unlike `tools/call` it reads no
+    // `_meta` and applies no scope: an operator configuring a profile is
+    // allowed to see everything on the host, which is the disclosure ADR-011
+    // names as deliberate. An MCP that does not implement this method still
+    // falls through to the `default` case below and returns the ordinary
+    // -32601, which is how relay detects the absence and degrades to a
+    // free-text box (decision 6's "raw JSON editor is the fallback").
+    case "context/enumerate":
+        guard let field = req.params?["field"]?.stringValue else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "context/enumerate requires a \"field\" string parameter")
+            ))
+            break
+        }
+        guard let fragment = mailContextSchema[field]?.objectValue else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "unknown contextSchema field: \(field)")
+            ))
+            break
+        }
+        guard fragment["enumerable"]?.boolValue == true else {
+            respond(JSONRPCResponse(
+                id: req.id,
+                error: JSONRPCError(code: -32602, message: "contextSchema field \(field) is not enumerable")
+            ))
+            break
+        }
+        let values = req.params?["values"]?.objectValue
+        let (entries, error) = MailService.enumerateContext(field: field, values: values)
+        if let error {
+            respond(JSONRPCResponse(id: req.id, error: JSONRPCError(code: -32000, message: error)))
+            break
+        }
+        let valueValues: [JSONValue] = entries.map {
+            .object(["value": .string($0.value), "label": .string($0.label)])
+        }
+        respond(JSONRPCResponse(
+            id: req.id,
+            result: .object(["field": .string(field), "values": .array(valueValues)])
+        ))
+
     default:
         respond(JSONRPCResponse(
             id: req.id,
