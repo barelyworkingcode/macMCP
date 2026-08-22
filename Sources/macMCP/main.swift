@@ -65,7 +65,9 @@ while let line = readLine(strippingNewline: true) {
                 "capabilities": .object(["tools": .object([:])]),
                 "serverInfo": .object([
                     "name": .string("macmcp"),
-                    "version": .string("1.0.0")
+                    "version": .string("1.1.0"),
+                    "contextSchemaVersion": .int(2),
+                    "contextSchema": .object(mailContextSchema)
                 ])
             ])
         ))
