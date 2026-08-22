@@ -153,13 +153,39 @@ final class MailSourceTerminationTests: XCTestCase {
         XCTAssertEqual(MIME.multipartIsTerminated(data), true)
     }
 
-    func testAnEpilogueReadsAsNotTerminated() throws {
-        // Legal per RFC 2046 and vanishingly rare. It costs such a message the
-        // stronger reading -- `"wire"` rather than `"wire+terminated"` -- and
-        // never `complete: false`, because the basis only tightens when the
-        // message is a multipart the check could answer for.
+    func testAMessageWithALegalEpilogueIsStillTerminated() throws {
+        // RFC 2046 5.1.1 permits an epilogue after the close-delimiter. This
+        // used to read as not terminated, and the comment here used to claim
+        // that only cost such a message the stronger reading. It did not: the
+        // basis went to `unterminated`, `complete` went false, and
+        // mail_save_attachment refused outright -- a legal message losing the
+        // one tool whose job is producing its attachment.
         var data = multipart(parts: 1, terminated: true)
         data.append(contentsOf: Data("this is an epilogue\n".utf8))
+        XCTAssertEqual(MIME.multipartIsTerminated(data), true)
+    }
+
+    func testAMultiLineEpilogueIsStillTerminated() throws {
+        var data = multipart(parts: 1, terminated: true)
+        for i in 0..<50 {
+            data.append(contentsOf: Data("epilogue line \(i)\r\n".utf8))
+        }
+        XCTAssertEqual(MIME.multipartIsTerminated(data), true)
+    }
+
+    func testAnEpilogueDoesNotRescueAMessageThatNeverClosed() throws {
+        // The scan looks back for a real close-delimiter; trailing bytes that
+        // are not one must not be mistaken for the end of the message.
+        var data = multipart(parts: 1, terminated: false)
+        data.append(contentsOf: Data("this is not a close delimiter\n".utf8))
+        XCTAssertEqual(MIME.multipartIsTerminated(data), false)
+    }
+
+    func testACloseDelimiterFurtherBackThanTheScanIsNotFound() throws {
+        // The bound is deliberate: past it, a close-delimiter is not
+        // distinguishable from a message that never had one.
+        var data = multipart(parts: 1, terminated: true)
+        data.append(contentsOf: Data(repeating: 0x41, count: MIME.maxEpilogueScan + 1024))
         XCTAssertEqual(MIME.multipartIsTerminated(data), false)
     }
 }

@@ -4573,7 +4573,7 @@ var savedDraft = (function() {
             if byteCount == 0 {
                 sentences.append("Mail returned no bytes at all for this message — not even its headers had arrived. An RFC 822 message always has a header block, so this is the absence of a message rather than an empty one. Try again in a moment.")
             } else if completeBasis == "unterminated", let expectedSize {
-                sentences.append("These \(byteCount) bytes reach the \(expectedSize) Mail reports only once each LF is counted as the CRLF it stood for on the wire, which leaves \(expectedSize - byteCount) byte(s) of slack — and the message is a multipart that does not end with the \"--boundary--\" line that closes it, so it stops short of where it says it ends. That is a fragment, and an attachment cut out of one is silently truncated on disk. Try again in a moment. The one other thing this can be is a sender that left the closing line out of a message that is all here, which RFC 2046 does not allow; mail_get_source will still return what there is.")
+                sentences.append("These \(byteCount) bytes reach the \(expectedSize) Mail reports only once each LF is counted as the CRLF it stood for on the wire, which leaves \(expectedSize - byteCount) byte(s) of slack — and the message is a multipart that does not end with the \"--boundary--\" line that closes it, so it stops short of where it says it ends. That is a fragment, and an attachment cut out of one is silently truncated on disk. Try again in a moment. The one other thing this can be is a sender that left the closing line out of a message that is all here; mail_get_source will still return what there is.")
             } else if !complete, let expectedSize {
                 sentences.append("Mail had only \(wireSize) of this message's \(expectedSize) bytes when the source was read and did not finish downloading the rest within the wait, so what is here is a fragment rather than the message. Try again in a moment.")
             } else if completeBasis == "wire+terminated", let expectedSize {
@@ -5032,7 +5032,7 @@ var savedDraft = (function() {
             // messageSize has slack in it worth 919,823 bytes on a 70.8 MB
             // message.
             if fidelity.completeBasis == "unterminated" {
-                return errorResult("Message \(messageId) is a multipart that does not end with the \"--boundary--\" line closing it, and its \(fidelity.byteCount) bytes reach the \(expectedSize) Mail reports only once every LF is counted as a CRLF — so it stops short of where it says it ends and anything cut out of it would be truncated. Try again in a moment. If it keeps happening, the message itself may be missing that closing line, which RFC 2046 does not allow; mail_get_source will still hand back what there is.")
+                return errorResult("Message \(messageId) is a multipart that does not end with the \"--boundary--\" line closing it, and its \(fidelity.byteCount) bytes reach the \(expectedSize) Mail reports only once every LF is counted as a CRLF — so it stops short of where it says it ends and anything cut out of it would be truncated. Try again in a moment. If it keeps happening, the message itself may be missing that closing line; mail_get_source will still hand back what there is.")
             }
             return errorResult("Mail has only \(fidelity.wireSize) of this message's \(expectedSize) bytes and did not finish downloading it — attachments cut from that would be truncated. Try again in a moment.")
         }

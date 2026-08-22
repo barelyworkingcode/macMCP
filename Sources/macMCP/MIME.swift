@@ -380,28 +380,46 @@ enum MIME {
     /// anywhere before the last part's end does not have it, whatever its
     /// bytes add up to.
     ///
-    /// "Ends with" is read leniently at the tail only: trailing CR, LF, space
-    /// and tab are stepped over, because that is what a transfer adds. An
-    /// epilogue after the close-delimiter — legal, and vanishingly rare — reads
-    /// as *not* terminated, which costs a caller the stronger reading of a
-    /// message rather than a wrong one. The delimiter must also start a line,
-    /// so a body whose last line happens to end in the same characters cannot
-    /// stand in for it.
+    /// The delimiter is looked for at the start of a line anywhere in the tail,
+    /// not only at the very end. RFC 2046 §5.1.1 permits an epilogue after the
+    /// close-delimiter, and requiring the delimiter to be the last thing in the
+    /// message read a legal message as truncated — which cost the caller
+    /// `mail_save_attachment` entirely, rather than costing them the stronger
+    /// reading of it. A close-delimiter at a line start *is* where the multipart
+    /// ends, wherever it sits, so finding it there is the question being asked.
+    /// Requiring a line start still stops a body whose last line happens to end
+    /// in those characters from standing in for it.
+    ///
+    /// The scan is bounded: an epilogue is a trailing note, not a payload, and
+    /// on a 70 MB message a whole-buffer walk to answer a tail question is work
+    /// nobody asked for. A close-delimiter further back than this is not
+    /// distinguishable from a message that never had one.
     static func multipartIsTerminated(_ data: Data) -> Bool? {
         let bytes = [UInt8](data)
         guard let boundary = topLevelBoundary(bytes) else { return nil }
         let needle = [UInt8]("--\(boundary)--".utf8)
-        var end = bytes.count
-        while end > 0, bytes[end - 1] == 0x0D || bytes[end - 1] == 0x0A
-                || bytes[end - 1] == 0x20 || bytes[end - 1] == 0x09 {
-            end -= 1
+        guard bytes.count >= needle.count else { return false }
+        let floor = max(0, bytes.count - maxEpilogueScan)
+        var start = bytes.count - needle.count
+        while start >= floor {
+            var matched = true
+            for i in 0..<needle.count where bytes[start + i] != needle[i] {
+                matched = false
+                break
+            }
+            // At the start of a line, or at the start of the message.
+            if matched, start == 0 || bytes[start - 1] == 0x0A || bytes[start - 1] == 0x0D {
+                return true
+            }
+            start -= 1
         }
-        let start = end - needle.count
-        guard start >= 0 else { return false }
-        for i in 0..<needle.count where bytes[start + i] != needle[i] { return false }
-        // At the start of a line, or at the start of the message.
-        return start == 0 || bytes[start - 1] == 0x0A || bytes[start - 1] == 0x0D
+        return false
     }
+
+    /// How far back from the end `multipartIsTerminated` looks for the
+    /// close-delimiter. Generous against any real epilogue, which is a trailing
+    /// note; bounded so the check stays a tail question on a large message.
+    static let maxEpilogueScan = 1 << 20
 
     /// The `boundary` parameter of the message's own `Content-Type`, when it is
     /// a `multipart/*`. Reads the header block only.

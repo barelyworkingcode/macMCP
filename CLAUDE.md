@@ -240,6 +240,24 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
   message arrived ran against that same value, so nothing can say whether the
   bytes are the message or a fragment.
 
+- **A multipart ends at its close-delimiter, wherever that sits.** The
+  terminator check that closes the `wire` slack (a fragment nearly a megabyte
+  short of a 70 MB message passed as `complete`) first required
+  `--<boundary>--` to be the *last* thing in the source, stepping over trailing
+  whitespace only. RFC 2046 §5.1.1 permits an **epilogue** after it, and such a
+  message read as truncated: `complete_basis: "unterminated"`, `complete:
+  false`, and `mail_save_attachment` refusing outright — a legal message losing
+  the one tool whose job is producing its attachment, under an error that told
+  the caller RFC 2046 forbids what it in fact allows. The delimiter is now
+  looked for at the start of a line anywhere in the last MiB, which is both the
+  correct question (a close-delimiter at a line start *is* where the multipart
+  ends) and a simpler one. The bound is deliberate: further back than that, a
+  close-delimiter is not distinguishable from a message that never had one, and
+  a whole-buffer walk to answer a tail question on a 70 MB message is work
+  nobody asked for. Verified both ways against the fixture — a message with a
+  legal epilogue saves its attachment byte-exactly, and a genuinely truncated
+  multipart is still refused with nothing written.
+
 - **Mail rewrites any body set through its scripting interface, and there is no way around it.** Whatever is given as `content` (or `html content`) arrives inside `<blockquote type="cite">` under Mail's `Apple-Mail-URLShareWrapperClass` scaffolding: a sent message's `text/plain` alternative gets `> ` on every line, and a saved draft's `text/plain` part comes out **empty**. Ruled out on Darwin 27 / Mail 16.0 (3864.500.181), each verified against the fixture's Maildir: setting the body at creation, setting it after `resolveOutgoingJXA`, `visible: true`, `html content`, injecting closing tags to escape the blockquote (WebKit rebalances them), `SendFormat = Plain` with a Mail restart, and textbook AppleScript `make new outgoing message with properties {content:…}` — which reproduces it exactly, so this is not something macMCP's compose path chose. A message **typed by hand** in Mail comes out as a clean single-part `text/plain`, so it is specific to the scripting path. `mailto:` compose windows never appear in `outgoing messages`, so that route cannot be driven; `content.paragraphs.push(…)` **kills osascript** (SIGKILL, no output). What is left is not to lie about it: `mail_create_draft` re-reads the saved draft and reports `body_check`, because `rendered_chars` is measured off `msg.content()` before Mail generates the alternatives and will happily report a plausible number for a message whose plain part is empty. `rendered_chars` also counts **whitespace-stripped** characters — `"just one line here"` reports 15, not 18 — which is right for the question it answers ("did Mail render anything visible") and wrong for the one a caller is likely to ask it ("is this my body's length"), so both compose schemas now say which it is.
 
   **`body_check` is behind `verify_body` and defaults to `null`, not `false`.** It is a guard documented to fire on 100% of calls — the sentence above says the plain part comes back empty for *every* scripted draft — and it costs a full download of the saved draft to report that constant, which on a large draft is the whole draft. So the default says `plain_text_matches_body: null, measured: false` with the known behaviour in the detail. Null rather than a hardcoded `false` because a hardcoded claim becomes a confidently wrong answer the day a Mail release stops rewriting the body, which is precisely what this check exists to catch; `verify_body: true` takes the measurement.
