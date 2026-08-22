@@ -188,19 +188,48 @@ final class MailScriptPlumbingTests: XCTestCase {
 
     // MARK: - What a spawn costs before the script starts
 
-    func testASpawnDoesNotPayAFixedPollingTaxBeforeItCanFinish() {
+    func testAScriptThatFinishesQuicklyIsNotHeldForAFixedQuantum() {
         // The wait used to tick in flat 0.05s steps, so every spawn paid up to
-        // 50ms of pure sleep after its script had already exited — and a scan
-        // spawns one process per account per pass. Ten trivial scripts is the
-        // smallest sample where a 50ms tick is unmistakable against spawn cost.
-        let started = Date()
-        for _ in 0..<10 {
-            let (_, error) = MailService.runJXAData("'x';", retries: 0, timeout: 30)
-            XCTAssertNil(error)
+        // 50ms of pure sleep after its script had already exited -- and a scan
+        // spawns one process per account per pass. Asserted against the curve
+        // itself rather than against ten real spawns: the old test measured
+        // osascript and the machine as much as the tax, so it failed whenever
+        // Mail was busy, which is exactly when the suite is most often run.
+        // The tax a backoff curve charges is bounded by the interval it has
+        // reached, so it grows with how long the script ran -- by 80ms the
+        // interval is at the 50ms ceiling, which is the point of backing off.
+        // What must never come back is a *fixed* quantum: a script finishing in
+        // a millisecond paying tens of them. So the bound is the ceiling, and
+        // below the ceiling it is the elapsed time itself (the curve cannot
+        // overshoot by more than it has already waited), with a small floor for
+        // the sub-millisecond cases.
+        for finish in [0.0005, 0.001, 0.005, 0.02, 0.08, 0.5] {
+            let overshoot = MailService.pollOvershoot(finishingAfter: finish)
+            XCTAssertLessThanOrEqual(
+                overshoot, min(MailService.maxPollInterval, max(0.004, finish)),
+                "a script finishing at \(Int(finish * 1000))ms was held a further "
+                    + "\(Int(overshoot * 1000))ms"
+            )
         }
-        let each = Date().timeIntervalSince(started) / 10
-        // osascript itself costs ~60-90ms. The bound is what a 50ms tick on top
-        // of that would not fit inside, with room for a loaded machine.
-        XCTAssertLessThan(each, 0.12, "each spawn averaged \(Int(each * 1000))ms")
+        // Concretely, the case the flat tick was worst for.
+        XCTAssertLessThan(MailService.pollOvershoot(finishingAfter: 0.001), 0.002)
+        // A flat 50ms tick is what this replaced: it would hold a 1ms script
+        // for 49ms. Pin that the curve starts far below it.
+        XCTAssertLessThanOrEqual(MailService.firstPollInterval, 0.001)
+    }
+
+    func testThePollCurveBacksOffSoALongWaitIsNotMillionsOfWakeups() {
+        // The other half of the trade: starting at a millisecond must not turn
+        // a two-minute timeout into two million wakeups.
+        var interval = MailService.firstPollInterval
+        var wakeups = 0
+        var waited = 0.0
+        while waited < 120 {
+            waited += interval
+            interval = MailService.nextPollInterval(after: interval)
+            wakeups += 1
+        }
+        XCTAssertLessThan(wakeups, 3000, "a 120s wait cost \(wakeups) wakeups")
+        XCTAssertEqual(interval, MailService.maxPollInterval, accuracy: 1e-9)
     }
 }

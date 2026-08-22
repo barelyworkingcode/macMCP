@@ -293,4 +293,55 @@ final class MailSchemaDocsTests: XCTestCase {
             "the body pass's own coverage"
         )
     }
+
+    /// The body pass reads fewer bodies than asked for whenever the newest
+    /// messages in scope are ones it will not read again, and that used to be
+    /// invisible: `bodies_read: 0` beside `body_matches: 0` reads as "none of
+    /// them matched". A caller cannot ask for more without knowing which of the
+    /// two happened.
+    func testTheSearchSchemaSaysWhatAShortBodyPassLooksLike() throws {
+        let text = try description(of: "mail_search")
+        XCTAssertTrue(text.contains("body_scan_shortfall"), text)
+        assertMentions(
+            text,
+            anyOf: ["wider", "widen"],
+            "the sweep being wider than body_scan_limit"
+        )
+    }
+
+    /// `body_check` costs a full download of the saved draft to report an
+    /// answer that has been the same every time it has been measured. It is
+    /// behind an argument now, so both the argument and what the default means
+    /// have to be legible.
+    func testTheDraftSchemaSaysBodyCheckIsNotMeasuredByDefault() throws {
+        let text = try description(of: "mail_create_draft")
+        XCTAssertTrue(text.contains("body_check"), text)
+        XCTAssertTrue(text.contains("verify_body"), text)
+        assertMentions(text, anyOf: ["null"], "the default being null rather than false")
+        let arg = try property("verify_body", of: "mail_create_draft")
+        assertMentions(arg, anyOf: ["default: false", "off by default"], "the default")
+    }
+
+    /// A multipart that stops before the delimiter closing it is a fragment
+    /// whatever its byte count says, and both tools that read a source act on
+    /// that -- one reports it, the other refuses.
+    func testTheSourceToolsNameTheStructuralCompletenessCheck() throws {
+        let source = try description(of: "mail_get_source")
+        XCTAssertTrue(source.contains("wire+terminated"), source)
+        XCTAssertTrue(source.contains("unterminated"), source)
+        let save = try description(of: "mail_save_attachment")
+        assertMentions(
+            save,
+            anyOf: ["unterminated", "--boundary--"],
+            "mail_save_attachment refusing a multipart that stops short of its own end"
+        )
+    }
+
+    /// `mail_mark_read` reports what Mail says afterwards, not what was asked
+    /// for, and names the message it happened to.
+    func testTheMarkReadSchemaSaysTheAnswerIsReadBack() throws {
+        let text = try description(of: "mail_mark_read")
+        assertMentions(text, anyOf: ["read back", "read-back"], "the read-back")
+        assertMentions(text, anyOf: ["error"], "a flag Mail did not take being an error")
+    }
 }

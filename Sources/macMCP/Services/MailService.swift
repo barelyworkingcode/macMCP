@@ -389,14 +389,38 @@ enum MailService {
     /// a fast script almost nothing, and backing off keeps a two-minute wait
     /// from being two million wakeups.
     private static func wait(for process: Process, until deadline: Date) -> Bool {
-        var interval = 0.001
+        var interval = firstPollInterval
         while process.isRunning {
             let left = deadline.timeIntervalSinceNow
             if left <= 0 { break }
             Thread.sleep(forTimeInterval: min(interval, left))
-            interval = min(interval * 1.5, 0.05)
+            interval = nextPollInterval(after: interval)
         }
         return process.isRunning
+    }
+
+    /// The poll curve, as data rather than as a loop, so the property that
+    /// matters -- that a script finishing quickly is not held for a fixed
+    /// quantum -- can be asserted without spawning anything and without
+    /// measuring a machine that may be busy. Deliberately not `private`:
+    /// `MailScriptPlumbingTests` reads both.
+    static let firstPollInterval = 0.001
+    static let maxPollInterval = 0.05
+
+    static func nextPollInterval(after interval: TimeInterval) -> TimeInterval {
+        min(interval * 1.5, maxPollInterval)
+    }
+
+    /// How long the curve sleeps before it has waited `elapsed` -- i.e. the tax
+    /// a script that finishes at `elapsed` actually pays.
+    static func pollOvershoot(finishingAfter elapsed: TimeInterval) -> TimeInterval {
+        var waited = 0.0
+        var interval = firstPollInterval
+        while waited < elapsed {
+            waited += interval
+            interval = nextPollInterval(after: interval)
+        }
+        return waited - elapsed
     }
 
     /// Runs a JXA script under a hard deadline, returning trimmed stdout.
@@ -2261,68 +2285,137 @@ enum MailService {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let account = args?["account"]?.stringValue
         let call = MailCall.forArguments(args, default: Budget.getEmail)
-        let findMessage = findMessageJXA(account: args?["account"]?.stringValue, mailbox: mailbox, messageId: messageId)
 
-        let escapedId = escapeJSString(messageId)
+        // **One script, one bind, one fetch.** This used to be two osascript
+        // spawns with a `findMessageJXA` in each: the first for the properties,
+        // the second for the source that the properties are then checked
+        // against. The second one is not optional -- Mail's own answer for a
+        // message it has not finished downloading is `body: ""` with
+        // `has_attachments: false` and no complaint -- so the message was
+        // downloaded on every call regardless, and the only thing the split
+        // bought was a second process, a second bind, and two readings of
+        // `messageSize` taken at two moments.
+        let (source, expectedSize, meta, fetchError) = fetchSource(
+            account: account,
+            mailbox: mailbox,
+            messageId: messageId,
+            call: call,
+            meta: messagePropertiesJXA
+        )
+        if let fetchError {
+            // A message that is not there has nothing to salvage, and asking
+            // Mail again would be a second spawn to be told the same thing.
+            guard !fetchError.contains("message not found") else { return errorResult(fetchError) }
+            // The bytes could not be read. Mail may still be able to answer for
+            // the message, and its unverified answer with a warning attached is
+            // worth more than nothing -- that is the `source_check` path, and
+            // it is the only reason a second spawn is ever paid for here.
+            return salvagedFromMail(
+                messageId: messageId,
+                account: account,
+                mailbox: mailbox,
+                call: call,
+                reason: fetchError
+            )
+        }
+        guard var payload = meta else {
+            return errorResult("the message fetch returned its bytes without the properties that go with them, which is a bug in macMCP rather than something about the message; please report it")
+        }
+        if let error = payload["error"] as? String { return errorResult(error) }
+        let listedByMail = payload["attachments"] as? [[String: Any]] ?? []
+        payload.removeValue(forKey: "error")
+        return jsonResult(messageChecked(
+            payload,
+            listedByMail: listedByMail,
+            source: source,
+            fidelity: sourceFidelity(source, expectedSize: expectedSize)
+        ))
+    }
 
-        // Every property is read behind `safe`: a message carrying attachments
-        // makes several of them raise "AppleEvent handler failed" (Mail's own
-        // bug), and one bad property must not cost the caller the whole
-        // message. `MIME type` on an attachment is not read at all -- it raises
-        // on every message that has one -- so the type is inferred below from
-        // the filename.
+    /// Everything about a message that only Mail can answer for, as a
+    /// JavaScript expression evaluated against `found`.
+    ///
+    /// Every property is read behind `safe`: a message carrying attachments
+    /// makes several of them raise "AppleEvent handler failed" (Mail's own
+    /// bug), and one bad property must not cost the caller the whole message.
+    /// `MIME type` on an attachment is not read at all -- it raises on every
+    /// message that has one -- so the type comes from the message's own source.
+    ///
+    /// `body` is deliberately still Mail's `content()` rather than the source's
+    /// `text/plain` part. They are not the same answer: Mail renders a
+    /// plain-text body for an HTML-only message, and the source has none to
+    /// give. What the source is authoritative for -- the attachment list, the
+    /// declared types, whether the message is all here -- is taken from the
+    /// source in `messageChecked`, and `body` is the one field Mail is the
+    /// better witness for.
+    private static let messagePropertiesJXA = """
+    {
+        id: '' + safe(function() { return found.id(); }, ''),
+        account: foundAccount,
+        mailbox: foundMailbox,
+        subject: safe(function() { return found.subject(); }, ''),
+        sender: safe(function() { return found.sender(); }, ''),
+        rfc_message_id: '' + safe(function() { return found.messageId(); }, ''),
+        date_received: '' + safe(function() { return found.dateReceived(); }, ''),
+        date_sent: '' + safe(function() { return found.dateSent(); }, ''),
+        message_size: safe(function() { return found.messageSize(); }, 0),
+        read: safe(function() { return found.readStatus(); }, false),
+        to: safe(function() { return found.toRecipients().map(function(r) { return r.address(); }); }, []),
+        cc: safe(function() { return found.ccRecipients().map(function(r) { return r.address(); }); }, []),
+        attachments: safe(function() {
+            return found.mailAttachments().map(function(a) {
+                return {
+                    name: safe(function() { return '' + a.name(); }, ''),
+                    size: safe(function() { return a.fileSize(); }, 0),
+                    downloaded: safe(function() { return a.downloaded(); }, false),
+                    id: safe(function() { return '' + a.id(); }, '')
+                };
+            });
+        }, []),
+        body: safe(function() { return found.content(); }, '')
+    }
+    """
+
+    /// What `mail_get_email` can still say when the message's bytes could not
+    /// be read at all.
+    ///
+    /// A source that will not fetch is not a reason to cost the caller a
+    /// message Mail can describe. It is a reason to say that nothing confirmed
+    /// the description, which is what `source_check` is. This is the only path
+    /// on which the tool spawns twice, and it is reached only after a failure.
+    private static func salvagedFromMail(
+        messageId: String,
+        account: String?,
+        mailbox: String,
+        call: MailCall,
+        reason: String
+    ) -> MCPCallResult {
         let script = """
         var mail = Application('Mail');
-        \(findMessage)
+        \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
         function safe(fn, dflt) { try { var v = fn(); return v == null ? dflt : v; } catch (e) { return dflt; } }
         if (!found) {
-            JSON.stringify({error: 'message not found with id: \(escapedId)'});
+            JSON.stringify({error: 'message not found with id: \(escapeJSString(messageId))'});
         } else {
-            var atts = safe(function() {
-                return found.mailAttachments().map(function(a) {
-                    return {
-                        name: safe(function() { return '' + a.name(); }, ''),
-                        size: safe(function() { return a.fileSize(); }, 0),
-                        downloaded: safe(function() { return a.downloaded(); }, false),
-                        id: safe(function() { return '' + a.id(); }, '')
-                    };
-                });
-            }, []);
-            JSON.stringify({
-                id: '' + safe(function() { return found.id(); }, ''),
-                account: foundAccount,
-                mailbox: foundMailbox,
-                subject: safe(function() { return found.subject(); }, ''),
-                sender: safe(function() { return found.sender(); }, ''),
-                rfc_message_id: '' + safe(function() { return found.messageId(); }, ''),
-                date_received: '' + safe(function() { return found.dateReceived(); }, ''),
-                date_sent: '' + safe(function() { return found.dateSent(); }, ''),
-                message_size: safe(function() { return found.messageSize(); }, 0),
-                read: safe(function() { return found.readStatus(); }, false),
-                to: safe(function() { return found.toRecipients().map(function(r) { return r.address(); }); }, []),
-                cc: safe(function() { return found.ccRecipients().map(function(r) { return r.address(); }); }, []),
-                attachments: atts,
-                body: safe(function() { return found.content(); }, '')
-            });
+            JSON.stringify(\(messagePropertiesJXA));
         }
         """
-        let (output, error) = runJXA(script, call: call)
-        if let error { return errorResult(error) }
+        let (output, error) = runJXA(script, retries: 0, call: call)
+        if error != nil { return errorResult(reason) }
         var payload: [String: Any]
         switch scriptPayload(output) {
-        case .failure(let message): return errorResult(message)
-        case .text(let text): return textResult(text)
+        case .failure: return errorResult(reason)
+        case .text: return errorResult(reason)
         case .object(let object): payload = object
         }
-        return reconciled(
-            payload,
-            listedByMail: payload["attachments"] as? [[String: Any]] ?? [],
-            account: payload["account"] as? String ?? args?["account"]?.stringValue,
-            mailbox: payload["mailbox"] as? String ?? mailbox,
-            messageId: messageId,
-            call: call
-        )
+        if let scriptError = payload["error"] as? String { return errorResult(scriptError) }
+        let listedByMail = payload["attachments"] as? [[String: Any]] ?? []
+        payload["attachments"] = listedByMail.map(withFilenameGuess)
+        payload["has_attachments"] = !listedByMail.isEmpty
+        payload["source_check"] = "the message source could not be read (\(reason)), so the body and attachments here are Mail's own answer and nothing confirms the message had finished downloading"
+        return jsonResult(payload)
     }
 
     /// Checks a message read out of Mail against the message itself, and reports
@@ -2355,37 +2448,9 @@ enum MailService {
     ///
     /// A source fetch that fails leaves the message as Mail reported it, with
     /// `source_check` saying the check did not happen -- an unreadable source is
-    /// not a reason to cost the caller a message that did read.
-    private static func reconciled(
-        _ message: [String: Any],
-        listedByMail: [[String: Any]],
-        account: String?,
-        mailbox: String,
-        messageId: String,
-        call: MailCall
-    ) -> MCPCallResult {
-        var payload = message
-        let (source, expectedSize, error) = fetchSource(
-            account: account,
-            mailbox: mailbox,
-            messageId: messageId,
-            call: call
-        )
-        guard error == nil else {
-            payload["attachments"] = listedByMail.map(withFilenameGuess)
-            payload["has_attachments"] = !listedByMail.isEmpty
-            payload["source_check"] = "the message source could not be read (\(error!)), so the body and attachments here are Mail's own answer and nothing confirms the message had finished downloading"
-            return jsonResult(payload)
-        }
-
-        return jsonResult(messageChecked(
-            payload,
-            listedByMail: listedByMail,
-            source: source,
-            fidelity: sourceFidelity(source, expectedSize: expectedSize)
-        ))
-    }
-
+    /// not a reason to cost the caller a message that did read. See
+    /// `salvagedFromMail`.
+    ///
     /// Applies both rules to a message Mail reported and the source it was
     /// checked against. Split out from the fetch so the rules can be tested
     /// without a mailbox.
@@ -2748,12 +2813,24 @@ JSON.stringify(out);
         call: MailCall
     ) -> (matches: [[String: Any]], scanned: Int, complete: Bool) {
         // Group by mailbox so each one costs a single bulk id fetch.
+        //
+        // **In the order the candidates arrived**, which is newest-first across
+        // the whole scope. A `Dictionary` iterates in an order that depends on
+        // its keys' hash seed, and the seed is per-process, so the groups used
+        // to be visited in a different order on every call -- and this loop
+        // stops when the deadline runs out. Two identical calls could therefore
+        // read the bodies of two different sets of mailboxes and return
+        // different matches, with nothing in either result to say so. Grouping
+        // in arrival order also spends a short budget on the newest messages,
+        // which is the order the caller asked for.
+        var order: [MailboxKey] = []
         var byMailbox: [MailboxKey: [[String: Any]]] = [:]
         for row in candidates {
             let key = MailboxKey(
                 account: row["account"] as? String ?? "",
                 mailbox: row["mailbox"] as? String ?? ""
             )
+            if byMailbox[key] == nil { order.append(key) }
             byMailbox[key, default: []].append(row)
         }
 
@@ -2762,7 +2839,8 @@ JSON.stringify(out);
         var scanned = 0
         var complete = true
 
-        for (key, rows) in byMailbox {
+        for key in order {
+            let rows = byMailbox[key] ?? []
             let wanted = rows.compactMap { $0["id"] as? String }
             guard !wanted.isEmpty else { continue }
 
@@ -2835,6 +2913,83 @@ JSON.stringify(out);
             && sweep.scanComplete
     }
 
+    /// How much of a message that matched on subject or sender the sweep is
+    /// widened by, as a multiple of `body_scan_limit`, and the floor under that.
+    ///
+    /// The pad exists because the sweep's rows are eaten before any body is
+    /// read: a message already being returned, or one that matched on its
+    /// subject or sender, is not read again. Sweeping exactly
+    /// `body_scan_limit` rows therefore left `body_scan_limit` minus the
+    /// metadata hits to read, which for a query that matches a lot of subjects
+    /// is nothing at all.
+    ///
+    /// The size of it is a cost decision, and the cost is not Apple Events: a
+    /// scan reads whole columns whatever the limit is, and the limit only trims
+    /// the rows each mailbox contributes. What it does cost is JSON out of the
+    /// script, and the per-row re-read of a mailbox that changed under the scan
+    /// -- which is bounded by the limit, at ~11ms a row against a 20s budget.
+    /// A ceiling of `maxBodyScanLimit * (1 + factor)` = 1000 rows keeps the
+    /// worst case of that inside its budget, and scaling with what the caller
+    /// asked for keeps a `body_scan_limit: 5` request from paying for a
+    /// thousand-row sweep. The floor is what makes a small limit usable at all:
+    /// four times five is twenty, and twenty subject matches ahead of the first
+    /// body-only one is an ordinary state of affairs.
+    private static let bodyScanSweepPadFactor = 4
+    private static let bodyScanSweepPadFloor = 100
+
+    /// How many rows the body pass's own sweep asks for.
+    ///
+    /// **The sweep has to be wider than the number of bodies to be read, not
+    /// the same size.** It used to run at `body_scan_limit` exactly, and the
+    /// rows already being returned plus the rows that matched on subject or
+    /// sender were then subtracted from that same set with no backfill.
+    /// Measured on the fixture: `body_scan_limit: 5` with query `PROBE`
+    /// returned `bodies_read: 0, body_matches: 0` -- indistinguishable, in the
+    /// response, from five bodies read and none matching. Worse, a body-only
+    /// hit at position six was unreachable at *every* limit, because raising
+    /// the limit widened the sweep that ate it in exactly the same step.
+    ///
+    /// `metadataMatches` is the metadata scan's `total`, which is the most rows
+    /// the sweep can lose to matches; capped, because a query matching
+    /// thousands of subjects would otherwise ask for thousands of rows to find
+    /// bodies for messages that have already matched.
+    static func bodyScanSweepLimit(bodyScanLimit: Int, metadataMatches: Int) -> Int {
+        guard bodyScanLimit > 0 else { return 0 }
+        let ceiling = max(bodyScanLimit * bodyScanSweepPadFactor, bodyScanSweepPadFloor)
+        return bodyScanLimit + min(max(metadataMatches, 0), ceiling)
+    }
+
+    /// Picks the messages whose bodies are worth reading out of the sweep, and
+    /// says how far short of the caller's budget it came.
+    ///
+    /// Eligible means: not a row already being returned (its body would be read
+    /// to decide something already decided), and not a row that matched on its
+    /// own subject or sender (counting it again would inflate
+    /// `total_matches`). What is left is read newest-first up to
+    /// `bodyScanLimit`.
+    ///
+    /// `shortfall` is how many of the bodies the caller made room for could not
+    /// be found to read. It is reported rather than absorbed: reading three
+    /// bodies when twenty-five were asked for and saying nothing is the shape
+    /// this whole seam exists to remove.
+    static func bodyScanCandidates(
+        sweepRows: [[String: Any]],
+        metadataRows: [[String: Any]],
+        query: String,
+        bodyScanLimit: Int
+    ) -> (candidates: [[String: Any]], eligible: Int, shortfall: Int) {
+        let cap = max(bodyScanLimit, 0)
+        let needle = query.lowercased()
+        let returned = Set(metadataRows.compactMap { $0["id"] as? String })
+        let eligible = sweepRows.filter { row in
+            guard let id = row["id"] as? String, !returned.contains(id) else { return false }
+            let meta = "\(row["subject"] as? String ?? "") \(row["sender"] as? String ?? "")"
+            return !meta.lowercased().contains(needle)
+        }
+        let candidates = Array(eligible.prefix(cap))
+        return (candidates, eligible.count, cap - candidates.count)
+    }
+
     private static func searchEmails(_ args: JSONObject?) -> MCPCallResult {
         guard let query = args?["query"]?.stringValue else {
             return errorResult("query is required")
@@ -2871,12 +3026,23 @@ JSON.stringify(out);
         if searchBody {
             // Second pass: the newest messages in scope, regardless of whether
             // their metadata matched, so body-only hits can still surface.
+            //
+            // **Wider than the number of bodies to be read**, because the rows
+            // already being returned and the rows that matched on subject or
+            // sender come out of it before a single body is fetched. Sweeping
+            // exactly `body_scan_limit` and then subtracting from that same set
+            // is what made a body-only hit at position `body_scan_limit + 1`
+            // unreachable at every limit. See `bodyScanSweepLimit`.
+            let sweepLimit = bodyScanSweepLimit(
+                bodyScanLimit: bodyScanLimit,
+                metadataMatches: outcome.total
+            )
             let sweep = scanAllAccounts(
                 targets: targets,
                 mailbox: mailbox,
                 query: nil,
                 searchRecipients: false,
-                limit: bodyScanLimit,
+                limit: sweepLimit,
                 timeout: defaultTimeout,
                 call: call
             )
@@ -2888,14 +3054,13 @@ JSON.stringify(out);
             // own subject/sender catches matches that `outcome.total` counted but
             // that the per-mailbox limit trimmed out of `rows` -- counting those
             // again here would inflate total_matches.
-            let needle = query.lowercased()
-            let returned = Set(rows.compactMap { $0["id"] as? String })
-            let eligible = sweep.rows.filter { row in
-                guard let id = row["id"] as? String, !returned.contains(id) else { return false }
-                let meta = "\(row["subject"] as? String ?? "") \(row["sender"] as? String ?? "")"
-                return !meta.lowercased().contains(needle)
-            }
-            let candidates = Array(eligible.prefix(bodyScanLimit))
+            let selection = bodyScanCandidates(
+                sweepRows: sweep.rows,
+                metadataRows: rows,
+                query: query,
+                bodyScanLimit: bodyScanLimit
+            )
+            let candidates = selection.candidates
 
             let (bodyMatches, bodiesRead, bodiesComplete) = matchBodies(
                 candidates: candidates,
@@ -2928,10 +3093,24 @@ JSON.stringify(out);
                 "body_scan_complete": bodyScanComplete(
                     bodiesRead: bodiesComplete,
                     candidates: candidates.count,
-                    eligible: eligible.count,
+                    eligible: selection.eligible,
                     sweep: sweep
                 )
             ]
+            // How many of the bodies the caller made room for could not be
+            // found to read. Reported rather than absorbed: reading three when
+            // twenty-five were asked for, and saying nothing, is the shape this
+            // whole pass was rebuilt to remove.
+            if selection.shortfall > 0 {
+                bodyInfo?["body_scan_shortfall"] = selection.shortfall
+                let capped = sweep.rows.count < sweep.total
+                bodyInfo?["body_scan_shortfall_note"] =
+                    "There was room to read \(bodyScanLimit) message body(ies) and only \(candidates.count) message(s) to read them from. "
+                    + "The second pass over the newest messages in scope returned \(sweep.rows.count) row(s); a message already among the results, or one that matched on its subject or sender, is not read again. "
+                    + (capped
+                        ? "That pass is capped at \(sweepLimit) of the \(sweep.total) messages in scope, so raising body_scan_limit widens it."
+                        : "That is every message in scope, so no larger body_scan_limit would read more.")
+            }
             // The sweep's own coverage, kept separate from the metadata scan's
             // rather than merged into it: they are two reads of the same scope
             // at two moments, and one can succeed where the other failed.
@@ -3463,6 +3642,16 @@ JSON.stringify(out);
         // and carries the same subject -- and it is none of this code's
         // business. Verified across the fixture's 22 drafts: every deliberate
         // save lacks the header, every autosave has it.
+        // The RFC Message-ID a draft carries, bare. Read off the bound message,
+        // one Apple Event per hit -- and there are normally none or one. It is
+        // what tells `mail_create_draft`'s own draft from a copy Mail wrote
+        // behind its back when the two share the autosave header; see
+        // composeDisownSavedDraft.
+        function composeRfcOf(el) {
+            var v = null;
+            try { v = el.messageId(); } catch (e) { return null; }
+            return v == null ? null : ('' + v).replace(/^</, '').replace(/>$/, '');
+        }
         function composeAutosavedOnly(entry, hits) {
             var out = [];
             for (var k = 0; k < hits.length; k++) {
@@ -3470,7 +3659,40 @@ JSON.stringify(out);
                 var headers = null;
                 try { headers = '' + bound.allHeaders(); } catch (e) { headers = null; }
                 if (headers === null || !/^X-Apple-Auto-Saved:/im.test(headers)) continue;
-                out.push({id: hits[k].id, element: bound});
+                out.push({id: hits[k].id, rfc: composeRfcOf(bound), element: bound});
+            }
+            return out;
+        }
+        // The summary, built from the entries still held against this message.
+        // Separate from the sweep because it is built twice: once when the
+        // sweep runs, and again if the draft this call deliberately saved
+        // turns out to be one of them (composeDisownSavedDraft).
+        function composeSummariseSweep(out, left, mayRemove) {
+            out.found = out.removed + left.length;
+            if (left.length) {
+                out.left_in_drafts = left.map(function(e) { return e.id; });
+            } else {
+                delete out.left_in_drafts;
+            }
+            if (out.found > 0) {
+                if (out.removed === out.found) {
+                    out.note = 'Mail autosaved a copy of this message while composing it; that copy has been moved to Trash';
+                } else if (!mayRemove) {
+                    out.note = 'Mail autosaved a copy of this message and it is still in Drafts. It is left alone deliberately: Mail re-creates the autosaved copy of a message it is still holding, so deleting it leaves two copies rather than none';
+                } else {
+                    out.note = 'Mail autosaved a copy of this message while composing it and it could not be removed; it is still in Drafts';
+                }
+            } else {
+                // Finding nothing is a reading taken at a moment, and the
+                // moment is immediately after Mail was told to stop. That is
+                // what makes it usually final -- five sends and a 114-second
+                // watch on a saved draft produced no copy -- but it is not
+                // final under load: six sends run while Mail was being driven
+                // hard each left an autosaved copy whose own Date header was
+                // 7s after the sent copy's, appearing after this check had
+                // already looked and found nothing. So it says what it saw
+                // rather than what will be true.
+                out.note = 'None was in Drafts when this was checked, immediately after Mail was told to close the message. Mail writes its autosaved copy on its own schedule and has been measured writing one several seconds later when it is busy, so a copy of this message can still appear there.';
             }
             return out;
         }
@@ -3482,26 +3704,74 @@ JSON.stringify(out);
             if (hits === null) return out;
             var autosaved = composeAutosavedOnly(entry, hits);
             out.checked = true;
-            out.found = autosaved.length;
+            out.mayRemove = mayRemove ? true : false;
             var leftAlone = [];
             var failures = [];
             for (var k = 0; k < autosaved.length; k++) {
-                if (!mayRemove) { leftAlone.push(autosaved[k].id); continue; }
+                if (!mayRemove) { leftAlone.push({id: autosaved[k].id, rfc: autosaved[k].rfc}); continue; }
                 try { mail.delete(autosaved[k].element); out.removed++; }
                 catch (e) { failures.push('' + autosaved[k].id + ': ' + e); }
             }
             if (failures.length) out.not_removed = failures;
-            if (leftAlone.length) out.left_in_drafts = leftAlone;
-            if (out.found > 0) {
-                if (out.removed === out.found) {
-                    out.note = 'Mail autosaved a copy of this message while composing it; that copy has been moved to Trash';
-                } else if (!mayRemove) {
-                    out.note = 'Mail autosaved a copy of this message and it is still in Drafts. It is left alone deliberately: Mail re-creates the autosaved copy of a message it is still holding, so deleting it leaves two copies rather than none';
-                } else {
-                    out.note = 'Mail autosaved a copy of this message while composing it and it could not be removed; it is still in Drafts';
-                }
+            // Kept so the summary can be rebuilt once the deliberate draft is
+            // known. Removed from the result before it is returned -- see
+            // composeCloseSweep.
+            out.held = leftAlone;
+            return composeSummariseSweep(out, leftAlone, mayRemove);
+        }
+        // **The draft `mail_create_draft` asked for is not a leak, whatever
+        // header it carries.**
+        //
+        // The rule this replaces -- a deliberate draft has no
+        // X-Apple-Auto-Saved, an autosave always has one -- held for all 22
+        // fixture drafts and for every compose that finishes quickly, and it
+        // does not hold for a slow one. Reproduced on Mail 16.0 against the
+        // fixture with a 300,000-character body and 40 attachments (~30s of
+        // compose): Mail's autosave timer fired while the message was still
+        // being built, `mail.save()` then saved **over that same copy**, and
+        // the one message in Drafts came out carrying `X-Apple-Auto-Saved: 1`
+        // *and* the Message-Id this call reports as the draft. It appeared in
+        // `draft` and in `autosaved_draft.left_in_drafts` at once: one copy on
+        // disk, nothing deleted, and a report saying a copy had leaked.
+        //
+        // The discriminator is the draft's own identity, which the saved-draft
+        // lookup has already read back off the message. Both handles are
+        // checked -- the numeric id, and the RFC Message-ID for the case where
+        // the account has re-uploaded the draft and the numeric id has moved
+        // on -- because either one matching is proof enough that this is the
+        // message that was asked for.
+        //
+        // Nothing is un-deleted here: this only ever runs on the
+        // `mail_create_draft` path, where `mayRemove` is false and the entries
+        // are the ones that were left alone.
+        function composeDisownSavedDraft(sweep, saved) {
+            if (sweep === null || sweep === undefined || !sweep.checked) return sweep;
+            var held = sweep.held || [];
+            if (saved === null || saved === undefined || held.length === 0) return sweep;
+            var wantId = saved.message_id == null ? null : '' + saved.message_id;
+            var wantRfc = (saved.rfc_message_id == null || saved.rfc_message_id === '')
+                ? null : ('' + saved.rfc_message_id).replace(/^</, '').replace(/>$/, '');
+            var kept = [], mine = 0;
+            for (var i = 0; i < held.length; i++) {
+                var e = held[i];
+                var isOwn = (wantId !== null && e.id === wantId)
+                    || (wantRfc !== null && e.rfc !== null && e.rfc === wantRfc);
+                if (isOwn) { mine++; continue; }
+                kept.push(e);
             }
-            return out;
+            if (mine === 0) return sweep;
+            sweep.held = kept;
+            composeSummariseSweep(sweep, kept, sweep.mayRemove);
+            sweep.saved_over_autosave = true;
+            sweep.note = 'Mail autosaved a copy of this message while it was still being composed and the save then landed on that same copy, so the draft reported above carries Mail\\'s X-Apple-Auto-Saved header. That is the draft that was asked for, not an extra copy of it'
+                + (sweep.found > 0 ? '; the count here excludes it.' : ', and nothing else was in Drafts when this was checked.');
+            return sweep;
+        }
+        // Takes the bookkeeping back out of the reported object. `held` exists
+        // so the summary can be rebuilt; it is not an answer to anything.
+        function composeCloseSweep(sweep) {
+            if (sweep !== null && sweep !== undefined) { delete sweep.held; delete sweep.mayRemove; }
+            return sweep;
         }
         // The sentence the pre-send guard puts after what went wrong. It says
         // what was left behind rather than asserting that nothing was.
@@ -3708,6 +3978,9 @@ JSON.stringify(out);
             ? composeSweepDrafts(composeSenderAccount, \(disposesMessage))
             : COMPOSE_SWEEP;
         \(afterClose)
+        // `afterClose` is where the deliberate draft becomes identifiable, so
+        // the sweep's bookkeeping is only finished here.
+        composeCloseSweep(result.autosaved_draft);
         JSON.stringify(result);
         """
         // Composing has no scope: the message is the message.
@@ -3829,10 +4102,11 @@ JSON.stringify(out);
     /// have done it -- so the two go together, and neither can be dropped in
     /// favour of the other.
     private static func sendEmail(_ args: JSONObject?) -> MCPCallResult {
+        invalidateSourceCache()
         // `disposesMessage: true`: after `send()` Mail has let go of the
         // compose message, which is the one state in which removing a leftover
         // autosaved copy sticks rather than provoking another.
-        composeEmail(args, visible: false, finalAction: """
+        return composeEmail(args, visible: false, finalAction: """
         msg.send();
         result.status = 'sent';
         """, disposesMessage: true, call: MailCall.forArguments(args, default: Budget.send))
@@ -3980,6 +4254,7 @@ var savedDraft = (function() {
     }
 
     private static func createDraft(_ args: JSONObject?) -> MCPCallResult {
+        invalidateSourceCache()
         let call = MailCall.forArguments(args, default: Budget.createDraft)
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
@@ -3998,41 +4273,79 @@ var savedDraft = (function() {
         $.NSThread.sleepForTimeInterval(1.5);
         \(savedDraftLookupJXA(account: account, from: from, subject: subject, includeHelpers: false))
         result.draft = savedDraft;
+        // The draft that was just saved is not one of Mail's leaked copies,
+        // even when it carries Mail's autosave header -- which it does when
+        // the autosave timer fired mid-compose and the save landed on that
+        // copy. See composeDisownSavedDraft.
+        composeDisownSavedDraft(result.autosaved_draft, savedDraft);
         """
-        // Read the saved draft back off the server and compare its text/plain
-        // part with the body that was asked for. Mail rewrites the body of
-        // anything composed through its scripting interface -- a plain body
-        // comes back quoted, and a draft's plain part comes back empty -- and
-        // nothing in the compose script can see it happen, because `content()`
-        // reads back exactly what was set and the alternatives are generated
-        // afterwards. Reporting `rendered_chars` and calling it a success is how
-        // that went unnoticed.
+        // **`body_check` is a measurement, and it is no longer taken unasked.**
         //
-        // Only for a plain `body`: the plain-text part of an html_body message
-        // is Mail's own rendering, and there is nothing to compare it against.
+        // Mail rewrites the body of anything composed through its scripting
+        // interface -- a plain body comes back quoted, and a saved draft's
+        // `text/plain` part comes back empty -- and nothing in the compose
+        // script can see it happen, because `content()` reads back exactly what
+        // was set and the alternatives are generated afterwards. Reporting
+        // `rendered_chars` and calling it a success is how that went unnoticed,
+        // and reading the saved draft back is the only way to know.
+        //
+        // But it is the *same answer every time*: CLAUDE.md and this tool's own
+        // description both state that the plain part comes back empty for every
+        // scripted draft, ruled out against eight alternatives on Mail 16. A
+        // guard documented to fire on 100% of calls is a diagnostic, and paying
+        // a full source download on every draft to be told a constant is not
+        // what a caller asked for -- on a 70 MB draft it is 70 MB.
+        //
+        // So it is behind `verify_body`, and what is reported by default is
+        // `null` rather than `false`. Null is the difference between "not
+        // measured" and "measured and wrong", and it is the shape `fidelity`
+        // already uses for a `message_size` Mail would not give: a hardcoded
+        // `false` would become a confidently wrong answer the day a Mail
+        // release stops rewriting the body, which is precisely the failure this
+        // whole check exists to catch.
+        //
+        // Only ever for a plain `body`: the plain-text part of an html_body
+        // message is Mail's own rendering, and there is nothing to compare it
+        // against.
+        //
         // `disposesMessage: false`: `save` does not end Mail's interest in the
         // compose message, so an autosaved copy is reported rather than
         // deleted -- deleting one Mail is still holding brings it back.
+        let verifyBody = args?["verify_body"]?.boolValue ?? false
         return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, afterClose: afterClose) { payload in
             guard let body = args?["body"]?.stringValue,
                   args?["html_body"]?.stringValue == nil,
                   let draft = payload["draft"] as? [String: Any] else { return payload }
+            var enriched = payload
+            guard verifyBody else {
+                enriched["body_check"] = [
+                    "plain_text_matches_body": NSNull(),
+                    "measured": false,
+                    "detail": "Not measured. Mail rewrites the body of anything composed through its scripting interface, and every scripted draft measured on Mail 16 came back with an empty text/plain part, the body surviving only as HTML — so a plain-text-preferring client shows this draft as blank. That is Mail's behaviour rather than a reading of this draft, which is why this says null and not false. Pass verify_body: true to have the saved draft fetched back from the server and its text/plain part compared with the body that was asked for; it costs a full download of the draft."
+                ]
+                return enriched
+            }
             let identifier = (draft["rfc_message_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 ?? (draft["message_id"] as? String)
             guard let identifier else { return payload }
 
-            let (source, _, fetchError) = fetchSource(
+            let (source, _, _, fetchError) = fetchSource(
                 account: draft["account"] as? String,
                 mailbox: draft["mailbox"] as? String ?? "Drafts",
                 messageId: identifier,
                 call: call
             )
-            var enriched = payload
             guard fetchError == nil else {
-                enriched["body_check"] = ["plain_text_matches_body": NSNull(), "detail": "could not read the saved draft back: \(fetchError!)"]
+                enriched["body_check"] = [
+                    "plain_text_matches_body": NSNull(),
+                    "measured": false,
+                    "detail": "could not read the saved draft back: \(fetchError!)"
+                ]
                 return enriched
             }
-            enriched["body_check"] = checkComposedBody(source: source, requestedBody: body).dict
+            var check = checkComposedBody(source: source, requestedBody: body).dict
+            check["measured"] = true
+            enriched["body_check"] = check
             return enriched
         }
     }
@@ -4147,6 +4460,19 @@ var savedDraft = (function() {
         /// What the returned bytes would measure on the wire: one CR back for
         /// every LF, since that is the transform they came through.
         let wireSize: Int
+        /// Whether a `multipart/*` message ends with the delimiter that closes
+        /// it, or nil when the message is not multipart or declares no usable
+        /// boundary.
+        ///
+        /// This is the one piece of evidence about completeness that does not
+        /// come from a byte count, and it costs nothing: the bytes are already
+        /// here. It matters because the `"wire"` reading of `messageSize` has
+        /// slack in it that scales with the message -- measured at 919,823
+        /// bytes on a 70.8 MB probe, so a fragment nearly a megabyte short
+        /// passed as complete and `mail_save_attachment` would have cut a file
+        /// out of it. A truncated multipart has no close-delimiter whatever its
+        /// byte count says.
+        let multipartTerminated: Bool?
 
         /// False when Mail was still downloading and handed over a fragment --
         /// 838 bytes of a 300 KB message in one measurement, with nothing in the
@@ -4164,7 +4490,9 @@ var savedDraft = (function() {
         ///   work. `complete` is then "nothing contradicts it" rather than a
         ///   verified match -- `sizeKnown` says which of the two a caller has,
         ///   and the note says so in words.
-        var complete: Bool { completeBasis != "short" && completeBasis != "none" }
+        var complete: Bool {
+            completeBasis != "short" && completeBasis != "none" && completeBasis != "unterminated"
+        }
 
         /// What `complete` rests on, because it is not always the same thing
         /// and the weaker case has slack in it (#53).
@@ -4184,9 +4512,20 @@ var savedDraft = (function() {
         ///
         /// * `"bytes"` -- the bytes reach the size **on their own**, so it holds
         ///   whichever unit Mail quoted. Nothing is assumed.
-        /// * `"wire"` -- they reach it only once each LF is counted as a CRLF.
-        ///   True for the ordinary server-side message, and the note says how
-        ///   many bytes would be missing if Mail had meant the other unit.
+        /// * `"wire+terminated"` -- they reach it once each LF is counted as a
+        ///   CRLF, **and** the message is a multipart that ends with the
+        ///   delimiter closing it. The slack in the wire reading is then
+        ///   irrelevant: a fragment cut anywhere before the last part does not
+        ///   carry the close-delimiter, whatever its bytes add up to.
+        /// * `"wire"` -- they reach it only once each LF is counted as a CRLF,
+        ///   and there is no structural marker to check that against (a
+        ///   single-part message, or a multipart declaring no boundary). True
+        ///   for the ordinary single-part server-side message, and the note
+        ///   says how many bytes would be missing if Mail had meant the other
+        ///   unit.
+        /// * `"unterminated"` -- they reach it only on the wire reading and the
+        ///   message is a multipart that does **not** end where it says it
+        ///   ends. Not complete.
         /// * `"short"` -- they do not reach it either way. A fragment.
         /// * `"unchecked"` -- Mail would not report a size.
         /// * `"none"` -- no bytes at all, which is never a message.
@@ -4197,12 +4536,24 @@ var savedDraft = (function() {
         /// `messageSize` into a permanent false `incomplete`, which costs a
         /// caller `mail_save_attachment` entirely. Reporting the basis costs
         /// them nothing.
+        ///
+        /// The close-delimiter check is what that tightening was wanted for and
+        /// does not have its failure mode. It is applied **only** on the wire
+        /// reading, which is the only one with slack in it: on `"bytes"` the
+        /// count stands on its own and nothing is added to it. A sender that
+        /// omits the close-delimiter from a complete multipart -- malformed,
+        /// and RFC 2046 requires it -- is the one message this can be wrong
+        /// about, and the note says so in words so a refusal can be understood.
         var completeBasis: String {
             if byteCount == 0 { return "none" }
             guard let expectedSize else { return "unchecked" }
             if byteCount >= expectedSize { return "bytes" }
-            if wireSize >= expectedSize { return "wire" }
-            return "short"
+            guard wireSize >= expectedSize else { return "short" }
+            switch multipartTerminated {
+            case true: return "wire+terminated"
+            case false: return "unterminated"
+            case nil: return "wire"
+            }
         }
 
         /// Whether `complete` was checked against a size Mail supplied.
@@ -4212,16 +4563,21 @@ var savedDraft = (function() {
         /// units Mail stores the message in rather than in wire units. Zero
         /// unless `completeBasis` is `"wire"`.
         var slackBytes: Int {
-            guard completeBasis == "wire", let expectedSize else { return 0 }
-            return expectedSize - byteCount
+            guard completeBasis == "wire" || completeBasis == "wire+terminated",
+                  let expectedSize else { return 0 }
+            return max(expectedSize - byteCount, 0)
         }
 
         var note: String? {
             var sentences: [String] = []
             if byteCount == 0 {
                 sentences.append("Mail returned no bytes at all for this message — not even its headers had arrived. An RFC 822 message always has a header block, so this is the absence of a message rather than an empty one. Try again in a moment.")
+            } else if completeBasis == "unterminated", let expectedSize {
+                sentences.append("These \(byteCount) bytes reach the \(expectedSize) Mail reports only once each LF is counted as the CRLF it stood for on the wire, which leaves \(expectedSize - byteCount) byte(s) of slack — and the message is a multipart that does not end with the \"--boundary--\" line that closes it, so it stops short of where it says it ends. That is a fragment, and an attachment cut out of one is silently truncated on disk. Try again in a moment. The one other thing this can be is a sender that left the closing line out of a message that is all here, which RFC 2046 does not allow; mail_get_source will still return what there is.")
             } else if !complete, let expectedSize {
                 sentences.append("Mail had only \(wireSize) of this message's \(expectedSize) bytes when the source was read and did not finish downloading the rest within the wait, so what is here is a fragment rather than the message. Try again in a moment.")
+            } else if completeBasis == "wire+terminated", let expectedSize {
+                sentences.append("These \(byteCount) bytes reach the \(expectedSize) Mail reports once each LF is counted as the CRLF it stood for on the wire, which on its own leaves \(slackBytes) byte(s) of slack — but the message is a multipart and ends with the \"--boundary--\" line that closes it, so it is all here whichever unit Mail meant.")
             } else if !sizeKnown {
                 sentences.append("Mail would not report this message's size, so whether it had finished downloading could not be checked: complete is \"nothing contradicts it\" here rather than a verified match.")
             } else if completeBasis == "wire" {
@@ -4285,7 +4641,10 @@ var savedDraft = (function() {
             byteCount: data.count,
             // Every LF here stood for a CRLF on the wire, so this is what these
             // bytes weigh in the units `messageSize` is quoted in.
-            wireSize: data.count + crlf + bareLF
+            wireSize: data.count + crlf + bareLF,
+            // Free: the bytes are already here, and it is the only evidence of
+            // completeness that is not a byte count. See `completeBasis`.
+            multipartTerminated: MIME.multipartIsTerminated(data)
         )
     }
 
@@ -4359,6 +4718,26 @@ var savedDraft = (function() {
     /// spawn. One ASCII line, stripped only when it is exactly this shape.
     private static let sourceSizeMarker = "MACMCP-SIZE:"
 
+    /// Marks the line carrying everything a caller wanted to know about the
+    /// message *besides* its bytes: subject, sender, recipients, read state,
+    /// Mail's own attachment rows, the body Mail renders.
+    ///
+    /// It exists so `mail_get_email` is one osascript spawn rather than two.
+    /// It used to run its own script for the properties and then a second one,
+    /// with a second `findMessageJXA` in it, for the source -- one whole
+    /// process and one whole message bind to fetch bytes it already had a
+    /// reason to fetch. Both scripts also answered from their own moment, so a
+    /// message still arriving could report one `message_size` in the properties
+    /// and be measured against another in `fidelity`.
+    ///
+    /// **The line is ASCII and holds no newline**, which is what lets it sit in
+    /// front of raw message bytes. `JSON.stringify` never emits a literal
+    /// control character, and the script escapes every scalar above U+007F as
+    /// `\\uXXXX` before writing it -- so the line survives `decodeSourceBytes`'
+    /// UTF-8-to-Latin-1 round trip byte for byte, the same reason CLAUDE.md
+    /// gives for Mail escaping non-ASCII in generated JXA.
+    private static let sourceMetaMarker = "MACMCP-META:"
+
     /// The source fetch, minus the `var mail = Application('Mail');` line.
     ///
     /// Not private, and split from the handler, for the same reason the move
@@ -4383,9 +4762,28 @@ var savedDraft = (function() {
         mailbox: String,
         messageId: String,
         attempts: Int = sourceCompletionAttempts,
-        interval: Double = sourceCompletionInterval
+        interval: Double = sourceCompletionInterval,
+        meta: String? = nil
     ) -> String {
-        """
+        // Read after the wait, not before: a body or an attachment list taken
+        // off a message Mail is still downloading is exactly the empty answer
+        // #31 exists to stop reporting, and waiting costs nothing extra here
+        // because the source loop has already waited.
+        let metaBlock = meta.map { expression in
+            """
+            function safe(fn, dflt) { try { var v = fn(); return v == null ? dflt : v; } catch (e) { return dflt; } }
+            // Every scalar above U+007F as \\uXXXX, so this line is pure ASCII
+            // and survives the UTF-8/Latin-1 round trip the message bytes
+            // behind it are decoded through.
+            function macmcpAscii(s) {
+                return s.replace(/[\\u0080-\\uffff]/g, function(c) {
+                    return '\\\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4);
+                });
+            }
+            var metaLine = '\(sourceMetaMarker)' + macmcpAscii(JSON.stringify(\(expression))) + '\\n';
+            """
+        } ?? "var metaLine = '';"
+        return """
         \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
         if (!found) { throw new Error('message not found with id: \(escapeJSString(messageId))'); }
         var expected = -1;
@@ -4397,32 +4795,134 @@ var savedDraft = (function() {
             delay(\(interval));
             src = '' + found.source();
         }
-        var sourceResult = '\(sourceSizeMarker)' + expected + '\\n' + src;
+        \(metaBlock)
+        var sourceResult = metaLine + '\(sourceSizeMarker)' + expected + '\\n' + src;
         sourceResult;
         """
     }
 
+    /// One message's source, held so the call after this one does not fetch it
+    /// again.
+    ///
+    /// **The natural sequence downloads the message twice.** `mail_get_email`
+    /// has to read the source to check the message against it and to build the
+    /// attachment list; `mail_save_attachment` then reads exactly the same
+    /// bytes to cut a file out of them. Measured on a 70.8 MB message, that is
+    /// 141 MB moved through Apple Events to save one attachment.
+    ///
+    /// What makes it safe to keep is narrow, and each part of it is enforced
+    /// below:
+    ///
+    /// * **Only a complete source is kept.** A fragment is exactly what a
+    ///   caller retries for, and serving the same fragment back would turn a
+    ///   transient into a permanent one.
+    /// * **One entry**, replaced by the next fetch. The bound on memory is one
+    ///   message, and it is why there is no size limit -- capping it would
+    ///   exclude precisely the messages this exists for.
+    /// * **60 seconds.** Long enough for a `mail_get_email` followed by a
+    ///   `mail_save_attachment`, short enough that a numeric id Mail has since
+    ///   reissued cannot be answered for.
+    /// * **Any mutation clears it.** `mail_move`, `mail_mark_read`,
+    ///   `mail_send` and `mail_create_draft` all call
+    ///   `invalidateSourceCache()` before they run.
+    /// * **It is never read for a fetch that also wants Mail's own properties**
+    ///   (`meta`), since those are not in it and are not cacheable -- read
+    ///   state and mailbox both change under the message.
+    ///
+    /// `main.swift` serves one request at a time on one thread, which is what
+    /// makes a bare static safe here.
+    private struct CachedSource {
+        let key: String
+        let data: Data
+        let expectedSize: Int?
+        let at: Date
+    }
+    private static var cachedSource: CachedSource?
+    private static let sourceCacheTTL: TimeInterval = 60
+
+    /// Drops the held source. Called by every tool that changes something in
+    /// Mail, because after one the id it was keyed on may name another message.
+    static func invalidateSourceCache() { cachedSource = nil }
+
+    /// What identifies the bytes, which is not the same as what identifies the
+    /// request.
+    ///
+    /// A numeric id resolves globally -- `findMessageJXA` ignores `mailbox`
+    /// entirely for one -- so the mailbox is not part of it, and
+    /// `mail_get_email` (which knows where the message is) and
+    /// `mail_save_attachment` (which defaults to `INBOX`) reach the same entry.
+    /// An RFC Message-ID *is* searched mailbox-first and a duplicate can exist
+    /// in two mailboxes, so for one the mailbox stays in the key.
+    static func sourceCacheKey(account: String?, mailbox: String, messageId: String) -> String? {
+        let acct = (account ?? "").lowercased()
+        switch messageHandle(messageId) {
+        case .numeric(let id): return "n\u{0}\(acct)\u{0}\(id)"
+        case .rfc(let rfc): return "r\u{0}\(acct)\u{0}\(mailbox.lowercased())\u{0}\(rfc)"
+        case .unmatchable: return nil
+        }
+    }
+
+    /// Fetches a message's raw source, and -- when `meta` is given -- everything
+    /// Mail alone can say about the same message, in the same script.
+    ///
+    /// `meta` is a JavaScript expression evaluating to an object; it is
+    /// evaluated after the wait for the download to finish, so what it reports
+    /// describes the message the bytes describe.
     private static func fetchSource(
         account: String?,
         mailbox: String,
         messageId: String,
         call: MailCall,
-        timeout: TimeInterval = sourceFetchTimeout
-    ) -> (data: Data, expectedSize: Int?, error: String?) {
+        timeout: TimeInterval = sourceFetchTimeout,
+        meta: String? = nil
+    ) -> (data: Data, expectedSize: Int?, meta: [String: Any]?, error: String?) {
+        let key = sourceCacheKey(account: account, mailbox: mailbox, messageId: messageId)
+        if meta == nil, let key, let held = cachedSource,
+           held.key == key, Date().timeIntervalSince(held.at) < sourceCacheTTL {
+            return (held.data, held.expectedSize, nil, nil)
+        }
         let script = """
         var mail = Application('Mail');
-        \(sourceScriptJXA(account: account, mailbox: mailbox, messageId: messageId))
+        \(sourceScriptJXA(account: account, mailbox: mailbox, messageId: messageId, meta: meta))
         """
         let (data, error) = runJXAData(script, retries: 0, timeout: timeout, scopable: true, call: call)
         if let error {
             if error.contains("message not found") {
-                return (Data(), nil, "message not found with id: \(messageId)")
+                return (Data(), nil, nil, "message not found with id: \(messageId)")
             }
-            return (Data(), nil, error)
+            return (Data(), nil, nil, error)
         }
-        let marker = splitSourceSizeMarker(data)
-        if let error = marker.error { return (Data(), nil, error) }
-        return (decodeSourceBytes(marker.body), marker.size, nil)
+        let head = splitMetaMarker(data)
+        if let error = head.error { return (Data(), nil, nil, error) }
+        let marker = splitSourceSizeMarker(head.rest)
+        if let error = marker.error { return (Data(), nil, head.meta, error) }
+        let source = decodeSourceBytes(marker.body)
+        if let key, sourceFidelity(source, expectedSize: marker.size).complete {
+            cachedSource = CachedSource(key: key, data: source, expectedSize: marker.size, at: Date())
+        }
+        return (source, marker.size, head.meta, nil)
+    }
+
+    /// Splits the properties line off the front of the script's output, when
+    /// one was asked for.
+    ///
+    /// Like `splitSourceSizeMarker` this fails closed, and for the same reason:
+    /// anything left on the front of the bytes reaches `save_to` files, byte
+    /// counts and `MIME.parse` as a bogus header. A caller that did not ask for
+    /// a meta line gets the bytes back untouched -- the marker cannot be at
+    /// offset 0 then, because `MACMCP-SIZE:` is.
+    static func splitMetaMarker(_ raw: Data) -> (meta: [String: Any]?, rest: Data, error: String?) {
+        let marker = Data(sourceMetaMarker.utf8)
+        guard raw.starts(with: marker) else { return (nil, raw, nil) }
+        guard let newline = raw.firstIndex(of: 0x0A) else {
+            return (nil, Data(), "the source fetch wrote a \(sourceMetaMarker) line with no end to it, so nothing here can tell macMCP's own bytes from the message's and none are returned. This is a bug in macMCP rather than something about the message; please report it.")
+        }
+        let json = Data(raw[(raw.startIndex + marker.count)..<newline])
+        let rest = Data(raw[(newline + 1)...])
+        guard let object = try? JSONSerialization.jsonObject(with: json) as? [String: Any] else {
+            return (nil, Data(), "the source fetch wrote a \(sourceMetaMarker) line that is not the JSON object macMCP writes there, so what follows it cannot be trusted to be the message and is not returned. This is a bug in macMCP rather than something about the message; please report it.")
+        }
+        return (object, rest, nil)
     }
 
     /// Splits the size line off the front of the script's output.
@@ -4509,7 +5009,7 @@ var savedDraft = (function() {
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
         let overwrite = args?["overwrite"]?.boolValue ?? false
 
-        let (data, expectedSize, fetchError) = fetchSource(
+        let (data, expectedSize, _, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
@@ -4524,6 +5024,15 @@ var savedDraft = (function() {
         if !fidelity.complete {
             guard let expectedSize else {
                 return errorResult("Mail returned none of this message's bytes — not even its headers — so there is nothing to cut an attachment out of. Try again in a moment.")
+            }
+            // Named separately because it is a different finding. A byte count
+            // short of the size says how much is missing; a multipart with no
+            // closing delimiter says the message stops before its own end,
+            // which the count could not have shown -- the wire reading of
+            // messageSize has slack in it worth 919,823 bytes on a 70.8 MB
+            // message.
+            if fidelity.completeBasis == "unterminated" {
+                return errorResult("Message \(messageId) is a multipart that does not end with the \"--boundary--\" line closing it, and its \(fidelity.byteCount) bytes reach the \(expectedSize) Mail reports only once every LF is counted as a CRLF — so it stops short of where it says it ends and anything cut out of it would be truncated. Try again in a moment. If it keeps happening, the message itself may be missing that closing line, which RFC 2046 does not allow; mail_get_source will still hand back what there is.")
             }
             return errorResult("Mail has only \(fidelity.wireSize) of this message's \(expectedSize) bytes and did not finish downloading it — attachments cut from that would be truncated. Try again in a moment.")
         }
@@ -4667,7 +5176,7 @@ var savedDraft = (function() {
             return errorResult("message_id is required")
         }
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let (data, expectedSize, fetchError) = fetchSource(
+        let (data, expectedSize, _, fetchError) = fetchSource(
             account: args?["account"]?.stringValue,
             mailbox: mailbox,
             messageId: messageId,
@@ -4804,6 +5313,18 @@ var savedDraft = (function() {
     private static let moveVerifyAttempts = 12
     private static let moveVerifyInterval = 0.25
 
+    /// Which of `moveVerifyAttempts` fetch the destination's whole
+    /// `messageId()` column, as a JavaScript array literal.
+    ///
+    /// The column is the only thing that can identify a moved message when its
+    /// numeric id did not survive (see `moveScriptJXA`), and it costs 555ms on
+    /// an 11,808-message mailbox. Fetching it on every attempt made the worst
+    /// case ~9.4s of Apple Events; fetching it five times, front-loaded, makes
+    /// it ~2.8s while leaving the same three seconds of wall clock for a slow
+    /// move to become visible. A move that is going to be visible is visible on
+    /// the first one, which is what the fixture measures at 0.55s.
+    private static let moveVerifyColumnAttempts = "[0, 1, 3, 7, 11]"
+
     /// The move script, minus the `var mail = Application('Mail');` line.
     ///
     /// Not private, and split from the handler, so the tests can run it with
@@ -4875,27 +5396,79 @@ var savedDraft = (function() {
         } else {
         var sourceAccount = origin.account;
         var sourceMailboxName = origin.mailbox;
+        var sameAccount = ('' + destMboxAccount).toLowerCase() === ('' + sourceAccount).toLowerCase();
         found.mailbox = destMbox;
         // Read back where the message actually landed. `moved` on its own said
         // nothing about the destination, which is exactly why a cross-account
         // move went unnoticed.
+        //
+        // **Two ways to ask, and the cheap one is tried first.**
+        //
+        // The expensive one fetches the destination's whole `messageId()`
+        // column and scans it for the RFC Message-ID -- 555ms on Alice's
+        // 11,808-message INBOX, and it was being paid on **every one of up to
+        // twelve attempts**, ~9.4s of Apple Events inside a 120s script.
+        //
+        // The cheap one asks the message: `destMbox.messages.byId(n)` plus
+        // `fmLocate`, ~15-35ms and independent of how big the destination is.
+        // It works only while Mail's numeric id for the message survives the
+        // move, and **it does not survive one here**: measured against the
+        // fixture, moving message 133106 from Alice's INBOX to Alice's Archive
+        // produced 133107 in the destination. An IMAP re-file is a new UID even
+        // inside one account, which is what R5-F11 assumed away -- making the
+        // by-id path the *only* verification turned a 0.55s move into 3.69s,
+        // twelve failed probes and their delays before the column scan that was
+        // always going to be the answer. So it is a fast path, not a
+        // replacement: it costs one cheap probe when it fails and saves the
+        // whole column when it works (a local On-My-Mac move, or a Mail that
+        // keeps the id).
+        //
+        // What bounds the worst case instead is the number of full column
+        // scans, which is now a constant rather than the attempt count. The
+        // scans are front-loaded, because a move that is going to be visible is
+        // visible almost at once, and the later attempts exist for one that is
+        // slow -- for which sleeping is the useful part, not re-reading.
+        //
+        // `byId` resolves across every account, so `exists()` says the message
+        // is somewhere, not that it is here. Where it is comes off the message
+        // (`fmLocate`), which is the same rule the scan and `findMessageJXA`
+        // live by.
+        function moveVerifyById() {
+            var again = destMbox.messages.byId(parseInt(numericId, 10));
+            var here = false;
+            try { here = again.exists() === true; } catch (e) { return false; }
+            if (!here) return false;
+            var at = fmLocate(again);
+            return at !== null
+                && ('' + at.mailbox).toLowerCase() === ('' + destMboxPath).toLowerCase()
+                && ('' + at.account).toLowerCase() === ('' + destMboxAccount).toLowerCase();
+        }
+        function moveVerifyByColumn() {
+            if (rfcId !== null) {
+                var rids = destMbox.messages.messageId();
+                for (var i = 0; i < rids.length; i++) {
+                    if (rids[i] == null) continue;
+                    if (('' + rids[i]).replace(/^</, '').replace(/>$/, '') === rfcId) return true;
+                }
+                return false;
+            }
+            if (numericId !== null) {
+                var nids = destMbox.messages.id();
+                for (var j = 0; j < nids.length; j++) {
+                    if (('' + nids[j]) === numericId) return true;
+                }
+            }
+            return false;
+        }
+        var byId = sameAccount && numericId !== null;
+        var COLUMN_AT = \(moveVerifyColumnAttempts);
         var verified = false;
         for (var attempt = 0; attempt < \(moveVerifyAttempts) && !verified; attempt++) {
             try {
-                if (rfcId !== null) {
-                    var rids = destMbox.messages.messageId();
-                    for (var i = 0; i < rids.length; i++) {
-                        if (rids[i] == null) continue;
-                        if (('' + rids[i]).replace(/^</, '').replace(/>$/, '') === rfcId) { verified = true; break; }
-                    }
-                } else if (numericId !== null) {
-                    var nids = destMbox.messages.id();
-                    for (var j = 0; j < nids.length; j++) {
-                        if (('' + nids[j]) === numericId) { verified = true; break; }
-                    }
-                }
+                if (byId && moveVerifyById()) { verified = true; break; }
+                if (COLUMN_AT.indexOf(attempt) >= 0 && moveVerifyByColumn()) { verified = true; break; }
             } catch (e) {}
-            if (!verified) delay(\(moveVerifyInterval));
+            delay(\(moveVerifyInterval));
         }
         moveResult = {
             status: 'moved',
@@ -4909,7 +5482,7 @@ var savedDraft = (function() {
             message_id: numericId,
             rfc_message_id: rfcId,
             moved_from: {account: sourceAccount, mailbox: sourceMailboxName},
-            cross_account: destMboxAccount !== sourceAccount,
+            cross_account: !sameAccount,
             verified: verified
         };
         }
@@ -4927,6 +5500,10 @@ var savedDraft = (function() {
             return errorResult("target_mailbox is required")
         }
         let sourceMailbox = args?["source_mailbox"]?.stringValue ?? "INBOX"
+        // A move re-files the message, and across accounts it is re-uploaded
+        // under a new numeric id -- so any source held under the old one may
+        // now name something else. See `CachedSource`.
+        invalidateSourceCache()
 
         let script = """
         var mail = Application('Mail');
@@ -4953,6 +5530,52 @@ var savedDraft = (function() {
         }
     }
 
+    /// The mark-read script, minus the `var mail = Application('Mail');` line.
+    ///
+    /// **The answer is read back off the message, not restated from the
+    /// request.** This used to set `readStatus` and return the sentence
+    /// "marked read": a claim about Mail assembled entirely out of what the
+    /// caller had asked for, with nothing read back, and naming neither the
+    /// message it had happened to nor the mailbox it had been found in. For a
+    /// call whose `message_id` may be an RFC Message-ID resolved across every
+    /// account, those are exactly what the caller does not already know.
+    ///
+    /// `found` is already bound by id, so asking it for its own read state
+    /// costs one Apple Event -- the difference between reporting a request and
+    /// reporting a fact.
+    ///
+    /// Not private, and split from the handler, for the same reason the move
+    /// script is: the behaviour worth pinning lives in the JavaScript.
+    static func markReadScriptJXA(
+        account: String?,
+        mailbox: String,
+        messageId: String,
+        read: Bool
+    ) -> String {
+        """
+        \(findMessageJXA(account: account, mailbox: mailbox, messageId: messageId))
+        if (!found) {
+            JSON.stringify({error: 'message not found with id: \(escapeJSString(messageId))'});
+        } else {
+            found.readStatus = \(read);
+            var nowRead = null;
+            try { nowRead = found.readStatus() ? true : false; } catch (e) { nowRead = null; }
+            var rfcId = null;
+            try { rfcId = found.messageId(); } catch (e) {}
+            var numericId = null;
+            try { numericId = '' + found.id(); } catch (e) {}
+            JSON.stringify({
+                requested: \(read),
+                read: nowRead,
+                message_id: numericId,
+                rfc_message_id: rfcId == null ? null : ('' + rfcId).replace(/^</, '').replace(/>$/, ''),
+                account: foundAccount,
+                mailbox: foundMailbox
+            });
+        }
+        """
+    }
+
     private static func markRead(_ args: JSONObject?) -> MCPCallResult {
         guard let messageId = args?["message_id"]?.stringValue else {
             return errorResult("message_id is required")
@@ -4962,18 +5585,15 @@ var savedDraft = (function() {
         }
 
         let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
-        let escapedId = escapeJSString(messageId)
-        let findMessage = findMessageJXA(account: args?["account"]?.stringValue, mailbox: mailbox, messageId: messageId)
-
+        invalidateSourceCache()
         let script = """
         var mail = Application('Mail');
-        \(findMessage)
-        if (!found) {
-            JSON.stringify({error: 'message not found with id: \(escapedId)'});
-        } else {
-            found.readStatus = \(read);
-            'done';
-        }
+        \(markReadScriptJXA(
+            account: args?["account"]?.stringValue,
+            mailbox: mailbox,
+            messageId: messageId,
+            read: read
+        ))
         """
         // See `mutatingRetries`. Setting the flag twice is harmless in
         // itself, but a retried mutation is a habit rather than a judgement,
@@ -4985,17 +5605,37 @@ var savedDraft = (function() {
             call: MailCall.forArguments(args, default: Budget.markRead)
         )
         if let error { return errorResult(error) }
-        if case .failure(let message) = scriptPayload(output) { return errorResult(message) }
-        return textResult("marked \(read ? "read" : "unread")")
+        var payload: [String: Any]
+        switch scriptPayload(output) {
+        case .failure(let message): return errorResult(message)
+        case .text(let text): return textResult(text.isEmpty ? "marked \(read ? "read" : "unread")" : text)
+        case .object(let object): payload = object
+        }
+        if let scriptError = payload["error"] as? String { return errorResult(scriptError) }
+        let now = payload["read"] as? Bool
+        let where_ = "\(payload["account"] as? String ?? "?"):\(payload["mailbox"] as? String ?? "?")"
+        guard now == read else {
+            // The flag was set and Mail does not agree that it is set. Saying
+            // "marked read" here is the wrong answer whichever way it went.
+            let seen = now.map { $0 ? "read" : "unread" } ?? "nothing at all"
+            return errorResult("message \(payload["message_id"] as? String ?? messageId) in \(where_) was set to \(read ? "read" : "unread") and Mail reports it as \(seen). Nothing here can say which is true of the server's copy; read it back with mail_get_email before relying on either.")
+        }
+        payload["status"] = "marked \(read ? "read" : "unread")"
+        payload["verified"] = true
+        return jsonResult(payload)
     }
 
     // MARK: - Registration
 
     /// `mail_send` and `mail_create_draft` take the same message, so they take
     /// the same schema.
-    private static func composeSchema(action: String, budget: TimeInterval) -> JSONValue {
+    private static func composeSchema(
+        action: String,
+        budget: TimeInterval,
+        extra: [String: JSONValue] = [:]
+    ) -> JSONValue {
         schema(
-            properties: [
+            properties: extra.merging([
                 "to": stringOrStringArrayProp("Recipient address(es). One string, an array of strings, or a comma-separated list. Display names are allowed: \"Susan Cross\" <s@example.org>"),
                 "subject": stringProp("Email subject"),
                 "body": stringProp("Plain-text email body. Required unless html_body is given"),
@@ -5006,7 +5646,7 @@ var savedDraft = (function() {
                 "from": stringProp("Sender email address (overrides account lookup). Must be an address one of Mail's accounts sends as; an address no account owns is refused rather than substituted, because Mail's own behaviour is to send from the default account instead. The address the message actually went out as is reported back as `from`"),
                 "account": stringProp("Account name to \(action) (uses default account if omitted)"),
                 "timeout_seconds": timeoutProp(budget, mutating: true)
-            ],
+            ], uniquingKeysWith: { extra, _ in extra }),
             required: ["to", "subject"]
         )
     }
@@ -5081,7 +5721,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_search",
-                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count, which was taken from the columns. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched. With search_body, body_search reports the second pass's own coverage separately (body_scan_complete, and body_scan_skipped_mailboxes / body_scan_failed_accounts / body_scan_changed_mailboxes / body_scan_note when they apply), because it is a second read of the same scope and can fall short where the first did not",
+                description: "Search emails by subject and sender, optionally recipients and body (case-insensitive). Scans every mailbox in every account by default, newest first. Returns matches plus scan-coverage metadata (total_matches, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count, which was taken from the columns. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_matches 0 would be a claim that nothing matched. With search_body, body_search reports the second pass's own coverage separately (body_scan_complete, and body_scan_skipped_mailboxes / body_scan_failed_accounts / body_scan_changed_mailboxes / body_scan_note when they apply), because it is a second read of the same scope and can fall short where the first did not. That second pass is deliberately WIDER than body_scan_limit, because a message already among the results and a message that matched on its own subject or sender are not read again; when there were still fewer bodies to read than there was room for, body_scan_shortfall says how many and body_scan_shortfall_note says why",
                 inputSchema: schema(
                     properties: [
                         "query": stringProp("Search query"),
@@ -5115,8 +5755,12 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email, plus body_check: the draft is re-read from the server and its text/plain part compared with the body that was asked for. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface, so expect body_check to report a mismatch — currently an empty text/plain part, with the body surviving only as HTML. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts and removed — the draft you asked for is never touched by it",
-                inputSchema: composeSchema(action: "save the draft in", budget: Budget.createDraft),
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface: every scripted draft measured on Mail 16 came back with an EMPTY text/plain part, the body surviving only as HTML, so a plain-text-preferring client shows the draft as blank. That is reported as body_check, whose plain_text_matches_body is null and measured false unless you pass verify_body — the default does not re-download the draft to be told a constant, and says null rather than false because a hardcoded claim would go wrong the day Mail stops rewriting. verify_body: true fetches the saved draft back and compares its text/plain part with the body that was asked for. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts. The draft you asked for is never counted as one of those, even when a compose slow enough for Mail's autosave timer to fire means the save landed on Mail's own copy and the draft carries its X-Apple-Auto-Saved header — that case is reported as saved_over_autosave",
+                inputSchema: composeSchema(
+                    action: "save the draft in",
+                    budget: Budget.createDraft,
+                    extra: ["verify_body": boolProp("Fetch the saved draft back from the server and compare its text/plain part with the body that was asked for, reported as body_check (default: false). Mail rewrites a scripted body and the answer has been the same on every draft measured, so this is off by default: it costs a full download of the draft to confirm something already known. Turn it on to confirm it for this draft, or to find out that a Mail release has changed")]
+                ),
                 annotations: MCPAnnotations(readOnlyHint: false)
             ),
             category: cat,
@@ -5126,7 +5770,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_save_attachment",
-                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Selects out of exactly the list mail_get_email reports in attachments — same membership, same order, same names — so index is an index into that list and attachment_name is one of its name values. Saves every attachment in it when none of part_path, attachment_name or index is given. Inline parts (a logo, a pasted image the message displays in its body) are never in that list and are never saved by default; mail_get_email reports them separately under inline_parts, and part_path — the part's position in the message, e.g. \"2\" or \"1.2\" — is the exact handle that reaches one, or any other single part. Each saved entry reports part_path too. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message — note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
+                description: "Save attachments from a received message to disk. Writes the files directly (Mail's own save is blocked by its sandbox). Selects out of exactly the list mail_get_email reports in attachments — same membership, same order, same names — so index is an index into that list and attachment_name is one of its name values. Saves every attachment in it when none of part_path, attachment_name or index is given. Inline parts (a logo, a pasted image the message displays in its body) are never in that list and are never saved by default; mail_get_email reports them separately under inline_parts, and part_path — the part's position in the message, e.g. \"2\" or \"1.2\" — is the exact handle that reaches one, or any other single part. Each saved entry reports part_path too. The result reports fidelity for the message source the attachments were cut out of: Mail normalises CRLF to LF and turns any NUL into 0x80 before macMCP sees the bytes, so a part carried as 8bit or binary can reach disk altered in those two ways. A part carried as base64 or quoted-printable is unaffected. Refuses rather than writing a truncated file when Mail has not finished downloading the message, including when a multipart message stops before the \"--boundary--\" line that closes it (fidelity.complete_basis \"unterminated\"), which catches a fragment that the byte count alone cannot — Mail's size is quoted in units it does not name, and the slack in reading it as wire bytes is worth ~1.3% of a large message. Note that fidelity.message_size is null when Mail would not report the size, and completeness could then not be checked. The result also reports structure: parsed_complete is false when the message nests multipart parts deeper than macMCP descends (max_depth) or declares more parts than it reads (max_parts), in which case an attachment inside those parts is not in saved and not counted in attachments_in_message",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -5149,7 +5793,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_source",
-                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message — and complete_basis says what that rests on: \"bytes\" when the bytes reach message_size on their own, \"wire\" when they only reach it once each LF is counted as the CRLF it stood for (right for a server-side message, but a local draft is sized in LF units, so the note then says how many bytes would still be missing under that reading), \"short\" for a fragment, \"unchecked\" when Mail would not report a size, \"none\" for no bytes at all. message_size is Mail's own size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
+                description: "Get a message's raw RFC 822 source. Returns the first max_bytes by default, or writes the whole thing to save_to. An inline result reports source_encoding (utf-8, or iso-8859-1 for a source that is not valid UTF-8) and bytes_returned, which counts the bytes actually returned in that encoding — a truncation is moved back to a character boundary rather than cutting one in half. NOT byte-identical to the message on the server, so every result reports fidelity, measured over the WHOLE source (bytes_measured) rather than over the slice returned: line_endings is lf for every real message because Mail hands a source over with LF where the wire form has CRLF; ambiguous_nul_bytes counts bytes that are 0x80 where a NUL could have been lost, since Mail turns a NUL into 0x80 before macMCP sees it (a 0x80 inside a valid UTF-8 character is not counted, and base64 or quoted-printable parts are unaffected); complete says whether Mail had finished downloading the message — the fetch waits for it and reports a fragment as one rather than passing it off as the message — and complete_basis says what that rests on: \"bytes\" when the bytes reach message_size on their own, \"wire\" when they only reach it once each LF is counted as the CRLF it stood for (right for a server-side message, but a local draft is sized in LF units, so the note then says how many bytes would still be missing under that reading), \"wire+terminated\" when that reading is confirmed by the message being a multipart that ends with the \"--boundary--\" line closing it — which no fragment carries, whatever its bytes add up to — \"unterminated\" for a multipart on the wire reading that does NOT end where it says it ends, which is NOT complete, \"short\" for a fragment, \"unchecked\" when Mail would not report a size, \"none\" for no bytes at all. message_size is Mail's own size, or null when Mail would not report it, in which case complete means \"nothing contradicts it\" rather than a verified match. Errors rather than returning an empty string when Mail has none of the message yet. Use mail_save_attachment instead when the goal is just to extract attachments",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Numeric message ID from mail_get_emails or mail_search, or an RFC Message-ID"),
@@ -5190,7 +5834,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_mark_read",
-                description: "Mark an email as read or unread. Searches all accounts when account omitted",
+                description: "Mark an email as read or unread. Searches all accounts when account omitted. The result is read back off the message rather than restated from the request: it names the message (numeric and RFC ids), the account and mailbox it was found in, and the read state Mail reports afterwards. If Mail does not agree the flag was set, that is an error rather than a success sentence",
                 inputSchema: schema(
                     properties: [
                         "message_id": stringProp("Message ID from mail_get_emails or mail_search results"),

@@ -368,6 +368,64 @@ enum MIME {
         return out
     }
 
+    /// Whether a `multipart/*` message ends with the delimiter that closes it,
+    /// or nil when the question does not apply — the message is not multipart,
+    /// or declares no usable boundary.
+    ///
+    /// RFC 2046 requires a multipart body to end `--<boundary>--`. It is
+    /// therefore a **structural** end-of-message marker, independent of any
+    /// byte count, and it is the one check available on a message whose size
+    /// can only be confirmed in units Mail does not name (see
+    /// `MailService.SourceFidelity.completeBasis`). A message truncated
+    /// anywhere before the last part's end does not have it, whatever its
+    /// bytes add up to.
+    ///
+    /// "Ends with" is read leniently at the tail only: trailing CR, LF, space
+    /// and tab are stepped over, because that is what a transfer adds. An
+    /// epilogue after the close-delimiter — legal, and vanishingly rare — reads
+    /// as *not* terminated, which costs a caller the stronger reading of a
+    /// message rather than a wrong one. The delimiter must also start a line,
+    /// so a body whose last line happens to end in the same characters cannot
+    /// stand in for it.
+    static func multipartIsTerminated(_ data: Data) -> Bool? {
+        let bytes = [UInt8](data)
+        guard let boundary = topLevelBoundary(bytes) else { return nil }
+        let needle = [UInt8]("--\(boundary)--".utf8)
+        var end = bytes.count
+        while end > 0, bytes[end - 1] == 0x0D || bytes[end - 1] == 0x0A
+                || bytes[end - 1] == 0x20 || bytes[end - 1] == 0x09 {
+            end -= 1
+        }
+        let start = end - needle.count
+        guard start >= 0 else { return false }
+        for i in 0..<needle.count where bytes[start + i] != needle[i] { return false }
+        // At the start of a line, or at the start of the message.
+        return start == 0 || bytes[start - 1] == 0x0A || bytes[start - 1] == 0x0D
+    }
+
+    /// The `boundary` parameter of the message's own `Content-Type`, when it is
+    /// a `multipart/*`. Reads the header block only.
+    private static func topLevelBoundary(_ bytes: [UInt8]) -> String? {
+        let split = splitHeadersAndBody(bytes)
+        let headerBytes = Array(bytes[headerScan(split.headers, in: bytes)])
+        let headers = parseHeaders(headerBytes)
+        guard let raw = headers["content-type"] else { return nil }
+        let parsed = parseValueWithParameters(raw)
+        guard parsed.value.lowercased().hasPrefix("multipart/") else { return nil }
+        guard let boundary = parsed.parameters["boundary"], !boundary.isEmpty else { return nil }
+        return boundary
+    }
+
+    /// The header range, capped the same way `parseOne` caps it: a message with
+    /// no blank line in it is all headers on purpose, and reading megabytes of
+    /// them to find one parameter is work nobody asked for.
+    private static func headerScan(_ range: Range<Int>, in bytes: [UInt8]) -> Range<Int> {
+        guard range.count > maxHeaderBytes else { return range }
+        var cut = range.lowerBound + maxHeaderBytes
+        while cut > range.lowerBound, bytes[cut - 1] != 0x0A { cut -= 1 }
+        return range.lowerBound..<cut
+    }
+
     // MARK: - Header handling
 
     /// Returns the header block and body ranges, split at the first empty line.
