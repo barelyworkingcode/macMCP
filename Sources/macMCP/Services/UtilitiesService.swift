@@ -3,8 +3,22 @@ import Foundation
 enum UtilitiesService {
     private static func playSound(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
-        guard let path = args?["path"]?.stringValue else {
+        guard let requested = args?["path"]?.stringValue else {
             return errorResult("path is required")
+        }
+        // `path` is required and is read off this host, so the tool cannot run
+        // without a directory it may read from -- which is why it is in
+        // `file_dirs`'s `applies_to` and why the confinement is not optional
+        // here. See `HostFileScope`.
+        let scope = ResourceScope.parse(ctx.meta)
+        if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+            return scopeViolationResult(refusal)
+        }
+        let path: String
+        switch HostFileScope.resolve(requested, scope: scope, use: .read, what: "audio file") {
+        case .use(let resolved): path = resolved
+        case .refuse(let message): return scopeViolationResult(message)
+        case .error(let message): return errorResult(message)
         }
 
         let process = Process()
@@ -47,7 +61,7 @@ enum UtilitiesService {
                 description: "Play an audio file",
                 inputSchema: schema(
                     properties: [
-                        "path": stringProp("Path to the audio file to play")
+                        "path": stringProp("Absolute POSIX path of the audio file to play. Confined to the file_dirs of the calling client's resource scope; a client whose scope carries no file_dirs may not play a file off this host at all, and a path outside those directories is refused")
                     ],
                     required: ["path"]
                 ),

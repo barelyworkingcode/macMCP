@@ -163,12 +163,43 @@ private let mailScopeFields: [ScopeField] = [
     // only the other one, where relay *advertises* a confinement that is not
     // real. The `attachments` and `save_to` schemas say this in the tool
     // descriptions, which is the surface a client actually reads.
+    //
+    // **It is not a mail field, and three tools outside mail had no bound at
+    // all.** `file_dirs` arrived with the mail work and `grep -rn file_dirs
+    // Sources/` outside this file hit `MailScope.swift` and `MailService.swift`
+    // and nothing else -- while `capture_screenshot` and `capture_audio` took
+    // an unbounded absolute `path` and wrote to it, and `utilities_play_sound`
+    // took an unbounded absolute `path` and read from it. A profile granted
+    // `capture_*` therefore held the arbitrary host **write** finding 1 named
+    // as escalation rather than exfiltration and closed for
+    // `mail_save_attachment`: the same hole, in the same shape, one service
+    // over. The live attempt passed every relay and macMCP layer and died on
+    // the tool's backend, which is to say on nothing that was deciding
+    // anything.
+    //
+    // All three are named in `applies_to` by the rule stated above, and
+    // `capture_*` is the interesting reading of it: `path` is *optional in the
+    // schema and unavoidable in fact*. Every call writes a file somewhere -- a
+    // call with no `path` writes to `~/Desktop` -- so there is no form of the
+    // call a client with no directory could be served, which is
+    // `mail_save_attachment`'s position exactly rather than
+    // `mail_get_source`'s. `utilities_play_sound` requires `path` and reads
+    // it, so it is the plain case.
+    //
+    // The declaration is only half of it: relay reads `applies_to` and denies
+    // the tool outright, and `HostFileScope` is macMCP's own independent check
+    // at the parameter, which decision 4 requires be a second check rather
+    // than a restatement of relay's.
     ScopeField(
         name: "file_dirs",
         noun: "directory",
-        description: "Directories on this host this client may write files into and read attachments from",
+        description: "Directories on this host this client may write files into and read files "
+            + "from — attachments it sends, attachments and message sources it saves, screenshots "
+            + "and recordings it captures, and audio files it plays",
         source: .projectPath,
-        appliesTo: ["mail_save_attachment"]
+        appliesTo: [
+            "mail_save_attachment", "capture_screenshot", "capture_audio", "utilities_play_sound"
+        ]
     )
 ]
 

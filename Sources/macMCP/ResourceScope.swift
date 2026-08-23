@@ -468,6 +468,30 @@ struct ResourceScope: Equatable {
         case rootIsFilesystemRoot(String)
     }
 
+    /// The two sentences a `file_dirs` entry that cannot bound anything is
+    /// answered with.
+    ///
+    /// They live here rather than at a service because they are about the
+    /// field and not about the tool: neither says what was being opened or
+    /// which direction, and both are read by whoever wrote the access profile.
+    /// `MailScope` and `HostFileScope` both call them, which is what stops one
+    /// operator being told a `file_dirs` entry "is not an absolute path" and
+    /// another being told something else about the same mistake.
+    static func fileDirsNotAbsolute(_ dir: String) -> String {
+        "the directory scope this call carries is not usable: `file_dirs` entry "
+        + "\"\(dir)\" is not an absolute path, so there is no directory it names. "
+        + "Nothing was read or written. This is a configuration mistake rather than "
+        + "a refusal: the access profile making this call needs file_dirs set to "
+        + "absolute directory paths."
+    }
+
+    static func fileDirsBoundsNothing(_ dir: String) -> String {
+        "the directory scope this call carries is not usable: `file_dirs` entry "
+        + "\"\(dir)\" resolves to the filesystem root, which bounds nothing -- "
+        + "every absolute path is inside it. Nothing was read or written. Name the "
+        + "directories this client may reach instead."
+    }
+
     /// Whether `path` is inside one of `dirs`.
     ///
     /// The comparison follows fsMCP's `validatePath` in shape -- symlinks and
