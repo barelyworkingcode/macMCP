@@ -417,6 +417,56 @@ final class EventKitScopeTests: XCTestCase {
         XCTAssertTrue(message.contains("`calendars` takes that same path"), message)
     }
 
+    // MARK: - The account half of a path, when EventKit will not name one
+
+    /// The "unnamed CalDAV account" case: `EKSource.title` is `""` rather than
+    /// absent, so `source?.title ?? unknownSourceName` passed it straight
+    /// through and the path came out `"/Work"` — a container of nothing, in a
+    /// value an operator is asked to pick and a refusal is asked to print.
+    /// `ContactsService.containerName` has fallen back on empty since it was
+    /// written; these two now agree.
+    func testAnEmptySourceTitleFallsBackTheSameWayAnAbsentOneDoes() {
+        XCTAssertEqual(CalendarService.sourceName(nil), CalendarService.unknownSourceName)
+        XCTAssertEqual(CalendarService.sourceName(""), CalendarService.unknownSourceName)
+        XCTAssertEqual(CalendarService.sourceName("iCloud"), "iCloud")
+        XCTAssertEqual(
+            ScopePath.Row(container: CalendarService.sourceName(""), leaf: "Work").path,
+            "unknown/Work"
+        )
+    }
+
+    // MARK: - One spelling of case-insensitivity, everywhere
+
+    /// `reminders_complete` matched titles with `.lowercased()` while every
+    /// scope comparison on the same path uses `ResourceScope.fold`. What this
+    /// pins is that the handler now decides *which* reminder and *whether it
+    /// is in scope* by one rule.
+    ///
+    /// It deliberately does **not** claim `.lowercased()` gave a different
+    /// answer. Swift's `String ==` compares by canonical equivalence, so it
+    /// did not: measured across every scalar in U+0000...U+2FFFF against its
+    /// own decomposition, the two spellings agree everywhere, and the assert
+    /// below says so rather than pretending otherwise. The fix is one
+    /// spelling of one rule, which is what keeps it right if this comparison
+    /// is ever moved somewhere `==` is not canonical.
+    func testReminderTitleMatchingFoldsTheWayEveryScopeComparisonDoes() {
+        let nfc = "Caf\u{00E9} run"
+        let nfd = "Cafe\u{0301} RUN"
+        XCTAssertTrue(RemindersService.titleMatches(nfd, nfc))
+        XCTAssertTrue(RemindersService.titleMatches(nfc, nfd))
+        // Case-insensitivity, which is what the tool has always documented.
+        XCTAssertTrue(RemindersService.titleMatches("Buy Milk", "buy milk"))
+        XCTAssertFalse(RemindersService.titleMatches("Buy Bread", "buy milk"))
+        XCTAssertFalse(RemindersService.titleMatches(nil, "buy milk"))
+        // The verdict is the scope's own rule, not a lookalike beside it.
+        XCTAssertEqual(
+            RemindersService.titleMatches(nfd, nfc),
+            ResourceScope.fold(nfd) == ResourceScope.fold(nfc)
+        )
+        // And the honest part: in Swift the old spelling agreed here too.
+        XCTAssertEqual(nfc.lowercased(), nfd.lowercased())
+    }
+
     // MARK: - The reminders half is the same rule with different words
 
     /// The two services share the seam and differ only in the nouns, so a

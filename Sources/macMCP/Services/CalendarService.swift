@@ -329,7 +329,28 @@ enum CalendarService {
     /// is called. `EKCalendar.title` is not an identity: two sources can each
     /// hold a "Work", which is why `$0.title == name` returned both.
     static func row(of calendar: EKCalendar) -> ScopePath.Row {
-        ScopePath.Row(container: calendar.source?.title ?? unknownSourceName, leaf: calendar.title)
+        ScopePath.Row(container: sourceName(calendar.source?.title), leaf: calendar.title)
+    }
+
+    /// The account half of a path, from whatever `EKSource.title` gave.
+    ///
+    /// **An empty title is as unusable as no source at all**, and only the
+    /// second was handled: `source?.title ?? unknownSourceName` falls back for
+    /// a nil source and passes `""` straight through, so an unnamed CalDAV
+    /// account -- a server that supplies no display name, which is the
+    /// ordinary way this happens -- produced a container of `""` and a path of
+    /// `"/Work"`. That is a value no operator would type, one the picker would
+    /// nonetheless offer, and one that reads in a refusal as though the string
+    /// were truncated. `ContactsService.containerName` has fallen back on
+    /// empty since it was written, for exactly this case; these two now agree.
+    ///
+    /// Takes the title rather than the `EKSource` so the rule is reachable
+    /// from a hermetic test. EventKit cannot be driven from one, and an
+    /// `EKSource` cannot be constructed, so a function taking the framework
+    /// object would be a rule nothing could pin.
+    static func sourceName(_ title: String?) -> String {
+        guard let title, !title.isEmpty else { return unknownSourceName }
+        return title
     }
 
     /// Rows positionally aligned with the calendars they came from, so an index
