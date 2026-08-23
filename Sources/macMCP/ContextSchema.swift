@@ -33,23 +33,31 @@ import Foundation
 /// that is not real. The mail fields honour that -- they were declared in the
 /// same server version that enforces them.
 ///
-/// **The six calendar / contacts / reminders fields below were declared ahead
-/// of their enforcement, as a staging step, and that state must not reach a
-/// running relay.** Relay's own call-time presence check refuses a `calendars_*`
-/// call from a profile that sets no value, so the *presence* half goes live the
-/// moment a field is declared; the *value* half -- which calendar -- does not,
-/// and a profile scoped to `iCloud/Work` would have been shown as confined while
-/// `calendars_list_events` still answered from every calendar on the Mac. That
-/// is exactly decision 9's failure.
+/// **Every field declared here is enforced.** The six calendar / contacts /
+/// reminders fields were, for one branch, declared ahead of their enforcement
+/// as a staging step, and that state is gone:
 ///
-/// `calendar_accounts`, `calendars`, `reminder_accounts` and `reminder_lists`
-/// are now enforced: `ScopedRows` (`Services/EventKitScope.swift`) applies the
-/// reconciliation rule at every one of the six tools those four govern, and
-/// `CalendarRemindersScopeWiringTests` is what says so tool by tool.
-/// `contact_accounts` and `contact_groups` are enforced too, by
-/// `ContactsService.gate`; the four calendar and reminder fields above are the
-/// remainder, and this file is the honest place to say which half of the
-/// declaration is real.
+/// * `calendar_accounts`, `calendars`, `reminder_accounts` and
+///   `reminder_lists` by `ScopedRows` (`Services/EventKitScope.swift`), which
+///   applies the reconciliation rule at every one of the six tools those four
+///   govern -- `CalendarRemindersScopeWiringTests` says so tool by tool;
+/// * `contact_accounts` and `contact_groups` by `ContactsService.gate`, which
+///   all ten `contacts_*` tools go through;
+/// * `mail_accounts` and `mail_mailboxes` by `MailScope` and the generated
+///   scripts beneath it;
+/// * `file_dirs` at the parameter, by `MailScope.writeDestination` /
+///   `readableAttachment` and by `HostFileScope` for the three non-mail tools
+///   that open a file on this host.
+///
+/// Why the staging state was dangerous, kept because it is the reason to
+/// declare and enforce in one change rather than two: relay's call-time
+/// presence check refuses a `calendars_*` call from a profile that sets no
+/// value, so the *presence* half goes live the moment a field is declared
+/// while the *value* half -- which calendar -- does not. A profile scoped to
+/// `iCloud/Work` was shown as confined while `calendars_list_events` still
+/// answered from every calendar on the Mac, which is decision 9's failure
+/// exactly. A field added below without its enforcement puts this file back
+/// in that state.
 let macmcpContextSchema: JSONObject = {
     var schema: JSONObject = [:]
     for field in scopeFields { schema[field.name] = field.declaration }
@@ -221,11 +229,14 @@ private let mailScopeFields: [ScopeField] = [
 // operator narrows the picker with.
 //
 // **Values are paths, not bare titles**, for the reason `ScopePath` states at
-// length: `EKCalendar.title` is not unique, `CalendarService` matches with
-// `$0.title == name` and therefore matches *both* when two sources hold a
-// "Work", and a permission value that quietly selects two of something is the
-// same class of bug the mailbox path work fixed. `Source/Title` for a
-// calendar and a reminder list, `Account/Group` for a contact group.
+// length: `EKCalendar.title` is not unique, `CalendarService` used to match
+// with `$0.title == name` and therefore matched *both* when two sources hold
+// a "Work", and a permission value that quietly selects two of something is
+// the same class of bug the mailbox path work fixed. `Source/Title` for a
+// calendar and a reminder list, `Account/Group` for a contact group. Note a
+// path is not by itself sufficient -- two calendars can share one *path* as
+// well as one title, and `ScopedRows.allowed` refuses such a value rather
+// than admitting both, which is the same rule one level down.
 
 private let calendarScopeFields: [ScopeField] = [
     ScopeField(
@@ -253,11 +264,12 @@ private let calendarScopeFields: [ScopeField] = [
     )
 ]
 
-// **The contacts pair is enforced, as of the branch that added this note**, so
-// the staging warning above no longer applies to these two: `contact_accounts`
-// and `contact_groups` are read by `ContactsService.gate`, which every one of
-// the ten `contacts_*` tools goes through. The four calendar and reminder
-// fields are still declaration-only.
+// `contact_accounts` and `contact_groups` are read by `ContactsService.gate`,
+// which every one of the ten `contacts_*` tools goes through. (This used to
+// carry a note saying the four calendar and reminder fields were still
+// declaration-only. They are not, and have not been since `ScopedRows`
+// landed; the file header above is the one place that says what is enforced,
+// so there is only one such claim to keep true.)
 //
 // **The two contacts fields do NOT share an `applies_to`, and that asymmetry
 // with mail is the whole shape of this service.** Mail can require both of its
