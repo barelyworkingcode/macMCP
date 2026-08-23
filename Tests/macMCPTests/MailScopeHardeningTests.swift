@@ -84,6 +84,15 @@ final class MailScopeHardeningTests: XCTestCase {
     func testMailSendRefusesAnOutOfScopeAttachmentBeforeComposingAnything() {
         let registry = ToolRegistry()
         MailService.register(registry)
+        // `Drafts` is in scope on purpose: what this pins is the *attachment*
+        // refusal, and `mail_create_draft` now refuses a profile that cannot
+        // reach its destination mailbox before it looks at anything else (see
+        // `testCreateDraftAndMoveGiveTheSameAnswerAboutDrafts`). A scope that
+        // tripped both would be pinning whichever came first.
+        let scopeWithDrafts: JSONObject = [
+            "mail_accounts": .array([.string("Bob")]),
+            "mail_mailboxes": .array([.string("INBOX"), .string("Drafts")])
+        ]
         for tool in ["mail_send", "mail_create_draft"] {
             let result = registry.call(
                 name: tool,
@@ -93,7 +102,7 @@ final class MailScopeHardeningTests: XCTestCase {
                     "body": .string("probe"),
                     "attachments": .array([.string("/tmp/zsec-secret.txt")])
                 ],
-                meta: Self.bobInboxScope
+                meta: scopeWithDrafts
             )
             XCTAssertEqual(result.isError, true, tool)
             XCTAssertEqual(result.meta?["scope_violation"], .bool(true), tool)
@@ -102,6 +111,118 @@ final class MailScopeHardeningTests: XCTestCase {
                 "\(tool): \(result.content.first?.text ?? "")"
             )
         }
+    }
+
+    // MARK: - A draft is written into a mailbox, and that is reaching it
+
+    /// **The three answers that disagreed.** With the same profile --
+    /// `mail_mailboxes: ["Archive", "INBOX"]` -- `mail_move` to `Drafts` was
+    /// refused, `mail_create_draft` wrote a complete message into that same
+    /// `Drafts`, and `mail_get_email` on the id it handed back refused it as
+    /// out of scope. This runs both refusals from one scope so the agreement
+    /// is the assertion.
+    ///
+    /// End to end through the registry, which is the only thing that says the
+    /// check is wired in rather than merely available. Hermetic: the refusal
+    /// fires before `mail.OutgoingMessage` is generated, let alone spawned.
+    func testCreateDraftAndMoveGiveTheSameAnswerAboutDrafts() {
+        let registry = ToolRegistry()
+        MailService.register(registry)
+        let profile: JSONObject = [
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([.string("Archive"), .string("INBOX")])
+        ]
+        let move = registry.call(
+            name: "mail_move",
+            arguments: ["message_id": .int(1), "target_mailbox": .string("Drafts")],
+            meta: profile
+        )
+        XCTAssertEqual(move.isError, true)
+        XCTAssertEqual(move.meta?["scope_violation"], .bool(true))
+
+        let draft = registry.call(
+            name: "mail_create_draft",
+            arguments: [
+                "to": .string("bob@relaytest.local"),
+                "subject": .string("probe"),
+                "body": .string("probe")
+            ],
+            meta: profile
+        )
+        XCTAssertEqual(draft.isError, true)
+        XCTAssertEqual(draft.meta?["scope_violation"], .bool(true))
+        let text = draft.content.first?.text ?? ""
+        XCTAssertTrue(text.contains("outside the mailboxes this client may reach"), text)
+        XCTAssertTrue(text.contains("Nothing was composed"), text)
+        // The advice names what would make it work, which is the one thing a
+        // caller can act on: this tool takes no mailbox argument.
+        XCTAssertTrue(text.contains("Drafts is one of the mailboxes"), text)
+    }
+
+    /// A profile that names `Drafts` drafts. The refusal must be about the
+    /// mailbox and not about drafting.
+    func testAProfileThatNamesDraftsIsNotRefusedByThisCheck() {
+        let call = MailCall(budget: 30, scope: MailScope.parse([
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([.string("INBOX"), .string("Drafts")])
+        ]))
+        XCTAssertNil(MailService.draftDestinationRefusal(call: call))
+    }
+
+    /// Matched as a **path**, with no leaf-name fallback. `mailboxTargets`
+    /// accepts a leaf name for an argument a caller wrote; nobody wrote this
+    /// one, and a grant of a project folder called Drafts is not a grant of
+    /// the account's Drafts. `mail_move` reaches the same conclusion one step
+    /// later, when `fmAllowed` checks the resolved destination path.
+    func testANestedFolderCalledDraftsIsNotAGrantOfTheAccountsDrafts() {
+        let call = MailCall(budget: 30, scope: MailScope.parse([
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([.string("Projects/Drafts")])
+        ]))
+        XCTAssertNotNil(MailService.draftDestinationRefusal(call: call))
+    }
+
+    /// An unmediated call -- macmcp on a bare stdio pipe -- drafts exactly as
+    /// it always has. Every existing caller is this one.
+    func testAnUnmediatedCallDraftsWhereItAlwaysDid() {
+        XCTAssertNil(MailService.draftDestinationRefusal(
+            call: MailCall(budget: 30, scope: .none)))
+    }
+
+    /// **`mail_send` is deliberately not bound by this**, and the asymmetry is
+    /// a decision rather than an oversight, so it is pinned. What that tool
+    /// produces is a message on the wire; the Sent copy is bookkeeping about a
+    /// delivery that has already happened, is not a destination the caller
+    /// chose, and yields no handle. Requiring `Sent` in `mail_mailboxes` would
+    /// take sending away from every write profile to bound a copy that changes
+    /// nothing about who received the mail.
+    ///
+    /// A `mail_send` from a Drafts-less profile therefore gets past the scope
+    /// checks and fails on Mail instead -- which is what this asserts, by the
+    /// refusal it does NOT carry.
+    func testMailSendIsNotRefusedForNotNamingSentOrDrafts() {
+        let registry = ToolRegistry()
+        MailService.register(registry)
+        let result = registry.call(
+            name: "mail_send",
+            arguments: [
+                "to": .string("bob@relaytest.local"),
+                "subject": .string("probe"),
+                "body": .string("probe"),
+                // Zero budget so the call cannot reach Mail: what is being
+                // asserted is which refusal comes back, not that one does.
+                "timeout_seconds": .int(0)
+            ],
+            meta: [
+                "mail_accounts": .array([.string("Alice")]),
+                "mail_mailboxes": .array([.string("Archive"), .string("INBOX")])
+            ]
+        )
+        XCTAssertNil(result.meta?["scope_violation"], result.content.first?.text ?? "")
+        XCTAssertFalse(
+            (result.content.first?.text ?? "").contains("outside the mailboxes"),
+            result.content.first?.text ?? ""
+        )
     }
 
     // MARK: - A2: a bound that is not an absolute path bounds nothing

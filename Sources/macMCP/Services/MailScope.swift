@@ -222,21 +222,15 @@ extension ResourceScope {
                 return .use(expanded)
             case .notAbsolute:
                 return .refuse("path \"\(path)\" must be absolute")
+            // Both sentences are about `file_dirs` itself rather than about
+            // mail, so they are `ResourceScope`'s and `HostFileScope` reads
+            // the same two -- an operator meeting this mistake through
+            // `capture_screenshot` and through `mail_save_attachment` must
+            // not be told two different things about one bad entry.
             case .rootNotAbsolute(let dir):
-                return .misconfigured(
-                    "the directory scope this call carries is not usable: `file_dirs` entry "
-                    + "\"\(dir)\" is not an absolute path, so there is no directory it names. "
-                    + "Nothing was read or written. This is a configuration mistake rather than "
-                    + "a refusal: the access profile making this call needs file_dirs set to "
-                    + "absolute directory paths."
-                )
+                return .misconfigured(MailScope.fileDirsNotAbsolute(dir))
             case .rootIsFilesystemRoot(let dir):
-                return .misconfigured(
-                    "the directory scope this call carries is not usable: `file_dirs` entry "
-                    + "\"\(dir)\" resolves to the filesystem root, which bounds nothing -- "
-                    + "every absolute path is inside it. Nothing was read or written. Name the "
-                    + "directories this client may reach instead."
-                )
+                return .misconfigured(MailScope.fileDirsBoundsNothing(dir))
             case .outside:
                 switch use {
                 case .write:

@@ -77,7 +77,11 @@ enum RemindersService {
     /// is not an identity here either: every account may hold a `Reminders`.
     static func row(of calendar: EKCalendar) -> ScopePath.Row {
         ScopePath.Row(
-            container: calendar.source?.title ?? CalendarService.unknownSourceName,
+            // Shared with `CalendarService` rather than spelled again: an
+            // empty `EKSource.title` has to fall back the same way on both
+            // axes, or one service's picker offers `"/Work"` while the other
+            // offers `"unknown/Work"` for the same unnamed account.
+            container: CalendarService.sourceName(calendar.source?.title),
             leaf: calendar.title
         )
     }
@@ -85,6 +89,31 @@ enum RemindersService {
     /// Rows positionally aligned with the lists they came from, so an index the
     /// enforcement returns names the very object the handler acts on.
     static func rows(of calendars: [EKCalendar]) -> [ScopePath.Row] { calendars.map(row(of:)) }
+
+    /// Whether a reminder's own title is the one `reminders_complete` was
+    /// asked for.
+    ///
+    /// **`fold`, not `lowercased()`, and the reason is not the one it looks
+    /// like.** `fold` is NFC -> lowercase -> NFC, and it exists because
+    /// JavaScript's `===` compares UTF-16 code units, so an NFD mailbox name
+    /// and an NFC scope value are two strings in every generated script. In
+    /// *Swift* they are not: `String ==` compares by canonical equivalence, so
+    /// `.lowercased()` already answered every NFC/NFD pair identically.
+    /// Measured rather than assumed -- every scalar in U+0000...U+2FFFF
+    /// against its own decomposition, **zero** verdicts differ between the two
+    /// spellings. So this changes no behaviour today and is not a hole that
+    /// was open.
+    ///
+    /// What it is is the last comparison on a scoped path still carrying its
+    /// own case rule. The handler picks a reminder with this and then decides
+    /// that reminder's list membership with `ScopedRows.admits`, which folds;
+    /// two spellings of one rule in one handler is how they come apart, and
+    /// the way they would come apart here is by this comparison being moved
+    /// somewhere `==` is not canonical -- a generated script, a `Set` of raw
+    /// keys, a byte compare. One spelling, at the one seam.
+    static func titleMatches(_ candidate: String?, _ requested: String) -> Bool {
+        ResourceScope.fold(candidate ?? "") == ResourceScope.fold(requested)
+    }
 
     private static func confinement(_ scope: ResourceScope, rows: [ScopePath.Row]) -> ScopedRows.RowScope {
         ScopedRows.allowed(
@@ -342,7 +371,7 @@ enum RemindersService {
             // indistinguishable from a real miss and leaves nothing to debug.
             func incomplete(in calendars: [EKCalendar]?) -> EKReminder? {
                 fetchReminders(in: calendars).first {
-                    ($0.title ?? "").lowercased() == title.lowercased() && !$0.isCompleted
+                    titleMatches($0.title, title) && !$0.isCompleted
                 }
             }
             let match = incomplete(in: admitted.map { $0.map { all[$0] } })

@@ -30,10 +30,43 @@ enum CaptureService {
 
     // MARK: - Tool Handlers
 
+    /// The one place either capture tool decides where its file goes.
+    ///
+    /// **Both directions of `file_dirs` in one seam**, because both tools open
+    /// the same kind of hole in the same way and the only thing that differs
+    /// is the extension. See `HostFileScope` for why these tools are governed
+    /// at all and why an absent `path` resolves to the scope rather than
+    /// refusing.
+    private static func destination(
+        _ ctx: MCPCallContext, filename: String, what: String
+    ) -> (path: String?, refusal: MCPCallResult?) {
+        let scope = ResourceScope.parse(ctx.meta)
+        // Ordered before anything else for the reason every scoped handler
+        // orders it there: it is a question about this call's authority, which
+        // does not depend on whether the machine would have answered.
+        if let refusal = scope.presenceRefusal(tool: ctx.toolName) {
+            return (nil, scopeViolationResult(refusal))
+        }
+        let outcome: HostFileScope.Outcome
+        if let requested = ctx.arguments?["path"]?.stringValue {
+            outcome = HostFileScope.resolve(requested, scope: scope, use: .write, what: what)
+        } else {
+            outcome = HostFileScope.resolveDefault(
+                directory: "~/Desktop", filename: filename, scope: scope, what: what)
+        }
+        switch outcome {
+        case .use(let path): return (path, nil)
+        case .refuse(let message): return (nil, scopeViolationResult(message))
+        case .error(let message): return (nil, errorResult(message))
+        }
+    }
+
     private static func captureScreenshot(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
-        let defaultPath = NSString(string: "~/Desktop/screenshot-\(timestamp()).png").expandingTildeInPath
-        let path = args?["path"]?.stringValue ?? defaultPath
+        let resolved = destination(
+            ctx, filename: "screenshot-\(timestamp()).png", what: "screenshot")
+        if let refusal = resolved.refusal { return refusal }
+        guard let path = resolved.path else { return errorResult("no destination for the screenshot") }
         let type = args?["type"]?.stringValue ?? "fullscreen"
 
         var flags = ["-x"]
@@ -58,8 +91,10 @@ enum CaptureService {
 
     private static func captureAudio(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
-        let defaultPath = NSString(string: "~/Desktop/recording-\(timestamp()).m4a").expandingTildeInPath
-        let path = args?["path"]?.stringValue ?? defaultPath
+        let resolved = destination(
+            ctx, filename: "recording-\(timestamp()).m4a", what: "recording")
+        if let refusal = resolved.refusal { return refusal }
+        guard let path = resolved.path else { return errorResult("no destination for the recording") }
         let duration = args?["duration"]?.intValue ?? 10
 
         let flags = ["-d", "aac", "-f", "m4af", "-c", "1", "-s", "2", "--duration", "\(duration)", path]
@@ -92,7 +127,7 @@ enum CaptureService {
                 description: "Take a screenshot of the screen, a window, or a selection",
                 inputSchema: schema(
                     properties: [
-                        "path": stringProp("File path to save the screenshot (defaults to ~/Desktop/screenshot-{timestamp}.png)"),
+                        "path": stringProp("Absolute POSIX path to save the screenshot to (defaults to ~/Desktop/screenshot-{timestamp}.png). Confined to the file_dirs of the calling client's resource scope. A client whose scope carries no file_dirs cannot take a screenshot at all — every call writes a file — and one whose scope names directories writes only inside them: the default location is used when it is one of them, the single allowed directory is used when there is only one, and otherwise you are asked to pass a path naming one of them"),
                         "type": enumProp("Capture type", values: ["fullscreen", "window", "selection"])
                     ]
                 ),
@@ -108,7 +143,7 @@ enum CaptureService {
                 description: "Record audio from the default input device",
                 inputSchema: schema(
                     properties: [
-                        "path": stringProp("File path to save the recording (defaults to ~/Desktop/recording-{timestamp}.m4a)"),
+                        "path": stringProp("Absolute POSIX path to save the recording to (defaults to ~/Desktop/recording-{timestamp}.m4a). Confined to the file_dirs of the calling client's resource scope, exactly as capture_screenshot's path is: no file_dirs means no recording, and otherwise the file is written inside one of the named directories"),
                         "duration": intProp("Recording duration in seconds (defaults to 10)")
                     ]
                 ),
