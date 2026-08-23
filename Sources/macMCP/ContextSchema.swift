@@ -84,10 +84,27 @@ private let mailScopeFields: [ScopeField] = [
         appliesTo: ["mail_*"],
         enumerate: { _ in MailService.enumerateMailAccounts() }
     ),
+    // **"May reach" includes writing into one.** `mail_move`'s destination has
+    // always been bound by this field; `mail_create_draft`'s was not, and a
+    // profile carrying `["Archive", "INBOX"]` could therefore put a complete
+    // message into `Drafts` -- a mailbox the same profile could not move a
+    // message into and could not read one out of, under a handle the tool
+    // returned and every other tool then refused. ADR-011 decision 11 exempts
+    // the *autosave sweep* from this field ("a tool's bookkeeping about the
+    // message it just wrote is not a read of the user's mail"), and that
+    // ruling does not stretch to the creation itself. See
+    // `MailService.draftDestinationRefusal`.
+    //
+    // `mail_send` is deliberately still not bound by it: what that tool
+    // produces is a message on the wire, and the copy Mail files in Sent is
+    // bookkeeping about a delivery that has already happened rather than a
+    // destination the caller chose or gets a handle to.
     ScopeField(
         name: "mail_mailboxes",
         noun: "mailbox",
-        description: "Mailbox paths within those accounts this client may reach",
+        description: "Mailbox paths within those accounts this client may reach — for reading and "
+            + "for writing alike, so a client that may not read a mailbox may not move a message "
+            + "into it either, and a client without Drafts here cannot create drafts",
         appliesTo: ["mail_*"],
         dependsOn: ["mail_accounts"],
         enumerate: { values in

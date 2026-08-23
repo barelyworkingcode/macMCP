@@ -4910,6 +4910,19 @@ JSON.stringify(out);
         // of what `mail_accounts` governs here, and a `from` whose owning
         // account is out of scope is refused inside `senderJXA`, where which
         // account owns an address is answerable.
+        //
+        // **And `mail_send`, unlike `mail_create_draft`, does not check a
+        // destination mailbox against `mail_mailboxes`.** The two compose the
+        // identical message and they are deliberately answered differently.
+        // What this tool produces is a message on the wire; the copy Mail
+        // files in the sending account's Sent afterwards is bookkeeping about
+        // a message the call has already delivered -- the same category
+        // ADR-011 decision 11 exempts the autosave sweep under, and not a
+        // destination the caller chose, named, or gets a handle to. Requiring
+        // `Sent` in `mail_mailboxes` would take sending away from every write
+        // profile in order to bound a copy that changes nothing about who
+        // received the mail. `mail_create_draft` is the opposite case in every
+        // one of those respects; see `draftDestinationRefusal`.
         if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
         invalidateSourceCache()
         // `disposesMessage: true`: after `send()` Mail has let go of the
@@ -5062,10 +5075,77 @@ var savedDraft = (function() {
 """
     }
 
+    /// The mailbox `mail.save()` files a draft into: the sending account's
+    /// own `Drafts`, at the root of it.
+    ///
+    /// A bare name is a path with one component, so this is the path the
+    /// compose script already binds (`acct.mailboxes.byName('Drafts')`) and
+    /// the path `savedDraftLookupJXA` reports back as the draft's `mailbox`.
+    static let draftDestination = "Drafts"
+
+    /// ADR-011's reconciliation rule applied to the one mailbox
+    /// `mail_create_draft` writes into.
+    ///
+    /// **Three tools used to give three answers about one mailbox.** With
+    /// `mail_mailboxes: ["Archive", "INBOX"]`: `mail_move` to `Drafts` was
+    /// refused as "outside the mailboxes this client may reach";
+    /// `mail_create_draft` wrote a complete message -- recipients, subject,
+    /// body, attachments -- into that same `Drafts`; and `mail_get_email` on
+    /// the id it handed back refused it as out of scope. So a profile could
+    /// put a message somewhere it could not move one and could not read one,
+    /// and the tool that did it returned the handle that every other tool then
+    /// declined to honour.
+    ///
+    /// `mail_mailboxes` is described to the operator as "mailbox paths within
+    /// those accounts this client may reach", and writing a message into a
+    /// mailbox is reaching it -- more so than reading, not less. Decision 11's
+    /// exemption does not stretch to cover this: it excuses *bookkeeping about
+    /// the message a tool just wrote* (the Drafts sweep for the copy Mail
+    /// autosaves behind the caller's back, which can surface nothing but the
+    /// client's own message), and the creation itself is the write, not
+    /// bookkeeping about it. The alternative reading -- `mail_mailboxes`
+    /// governs reads only -- would have to be written into the field's
+    /// description and would leave `mail_move`, which is also a write,
+    /// enforcing something the field no longer claimed.
+    ///
+    /// So a profile whose `mail_mailboxes` does not name `Drafts` cannot
+    /// draft. That is a real cost and it is the intended one: it is exactly
+    /// the cost of not being able to `mail_move` into `Drafts`, which that
+    /// profile already pays.
+    ///
+    /// **Matched as a path, with no leaf-name fallback.** `mailboxTargets`
+    /// accepts a leaf name for an argument the caller *wrote*, because a bare
+    /// name a human typed is worth resolving; nobody wrote this one. A grant
+    /// of `Projects/Drafts` is a grant of a project folder that happens to be
+    /// called Drafts, and it is not a grant of the account's Drafts -- which
+    /// is the same conclusion `mail_move` reaches, one step later, when
+    /// `fmAllowed` checks the *resolved* destination path rather than the
+    /// string the caller passed.
+    static func draftDestinationRefusal(call: MailCall) -> MCPCallResult? {
+        // `.refuse` is `presenceRefusal`'s to answer and it has already run;
+        // `.unscoped` is macmcp on a bare stdio pipe and must be untouched.
+        guard case .allowed(let allowed) = call.scope.mailboxesAccess else { return nil }
+        guard MailScope.names(draftDestination, oneOf: allowed) else {
+            return scopeViolationResult(
+                "a draft is saved in the sending account's \"\(draftDestination)\" mailbox, which "
+                + "is outside the mailboxes this client may reach. It may reach: "
+                + allowed.joined(separator: ", ") + ". Nothing was composed and nothing was "
+                + "written. `mail_create_draft` takes no mailbox argument -- the destination is "
+                + "always the account's own \(draftDestination) -- so this profile cannot create "
+                + "drafts at all until \(draftDestination) is one of the mailboxes it may reach. "
+                + "It is the same refusal mail_move gives for a move into \(draftDestination)."
+            )
+        }
+        return nil
+    }
+
     private static func createDraft(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         let call = MailCall.forArguments(args, default: Budget.createDraft, meta: ctx.meta)
         if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
+        // The mailbox this call writes into. It is not an argument, which is
+        // why it went unchecked; it is still a mailbox this client is reaching.
+        if let refusal = draftDestinationRefusal(call: call) { return refusal }
         invalidateSourceCache()
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
@@ -6739,7 +6819,7 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_create_draft",
-                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface: every scripted draft measured on Mail 16 came back with an EMPTY text/plain part, the body surviving only as HTML, so a plain-text-preferring client shows the draft as blank. That is reported as body_check, whose plain_text_matches_body is null and measured false unless you pass verify_body — the default does not re-download the draft to be told a constant, and says null rather than false because a hardcoded claim would go wrong the day Mail stops rewriting. verify_body: true fetches the saved draft back and compares its text/plain part with the body that was asked for. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts. The draft you asked for is never counted as one of those, even when a compose slow enough for Mail's autosave timer to fire means the save landed on Mail's own copy and the draft carries its X-Apple-Auto-Saved header — that case is reported as saved_over_autosave",
+                description: "Create an email draft in Mail.app's Drafts folder, optionally as HTML and with file attachments. Does NOT send the email. Returns the saved draft's numeric and RFC message IDs so it can be read back with mail_get_email. rendered_chars is the length of the body Mail composed with all whitespace removed (an 18-character body of \"just one line here\" reports 15), and exists to catch a body Mail rendered as empty rather than to match the length of what was asked for. Mail rewrites the body of anything composed through its scripting interface: every scripted draft measured on Mail 16 came back with an EMPTY text/plain part, the body surviving only as HTML, so a plain-text-preferring client shows the draft as blank. That is reported as body_check, whose plain_text_matches_body is null and measured false unless you pass verify_body — the default does not re-download the draft to be told a constant, and says null rather than false because a hardcoded claim would go wrong the day Mail stops rewriting. verify_body: true fetches the saved draft back and compares its text/plain part with the body that was asked for. The result also reports from and account (the identity Mail composed as, read off the message) and autosaved_draft: Mail autosaves whatever it is composing, and this says whether that extra copy was found in Drafts. The draft you asked for is never counted as one of those, even when a compose slow enough for Mail's autosave timer to fire means the save landed on Mail's own copy and the draft carries its X-Apple-Auto-Saved header — that case is reported as saved_over_autosave. The draft is written into the sending account's own Drafts mailbox and takes no mailbox argument, so a client whose resource scope carries mail_mailboxes must have Drafts among them; without it the call is refused with nothing composed, the same refusal mail_move gives for a move into Drafts",
                 inputSchema: composeSchema(
                     action: "save the draft in",
                     budget: Budget.createDraft,
