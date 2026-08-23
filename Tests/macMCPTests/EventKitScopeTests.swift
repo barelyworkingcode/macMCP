@@ -315,6 +315,108 @@ final class EventKitScopeTests: XCTestCase {
             container: "Exchange", leaf: "Work", allowed: [0], rows: rows))
     }
 
+    // MARK: - One value must not silently grant two resources
+
+    /// The rows a duplicate produces: two calendars filed under one account
+    /// with one title, which an import or a shared-calendar subscription
+    /// makes routine and which `Source/Title` cannot tell apart.
+    private let duplicated: [ScopePath.Row] = [
+        .init(container: "Default", leaf: "ZSECDUP"),
+        .init(container: "Default", leaf: "Other"),
+        .init(container: "Default", leaf: "ZSECDUP")
+    ]
+
+    private func duplicatedConfinement(
+        accounts: [String], calendars: [String]
+    ) -> ScopedRows.RowScope {
+        let s = scope(accounts: accounts, calendars: calendars)
+        return ScopedRows.allowed(
+            rows: duplicated,
+            containers: s.access("calendar_accounts"),
+            leaves: s.access("calendars"),
+            fields: fields
+        )
+    }
+
+    /// **The hole this closes.** `Default/ZSECDUP` names two calendars, and
+    /// admitting both is one scope value granting two resources — with the
+    /// operator shown a single picker entry, because `ScopePath.entries`
+    /// dedupes by path. Reproduced live against reminders before this: a
+    /// `reminder_lists: ["Default/ZSECDUP"]` profile read the contents of
+    /// both lists, every row labelled `list_path: "Default/ZSECDUP"`.
+    func testAValueNamingTwoResourcesAdmitsNeitherOfThem() {
+        let verdict = duplicatedConfinement(
+            accounts: ["Default"], calendars: ["Default/ZSECDUP"])
+        guard case .misconfigured(let message) = verdict else {
+            return XCTFail("expected a misconfiguration, got \(verdict)")
+        }
+        XCTAssertTrue(message.contains("names more than one calendar"), message)
+        XCTAssertTrue(message.contains("\"Default/ZSECDUP\""), message)
+        // Not a scope violation: nobody probed a boundary, two calendars were
+        // given one name (ADR-011 decision 11).
+        if case .refused = verdict { XCTFail("an operator's duplicate is not a violation") }
+    }
+
+    /// `ScopePath.ambiguousValues` reports exactly the condition the
+    /// enforcement now refuses on. It said so in its own doc-comment and
+    /// nothing on the enforcement path agreed with it; this is what says the
+    /// picker's detection and the refusal are about the same thing.
+    func testTheDetectionThePickerUsesAndTheRefusalAgree() {
+        XCTAssertEqual(ScopePath.ambiguousValues(in: duplicated), ["Default/ZSECDUP"])
+        guard case .misconfigured = duplicatedConfinement(
+            accounts: ["Default"], calendars: ["Default/ZSECDUP"]
+        ) else { return XCTFail("expected the enforcement to refuse what the picker flags") }
+        // And the entry an operator is shown really is one entry, which is why
+        // admitting two would have been invisible.
+        XCTAssertEqual(
+            ScopePath.entries(fromRows: duplicated, containerFilter: nil).map(\.value),
+            ["Default/ZSECDUP", "Default/Other"]
+        )
+    }
+
+    /// The whole call refuses rather than the duplicate being dropped from an
+    /// otherwise usable scope: a profile that reads as granting two calendars
+    /// and silently grants one is a confinement an operator cannot review.
+    /// This is what `ContactsScope` has always done for the same shape.
+    func testOneAmbiguousValueRefusesTheCallRatherThanNarrowingIt() {
+        guard case .misconfigured = duplicatedConfinement(
+            accounts: ["Default"], calendars: ["Default/Other", "Default/ZSECDUP"]
+        ) else { return XCTFail("expected the whole scope to be refused") }
+    }
+
+    /// A scope with no duplicate in it is unaffected — the ordinary case must
+    /// not have changed, and the admitted rows stay in EventKit's own order
+    /// whatever order the scope named them in.
+    func testAnUnambiguousScopeIsUnchangedAndStaysInRowOrder() {
+        guard case .confined(let indices) = confinement(
+            accounts: ["iCloud", "Exchange"], calendars: ["Exchange/Work", "iCloud/Work"]
+        ) else { return XCTFail("expected a confinement") }
+        XCTAssertEqual(indices, [0, 2])
+        XCTAssertEqual(paths(indices), ["iCloud/Work", "Exchange/Work"])
+    }
+
+    /// A duplicate this scope does not name costs it nothing: the refusal is
+    /// about the *value*, not about the host holding two of something.
+    func testADuplicateTheScopeDoesNotNameIsNotItsProblem() {
+        guard case .confined(let indices) = duplicatedConfinement(
+            accounts: ["Default"], calendars: ["Default/Other"]
+        ) else { return XCTFail("expected a confinement") }
+        XCTAssertEqual(indices, [1])
+    }
+
+    /// The advice a caller gets when it meets the same duplicate from the
+    /// argument side has to be something they can act on. It used to say
+    /// "narrow the scope to the one this client should reach", and there is no
+    /// such scope — the value is the same path both carry.
+    func testTheAmbiguityAdviceDoesNotRecommendAnImpossibleScope() {
+        guard case .ambiguous(let message) = ScopedRows.resolve(
+            "Default/ZSECDUP", rows: duplicated, allowed: nil, fields: fields
+        ) else { return XCTFail("expected an ambiguity") }
+        XCTAssertFalse(message.contains("narrow the scope to the one"), message)
+        XCTAssertTrue(message.contains("Rename one of them in the app that owns it"), message)
+        XCTAssertTrue(message.contains("`calendars` takes that same path"), message)
+    }
+
     // MARK: - The reminders half is the same rule with different words
 
     /// The two services share the seam and differ only in the nouns, so a

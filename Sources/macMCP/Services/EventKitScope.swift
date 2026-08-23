@@ -121,6 +121,35 @@ enum ScopedRows {
     /// `total_messages: 0` the mail scan work removed. Which of the two
     /// mistakes was made is named: a value naming something this Mac does not
     /// hold, or two values that hold nothing in common.
+    ///
+    /// **One scope value admits at most one resource, and a value that names
+    /// two admits NEITHER.** This walks the scope's values and counts their
+    /// carriers, rather than walking the rows and keeping every row a value
+    /// matches, and the difference is a real hole rather than a style: two
+    /// reminder lists both called `ZSECDUP` under `Default` gave
+    /// `reminder_lists: ["Default/ZSECDUP"]` the contents of **both**, every
+    /// row labelled `list_path: "Default/ZSECDUP"`, and the operator saw one
+    /// entry in the picker because `ScopePath.entries` dedupes by path. Two
+    /// `Work` calendars in one account -- an import, or a shared-calendar
+    /// subscription -- do the same, which is the very collapse the
+    /// `Source/Title` path work was introduced to fix one level up.
+    ///
+    /// `ScopePath.ambiguousValues` had reported this condition for the
+    /// picker since it was written, and its own doc-comment said the
+    /// enforcement read it. Nothing did. It is read here now, in the sense
+    /// that this is the enforcement half of that pair; `ContactsScope` has
+    /// answered the same way since it was written (`ContactScope.select` puts
+    /// a two-carrier value in `ambiguous` and contributes no group), and the
+    /// two services disagreeing about what one permission value means is
+    /// worse than either answer.
+    ///
+    /// The whole call is refused rather than the ambiguous value being
+    /// dropped from an otherwise usable scope, for the reason contacts
+    /// refuses: a profile that reads as granting three calendars and silently
+    /// grants two is a confinement an operator cannot review. It is
+    /// `.misconfigured` and not `.refused` -- nobody probed anything, two
+    /// resources were given one name -- so it stays out of the security
+    /// signal, exactly as decision 11 requires.
     static func allowed(
         rows: [ScopePath.Row],
         containers: ResourceScope.Access,
@@ -149,19 +178,61 @@ enum ScopedRows {
               case .allowed(let leafValues) = leaves else { return .unscoped }
 
         let wantContainers = Set(containerValues.map(ResourceScope.fold))
-        let wantPaths = Set(leafValues.map(ResourceScope.fold))
-        var indices: [Int] = []
-        for (index, row) in rows.enumerated() {
-            guard wantContainers.contains(ResourceScope.fold(row.container)) else { continue }
-            guard wantPaths.contains(ResourceScope.fold(row.path)) else { continue }
-            indices.append(index)
+        // The container half first, because a leaf value is only reachable
+        // through an account the scope also names -- the cross-product, which
+        // is the direction that narrows.
+        let inContainers = rows.indices.filter {
+            wantContainers.contains(ResourceScope.fold(rows[$0].container))
         }
+        var admitted: Set<Int> = []
+        var ambiguous: [String] = []
+        for value in leafValues {
+            let needle = ResourceScope.fold(value)
+            let carriers = inContainers.filter { ResourceScope.fold(rows[$0].path) == needle }
+            if carriers.count > 1 {
+                if !ambiguous.contains(value) { ambiguous.append(value) }
+                continue
+            }
+            // Zero carriers is not reported here: `misconfiguration` already
+            // names every value this Mac does not hold, and it says it in the
+            // operator's terms.
+            admitted.formUnion(carriers)
+        }
+        if !ambiguous.isEmpty {
+            return .misconfigured(ambiguousScope(ambiguous, fields: fields))
+        }
+        // Sorted so the admitted set is in EventKit's own order whatever
+        // order the scope named its values in: this list is what
+        // `calendars_list` reports and what every refusal prints as "it may
+        // reach", and neither should reshuffle when an operator edits a
+        // profile.
+        let indices = admitted.sorted()
         if indices.isEmpty {
             return .misconfigured(misconfiguration(
                 rows: rows, containerValues: containerValues,
                 leafValues: leafValues, fields: fields))
         }
         return .confined(indices)
+    }
+
+    /// What an operator is told when one of their values names two resources.
+    ///
+    /// It names the value rather than the two resources, because they are the
+    /// same string -- printing it twice would suggest a choice between them
+    /// that no value, and no tool argument, can express. The remedy is
+    /// therefore in the app that owns them and nowhere else, which is what
+    /// `ambiguityMessage` says for the same condition met from the other
+    /// side.
+    private static func ambiguousScope(_ values: [String], fields: Fields) -> String {
+        "the \(fields.leafNoun) scope this call carries is not usable: "
+        + values.map {
+            "`\(fields.leafField)` entry \"\($0)\" names more than one \(fields.leafNoun)"
+        }.joined(separator: "; ")
+        + ". Nothing was read or written. Two \(fields.leafNoun)s filed under one account with "
+        + "one name cannot be told apart by an Account/Name value, so reading one of them would "
+        + "be a guess and reading both would grant more than the value says. Rename one of them "
+        + "in the app that owns it, or remove it — there is no scope value and no "
+        + "`\(fields.argument)` that selects one of two."
     }
 
     /// Why a scope admitted nothing, in the operator's terms rather than the
@@ -297,10 +368,18 @@ enum ScopedRows {
                 + "full. A bare name is not an identity here, and acting on both is not something "
                 + "the answer could show you."
         }
+        // **The advice has to be something an operator can carry out.** This
+        // used to end "or narrow the scope to the one this client should
+        // reach", and there is no such scope: a `\(fields.leafField)` value is
+        // the same `Account/Name` path both of these carry, so it selects
+        // both or neither -- which is why `allowed` refuses such a value
+        // outright rather than admitting two resources under one name. The
+        // only place the two can be told apart is the app that owns them.
         return "\(fields.leafNoun) \"\(requested)\" cannot be resolved: \(paths.count) "
             + "\(fields.leafNoun)s on this Mac are all filed as \"\(paths[0])\", and nothing in a "
-            + "request can tell them apart. Rename one of them, or narrow the scope to the one "
-            + "this client should reach."
+            + "request can tell them apart. Rename one of them in the app that owns it, or remove "
+            + "it. Narrowing the scope cannot help: `\(fields.leafField)` takes that same path, so "
+            + "a scope naming it is refused for this reason too."
     }
 
     // MARK: - The argument that was not passed
