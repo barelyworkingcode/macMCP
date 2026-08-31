@@ -335,10 +335,12 @@ private let contactsScopeFields: [ScopeField] = [
             "contacts_list_groups", "contacts_create_group",
             "contacts_add_to_group", "contacts_remove_from_group"
         ],
-        dependsOn: ["contact_accounts"],
-        enumerate: { values in
-            ContactsService.enumerateGroups(accountFilter: values?["contact_accounts"]?.stringsValue)
-        }
+        // A Contacts group is its own resource selector.  Unlike a calendar
+        // or reminder list, it remains useful to enumerate even when the
+        // profile's card-account selection is different or has not been made
+        // yet; the group value carries its own account in `Account/Group`.
+        // Call-time enforcement still reconciles both scope fields.
+        enumerate: { _ in ContactsService.enumerateGroups(accountFilter: nil) }
     )
 ]
 

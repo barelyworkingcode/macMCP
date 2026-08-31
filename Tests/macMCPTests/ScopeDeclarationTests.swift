@@ -30,7 +30,7 @@ final class ScopeDeclarationTests: XCTestCase {
             ("contact_groups", [
                 "contacts_list_groups", "contacts_create_group",
                 "contacts_add_to_group", "contacts_remove_from_group"
-            ], "contact_accounts"),
+            ], nil),
             ("reminder_accounts", ["reminders_*"], nil),
             ("reminder_lists", ["reminders_*"], "reminder_accounts")
         ]
