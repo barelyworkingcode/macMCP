@@ -100,6 +100,33 @@ extension ResourceScope {
             return .unscoped
         case .refuse:
             return .refuse(MailScope.refusalNoValue(field: "mail_accounts", noun: "mail account"))
+        // "Every account, resolved fresh" is exactly what `resolveTargets`'s
+        // own `.unscoped` branch already does -- an absent `account` reads
+        // `accountNames(scopable: true, ...)` live, and an explicit one is
+        // passed straight through with no list to check it against. Reusing
+        // `.unscoped` here is not a shortcut: it is what "there is nothing to
+        // resolve" cashes out to, since building a concrete list first and
+        // then not restricting to it would be enumerating for no reason.
+        case .unrestricted:
+            return .unscoped
+        // Confirmed-empty accounts means zero accounts in scope. An omitted
+        // `account` resolves to that empty scope -- `.use([])`, not
+        // `.refuse` -- so a scan proceeds and reports `total_messages: 0` as
+        // the true, reviewed answer rather than erroring: `resolveTargets`'s
+        // `.use` branch already treats an empty allowed list as "no
+        // targets", and `scanFailure` already treats zero targets as "the
+        // scope really was empty" rather than a failure. An **explicit**
+        // `account` is a different question -- ADR-011's rule that an
+        // explicit argument outside the scope is an error, never a silent
+        // narrowing, does not stop applying just because the scope is
+        // empty rather than merely not containing this one value.
+        case .confirmedEmpty:
+            guard let requested else { return .use([]) }
+            return .refuse(
+                "account \"\(requested)\" is outside the mail accounts this client may reach. "
+                + "This client's mail_accounts is confirmed empty — it may reach no account at all. "
+                + "Omit `account` to read every account it may reach (none)."
+            )
         case .allowed(let allowed):
             guard let requested else { return .use(allowed) }
             guard MailScope.names(requested, oneOf: allowed) else {
@@ -133,6 +160,25 @@ extension ResourceScope {
             return .unscoped
         case .refuse:
             return .refuse(MailScope.refusalNoValue(field: "mail_mailboxes", noun: "mailbox"))
+        // Nothing to resolve: every mailbox in every account is reachable,
+        // which is exactly what `.unscoped` already means to every caller of
+        // this function (`allowedList` feeds it into the generated scan as
+        // `SCOPE_MAILBOXES = null`, "no restriction"; `scopedMailboxArgument`
+        // reads it as "scoped" for the same reason `.allowed` is).
+        case .unrestricted:
+            return .unscoped
+        // Zero mailboxes in scope. Absent or the tool's own "all" wildcard
+        // resolves to that empty scope; an explicit mailbox name is still an
+        // explicit argument outside the scope, and stays a refusal rather
+        // than a silent empty scan -- the same split `accountTargets` makes.
+        case .confirmedEmpty:
+            guard let requested, requested.lowercased() != wildcard.lowercased() else {
+                return .use([])
+            }
+            return .refuse(
+                "mailbox \"\(requested)\" is outside the mailboxes this client may reach. "
+                + "This client's mail_mailboxes is confirmed empty — it may reach no mailbox at all."
+            )
         case .allowed(let allowed):
             guard let requested, requested.lowercased() != wildcard.lowercased() else {
                 return .use(allowed)
@@ -197,7 +243,18 @@ extension ResourceScope {
         switch fileDirsAccess {
         case .unscoped:
             return .unscoped
-        case .refuse:
+        // `file_dirs` is `source: "project_path"`: relay derives it, an
+        // operator never picks it, and there is no picker to click "select
+        // all" or "confirm empty" in. `.unrestricted` and `.confirmedEmpty`
+        // both exist for a field an operator reviews; there is no operator
+        // here to have reviewed anything, so neither reads as a considered
+        // grant. Refused exactly as `.refuse` is, and by the same words --
+        // fsMCP's finding 8 is precisely "an empty list quietly became no
+        // restriction", and a project-path field is the one place that bug
+        // would be a real filesystem escape rather than a lost tool, so this
+        // stays maximally conservative rather than trying to be helpful
+        // about which of the three absent-ish spellings it saw.
+        case .unrestricted, .confirmedEmpty, .refuse:
             switch use {
             case .write:
                 return .refuse(

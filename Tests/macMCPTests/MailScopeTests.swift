@@ -88,14 +88,58 @@ final class MailScopeTests: XCTestCase {
 
     // MARK: - Scoped, but this field refuses
 
-    func testAPresentEmptyArrayIsARefusalDistinctFromAbsent() {
+    func testAPresentEmptyArrayIsConfirmedEmptyDistinctFromAbsent() {
         let scope = MailScope.parse(["mail_accounts": .array([])])
         XCTAssertTrue(scope.isScoped, "the key was present, so this call is scoped")
         // Present-but-empty is a distinct fact from absent...
         XCTAssertEqual(scope.mailAccounts, [])
         XCTAssertNotEqual(scope.mailAccounts, nil as [String]?)
-        // ...but decision 4 requires both to refuse identically.
-        XCTAssertEqual(scope.accountsAccess, .refuse)
+        // ...and, since the ADR-011 addendum ("A star and an empty array"),
+        // a distinct `Access` case too: `.confirmedEmpty` rather than
+        // `.refuse`. An absent key still refuses -- that invariant is
+        // `testAFieldAbsentFromAScopedMetaRefusesRatherThanFallingBackToUnrestricted`
+        // below and is unchanged.
+        XCTAssertEqual(scope.accountsAccess, .confirmedEmpty)
+    }
+
+    func testAWildcardArrayIsUnrestricted() {
+        let scope = MailScope.parse(["mail_accounts": .array([.string("*")])])
+        XCTAssertTrue(scope.isScoped)
+        XCTAssertEqual(scope.accountsAccess, .unrestricted)
+    }
+
+    func testConfirmedEmptyAccountsResolvesToAnEmptyUseRatherThanRefusing() {
+        // `.use([])`, not `.refuse`: this was reviewed, so a scan proceeds
+        // and reports zero accounts as the true answer.
+        let scope = MailScope.parse(["mail_accounts": .array([]), "mail_mailboxes": .array([.string("*")])])
+        guard case .use(let accounts) = scope.accountTargets(requested: nil) else {
+            return XCTFail("confirmed-empty mail_accounts should resolve, not refuse")
+        }
+        XCTAssertEqual(accounts, [])
+    }
+
+    func testAnExplicitAccountAgainstConfirmedEmptyScopeStillRefuses() {
+        // ADR-011's rule -- an explicit argument outside the scope is an
+        // error, never a silent narrowing -- does not stop applying just
+        // because the scope is empty rather than merely missing this value.
+        let scope = MailScope.parse(["mail_accounts": .array([]), "mail_mailboxes": .array([.string("*")])])
+        guard case .refuse = scope.accountTargets(requested: "Alice") else {
+            return XCTFail("an explicit account against an empty scope should refuse")
+        }
+    }
+
+    func testUnrestrictedAccountsBehavesAsUnscopedForTargeting() {
+        // Nothing to resolve: `accountTargets` reuses the `.unscoped`
+        // Decision, which is what makes an explicit account pass straight
+        // through and an absent one enumerate every account live -- exactly
+        // what "every account, resolved fresh" means.
+        let scope = MailScope.parse(["mail_accounts": .array([.string("*")]), "mail_mailboxes": .array([.string("*")])])
+        guard case .unscoped = scope.accountTargets(requested: nil) else {
+            return XCTFail("wildcard mail_accounts should resolve as unscoped -- nothing to filter")
+        }
+        guard case .unscoped = scope.accountTargets(requested: "Alice") else {
+            return XCTFail("wildcard mail_accounts should not check an explicit account against a list")
+        }
     }
 
     func testAFieldAbsentFromAScopedMetaRefusesRatherThanFallingBackToUnrestricted() {

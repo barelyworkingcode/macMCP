@@ -131,8 +131,26 @@ extension ResourceScope {
     /// granting.
     func contactAccountTargets(catalog: [ContactAccountRef]) -> Decision<[ContactAccountRef]> {
         guard isScoped else { return .unscoped }
-        guard case .allowed(let accounts) = contactAccountsAccess else {
+        let accounts: [String]
+        // Exhaustive rather than `guard case .allowed(...) else { .refuse(...) }`:
+        // that shape's `else` is the right answer for `.refuse` (which
+        // reaches here only as belt-and-braces; `presenceRefusal` already
+        // caught it) but the wrong one for `.unrestricted` and
+        // `.confirmedEmpty`, both live states now.
+        switch contactAccountsAccess {
+        case .unscoped, .refuse:
             return .refuse(ResourceScope.refusalNoValue(field: "contact_accounts", noun: "contact account"))
+        // Every account this Mac holds -- nothing to resolve, so the whole
+        // catalog is the answer with no per-value lookup.
+        case .unrestricted:
+            return .use(catalog)
+        // Zero accounts in scope. `.use([])`, not `.refuse`: this was
+        // reviewed, and every card tool should answer emptily rather than
+        // error -- `contacts_list` returns `[]`, not a violation.
+        case .confirmedEmpty:
+            return .use([])
+        case .allowed(let allowed):
+            accounts = allowed
         }
         let selection = ContactScope.select(containers: catalog, accounts: accounts)
         if !selection.ambiguous.isEmpty {
@@ -181,11 +199,35 @@ extension ResourceScope {
     /// on one of two is a coin toss the response cannot show.
     func contactGroupTargets(catalog: [ContactGroupRef]) -> Decision<[ContactGroupRef]> {
         guard isScoped else { return .unscoped }
-        guard case .allowed(let accounts) = contactAccountsAccess else {
+        // The account half, resolved first -- the cross-product's narrowing
+        // direction. `.unrestricted` is passed through as "every account
+        // this group catalog carries" rather than resolved against a
+        // separate account catalog: nobody needs to be read, since
+        // `ContactScope.select`'s own account filter (`ResourceScope.names`)
+        // is then trivially true for every row.
+        let accounts: [String]
+        switch contactAccountsAccess {
+        case .unscoped, .refuse:
             return .refuse(ResourceScope.refusalNoValue(field: "contact_accounts", noun: "contact account"))
+        case .unrestricted:
+            accounts = catalog.map(\.account)
+        case .confirmedEmpty:
+            return .use([])
+        case .allowed(let allowed):
+            accounts = allowed
         }
-        guard case .allowed(let groups) = contactGroupsAccess else {
+        let groups: [String]
+        switch contactGroupsAccess {
+        case .unscoped, .refuse:
             return .refuse(ResourceScope.refusalNoValue(field: "contact_groups", noun: "contact group"))
+        // Every group in an in-scope account -- no per-value lookup, so no
+        // per-value ambiguity to check either.
+        case .unrestricted:
+            return .use(catalog.filter { ResourceScope.names($0.account, oneOf: accounts) })
+        case .confirmedEmpty:
+            return .use([])
+        case .allowed(let allowed):
+            groups = allowed
         }
         let selection = ContactScope.select(catalog: catalog, accounts: accounts, groups: groups)
         if !selection.ambiguous.isEmpty {

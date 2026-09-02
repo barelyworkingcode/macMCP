@@ -186,9 +186,25 @@ final class ContactsScopeTests: XCTestCase {
         let noGroups = scope(accounts: ["iCloud"], groups: nil).contactGroupTargets(catalog: catalog)
         guard case .refuse(let g) = noGroups else { return XCTFail("\(noGroups)") }
         XCTAssertTrue(g.contains("`contact_groups`"), g)
+    }
 
+    /// Present-but-**empty** is `.confirmedEmpty`, not absent (ADR-011
+    /// addendum, "A star and an empty array") -- a reviewed "no groups here"
+    /// rather than a forgotten field, and it resolves to `.use([])` rather
+    /// than a refusal: `contacts_list_groups` should answer `[]`, not error,
+    /// for an account that genuinely has none.
+    func testAConfirmedEmptyGroupsFieldResolvesToAnEmptyUseNotARefusal() throws {
         let emptyGroups = scope(accounts: ["iCloud"], groups: []).contactGroupTargets(catalog: catalog)
-        guard case .refuse = emptyGroups else { return XCTFail("an empty list is not a grant: \(emptyGroups)") }
+        guard case .use(let groups) = emptyGroups else {
+            return XCTFail("a confirmed-empty contact_groups should resolve, not refuse: \(emptyGroups)")
+        }
+        XCTAssertEqual(groups, [])
+    }
+
+    func testWildcardGroupsAdmitsEveryGroupInScopeAccounts() throws {
+        let wildcard = scope(accounts: ["iCloud"], groups: ["*"]).contactGroupTargets(catalog: catalog)
+        guard case .use(let groups) = wildcard else { return XCTFail("\(wildcard)") }
+        XCTAssertEqual(Set(groups.map(\.path)), Set(catalog.filter { $0.account == "iCloud" }.map(\.path)))
     }
 
     /// ADR-011 decision 11, the distinction this branch had to get right: a
@@ -356,8 +372,18 @@ final class ContactsScopeTests: XCTestCase {
         guard case .refuse(let refusal) = missing else { return XCTFail("\(missing)") }
         XCTAssertTrue(refusal.contains("`contact_accounts`"), refusal)
 
+        // Present-but-empty is `.confirmedEmpty`, not absent -- a reviewed
+        // "no accounts here" rather than a forgotten field -- and resolves
+        // to `.use([])`: `contacts_list` should answer `[]`, not error.
         let empty = scope(accounts: [], groups: nil).contactAccountTargets(catalog: accounts)
-        guard case .refuse = empty else { return XCTFail("an empty list is not a grant: \(empty)") }
+        guard case .use(let noAccounts) = empty else {
+            return XCTFail("a confirmed-empty contact_accounts should resolve, not refuse: \(empty)")
+        }
+        XCTAssertEqual(noAccounts, [])
+
+        let wildcard = scope(accounts: ["*"], groups: nil).contactAccountTargets(catalog: accounts)
+        guard case .use(let everyAccount) = wildcard else { return XCTFail("\(wildcard)") }
+        XCTAssertEqual(Set(everyAccount.map(\.identifier)), Set(accounts.map(\.identifier)))
 
         let typo = scope(accounts: ["Nowhere"], groups: nil).contactAccountTargets(catalog: accounts)
         guard case .misconfigured(let message) = typo else {

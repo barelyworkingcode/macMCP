@@ -246,31 +246,102 @@ struct ResourceScope: Equatable {
     }
 
     /// The raw value of one declared field: `nil` for "the key was not present
-    /// (or did not parse)", `[]` for "present and empty". Both refuse; see
-    /// `access(_:)`.
+    /// (or did not parse)", `[]` for "present and empty". The two used to mean
+    /// the same thing everywhere (ADR-011 decision 4); they still do for
+    /// `access(_:)`'s purposes when the key is genuinely absent, but a
+    /// *present* empty array is now `.confirmedEmpty` rather than `.refuse` --
+    /// see `Access` and the ADR-011 addendum ("A star and an empty array").
     func values(of field: String) -> [String]? { fields[field] }
+
+    /// The literal, single-element value that means "every value this field
+    /// could name, resolved fresh against the host on every call this scope
+    /// governs -- never a stored snapshot."
+    ///
+    /// ADR-011 decision 3 originally rejected a stored wildcard outright, on
+    /// the grounds that "a grant must be an enumeration someone typed, not a
+    /// value that widens when the host's configuration changes". The addendum
+    /// (`relay/docs/decisions/011-resource-scope.md`, "A star and an empty
+    /// array") revisits that for the resource-scope fields specifically: a
+    /// single self-granting operator confining their own trusted client to
+    /// their own data does not have the audience the ADR was defending
+    /// against, and every consumer of `Access` is required to disclose an
+    /// `.unrestricted` field loudly (the same treatment `file_dirs` entry `/`
+    /// already gets) rather than let it hide inside an innocuous-looking
+    /// list. The widening is real and is the point, not an oversight.
+    ///
+    /// **Exactly** `["*"]`. `["*", "Bob"]` is not recognised here -- `"*"` in
+    /// that shape is a literal value like any other, which folds and matches
+    /// nothing real, so it fails closed rather than guessing what a mixed
+    /// entry was meant to mean. Relay's save-time validation refuses that
+    /// combination outright, so a well-behaved client never produces it; a
+    /// hand-written one gets an inert wildcard-shaped string rather than a
+    /// silent grant.
+    static let wildcard = "*"
 
     /// What one field allows, for a caller that already knows which field
     /// governs the tool it is about to run.
+    ///
+    /// **Every consumer must handle all five cases explicitly** -- an
+    /// exhaustive `switch`, never `if case .allowed = access(...) else { ... }`
+    /// or an equivalent `guard`. That shape used to be safe because the only
+    /// two states behind an `else` were `.unscoped` and `.refuse`, both of
+    /// which `presenceRefusal` had usually already turned into a refusal
+    /// before the `else` could be reached for the wrong reason. `.unrestricted`
+    /// and `.confirmedEmpty` are both live, both non-refusing states that fall
+    /// into that same `else`, and at least one of them is wrong for almost
+    /// every such site: `EventKitScope.ScopedRows.allowed`'s equivalent guard
+    /// mapped an unhandled case to `.unscoped` (fail *open* -- unrestricted for
+    /// every axis, not just the one that earned it), and
+    /// `MailService.draftDestinationRefusal`'s mapped one to "proceed with no
+    /// check" (silently admitting a confirmed-empty `mail_mailboxes` to
+    /// Drafts). Both were real, both are fixed by converting to exhaustive
+    /// switches. A future sixth case should make every one of those switches
+    /// fail to compile until it is looked at.
     enum Access: Equatable {
         /// No scope is in play for this call at all (`isScoped == false`).
         /// The tool must behave exactly as it does when built with `.none`.
         case unscoped
-        /// A scope is in play, but this field is absent or empty. ADR-011
-        /// decision 4: refuse every call this field governs. Never treat
-        /// this as "unrestricted" and never treat it as "everything" --
-        /// both are the fail-open mistake finding 8 named in fsMCP.
+        /// A scope is in play, but this field's key is **absent** from
+        /// `_meta`. ADR-011 decision 4: refuse every call this field governs.
+        /// Never treat this as "unrestricted" and never treat it as
+        /// "everything" -- both are the fail-open mistake finding 8 named in
+        /// fsMCP. This is the one state an operator reaches by doing
+        /// *nothing* -- forgetting the field, or a relay bug that fails to
+        /// inject it -- which is exactly why it must never look like a
+        /// reviewed decision.
         case refuse
         /// A scope is in play and this field lists what it allows. The list
-        /// is never empty here -- an empty list is `.refuse`, not
+        /// is never empty here -- an empty list is `.confirmedEmpty`, not
         /// `.allowed([])`, so a caller can match on this case and use the
-        /// array without an extra emptiness check.
+        /// array without an extra emptiness check. Never exactly `["*"]`
+        /// either -- see `.unrestricted`.
         case allowed([String])
+        /// A scope is in play and this field's value is exactly
+        /// `[ResourceScope.wildcard]`: every value this field could name,
+        /// resolved fresh per call. A consumer that would otherwise build a
+        /// concrete list to intersect against should instead skip the
+        /// filter entirely -- there is nothing to resolve, which is what
+        /// makes this case cheaper than `.allowed`, not more expensive. See
+        /// `ResourceScope.wildcard`.
+        case unrestricted
+        /// A scope is in play and this field's key is **present** with an
+        /// **explicit, empty** array -- distinct from `.refuse`'s *absent*
+        /// key. Produced only by an operator action that looked at the real
+        /// (possibly empty) live enumeration and confirmed there is nothing
+        /// to grant; never the default state of an untouched field, and
+        /// never reachable by omission. A consumer should resolve this to
+        /// "the confined set for this field is empty" -- an ordinary,
+        /// successful empty result for a read, an ordinary (non-violation)
+        /// "nothing in scope to act on" for a write -- without touching the
+        /// framework to find out, since the answer cannot change.
+        case confirmedEmpty
     }
 
     func access(_ field: String) -> Access {
         guard isScopedFlag else { return .unscoped }
-        guard let values = fields[field], !values.isEmpty else { return .refuse }
+        guard let values = fields[field] else { return .refuse }
+        if values == [ResourceScope.wildcard] { return .unrestricted }
+        guard !values.isEmpty else { return .confirmedEmpty }
         return .allowed(values)
     }
 

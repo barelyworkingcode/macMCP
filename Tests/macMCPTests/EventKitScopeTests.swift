@@ -82,16 +82,51 @@ final class EventKitScopeTests: XCTestCase {
 
     /// Decision 4: a mediated call carrying no value for a field is a refusal,
     /// never "everything" and never "nothing quietly".
-    func testAMediatedCallWithNoValueRefusesRatherThanWidening() {
+    func testAMediatedCallWithAnAbsentValueRefusesRatherThanWidening() {
         for missing in [confinement(accounts: nil, calendars: ["iCloud/Work"]),
                         confinement(accounts: ["iCloud"], calendars: nil),
-                        confinement(accounts: [], calendars: []),
                         confinement(accounts: nil, calendars: nil)] {
             guard case .refused(let message) = missing else {
                 return XCTFail("expected a refusal, got \(missing)")
             }
             XCTAssertTrue(message.contains("refusal rather than \"everything\""), message)
         }
+    }
+
+    /// Present-but-**empty** is no longer the same state as absent (ADR-011
+    /// addendum, "A star and an empty array"): it is `.confirmedEmpty`, a
+    /// reviewed "there is nothing here" rather than a forgotten field, and it
+    /// resolves to `.confined([])` -- success, zero calendars -- rather than
+    /// a refusal. `calendars_list` etc. should answer `[]`, not error.
+    func testAConfirmedEmptyValueIsAnEmptyConfinementNotARefusal() {
+        for emptied in [confinement(accounts: [], calendars: ["iCloud/Work"]),
+                        confinement(accounts: ["iCloud"], calendars: []),
+                        confinement(accounts: [], calendars: [])] {
+            guard case .confined(let indices) = emptied else {
+                return XCTFail("expected an empty confinement, got \(emptied)")
+            }
+            XCTAssertEqual(indices, [])
+        }
+    }
+
+    /// The wildcard resolves without enumerating -- every row the live
+    /// EventKit read already produced is admitted, with no per-value lookup
+    /// and therefore no per-value ambiguity to trip over.
+    func testAWildcardOnBothAxesAdmitsEveryRow() {
+        guard case .confined(let indices) = confinement(accounts: ["*"], calendars: ["*"]) else {
+            return XCTFail("expected every row to be confined")
+        }
+        XCTAssertEqual(Set(indices), Set(rows.indices))
+    }
+
+    /// A wildcard account with an explicit calendar list still narrows by
+    /// the calendar half -- the cross-product survives one axis being
+    /// unrestricted.
+    func testAWildcardAccountWithAnExplicitCalendarListStillNarrows() {
+        guard case .confined(let indices) = confinement(accounts: ["*"], calendars: ["iCloud/Work"]) else {
+            return XCTFail("expected a confinement")
+        }
+        XCTAssertEqual(paths(indices), ["iCloud/Work"])
     }
 
     /// Decision 11: a scope naming a calendar this Mac does not hold is an

@@ -69,17 +69,27 @@ final class CalendarRemindersScopeWiringTests: XCTestCase {
         }
     }
 
-    /// A field present but **empty** is the same refusal as absent (decision 4):
-    /// an operator who never set it and one who set it to `[]` have both
-    /// granted nothing.
-    func testAnEmptyScopeValueRefusesExactlyAsAnAbsentOneDoes() {
-        let reg = registry()
-        let empty: JSONObject = [
+    /// A field **absent** still refuses -- decision 4's untouched half. What
+    /// changed (ADR-011 addendum, "A star and an empty array") is that a
+    /// field present as an **explicit** empty array no longer reads the same
+    /// way: it is `.confirmedEmpty`, not absent, and `presenceRefusal` -- the
+    /// same pure function every handler calls before touching EventKit --
+    /// must not treat it as a violation. What that resolves *to*
+    /// (`.confined([])`, an empty but successful `calendars_list`) is
+    /// `EventKitScopeTests.testAConfirmedEmptyValueIsAnEmptyConfinementNotARefusal`,
+    /// which can assert it purely; this file cannot go further than the
+    /// presence check without a real EventKit store to read, per the class
+    /// doc above.
+    func testAPresentEmptyScopeValueIsNotAPresenceRefusalUnlikeAbsent() {
+        let absent: JSONObject = ["project_id": .string("p"), "calendars": .array([.string("iCloud/Work")])]
+        XCTAssertNotNil(ResourceScope.parse(absent).presenceRefusal(tool: "calendars_list"))
+
+        let confirmedEmpty: JSONObject = [
             "project_id": .string("p"),
             "calendar_accounts": .array([]),
             "calendars": .array([])
         ]
-        XCTAssertTrue(isScopeViolation(reg.call(name: "calendars_list", arguments: nil, meta: empty)))
+        XCTAssertNil(ResourceScope.parse(confirmedEmpty).presenceRefusal(tool: "calendars_list"))
     }
 
     /// Half a scope is not a scope: `calendars` set and `calendar_accounts`
