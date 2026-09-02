@@ -80,7 +80,15 @@ enum HostFileScope {
             // same-user local access equivalent to running `screencapture`.
             // Every existing caller is this one and must be unaffected.
             return .use((path as NSString).expandingTildeInPath)
-        case .refuse:
+        // `file_dirs` is `source: "project_path"`, never operator-picked, so
+        // neither `.unrestricted` nor `.confirmedEmpty` reads as a reviewed
+        // grant the way it would for an operator-set field -- there is no
+        // operator here to have reviewed anything. Both refuse exactly as
+        // `.refuse` does: fsMCP finding 8 ("an empty list quietly became no
+        // restriction") is the shape this must never grow, and a
+        // project-path field is where that bug would be a real filesystem
+        // escape rather than a lost tool.
+        case .unrestricted, .confirmedEmpty, .refuse:
             return .refuse(noFileDirs(use: use, what: what))
         case .allowed(let dirs):
             return verdict(ResourceScope.bound(path, within: dirs), path: path, dirs: dirs, use: use)
@@ -124,7 +132,7 @@ enum HostFileScope {
         switch scope.fileDirsAccess {
         case .unscoped:
             return .use(toolDefault)
-        case .refuse:
+        case .unrestricted, .confirmedEmpty, .refuse:
             return .refuse(noFileDirs(use: .write, what: what))
         case .allowed(let dirs):
             switch ResourceScope.bound(toolDefault, within: dirs) {

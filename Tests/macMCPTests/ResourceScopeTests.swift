@@ -11,15 +11,35 @@ import XCTest
 final class ResourceScopeTests: XCTestCase {
     // MARK: - The three states, on a field mail never heard of
 
-    func testTheThreeStatesHoldForANewServicesField() {
+    func testTheFiveStatesHoldForANewServicesField() {
         // 1. Nobody mediated: behave exactly as macmcp on a bare stdio pipe.
         XCTAssertEqual(ResourceScope.parse(nil).access("calendars"), .unscoped)
-        // 2. Mediated, field absent -> refuse. Not "unrestricted", not
+        // 2. Mediated, field **absent** -> refuse. Not "unrestricted", not
         //    "everything": ADR-011 decision 4, which is the whole reason this
-        //    type keeps `isScoped` separate from any field's value.
+        //    type keeps `isScoped` separate from any field's value. This is
+        //    the state reached by doing nothing -- forgetting the field, or a
+        //    relay bug that fails to inject it -- so it must never look like
+        //    a reviewed decision, unlike 2b and 2c below.
         XCTAssertEqual(ResourceScope.parse(["project_id": .string("p")]).access("calendars"), .refuse)
-        // 2b. Mediated, field present and empty -> the same refusal.
-        XCTAssertEqual(ResourceScope.parse(["calendars": .array([])]).access("calendars"), .refuse)
+        // 2b. Mediated, field **present** and empty -> `.confirmedEmpty`, not
+        //     `.refuse`. Reachable only by an explicit action (relay's
+        //     "confirm nothing to grant" button), never by omission -- see
+        //     the ADR-011 addendum ("A star and an empty array"). Distinct
+        //     from 2 specifically so a consumer can resolve it to "the
+        //     confined set is empty" (an ordinary, successful empty result)
+        //     rather than a refusal.
+        XCTAssertEqual(ResourceScope.parse(["calendars": .array([])]).access("calendars"), .confirmedEmpty)
+        // 2c. Mediated, field present as exactly `["*"]` -> `.unrestricted`.
+        //     Also reachable only by an explicit action, never by omission or
+        //     by a real value that happens to be the string "*" mixed with
+        //     anything else.
+        XCTAssertEqual(ResourceScope.parse(["calendars": .array([.string("*")])]).access("calendars"), .unrestricted)
+        XCTAssertEqual(
+            ResourceScope.parse(["calendars": .array([.string("*"), .string("iCloud/Work")])]).access("calendars"),
+            .allowed(["*", "iCloud/Work"]),
+            "\"*\" mixed with a real value is not the wildcard -- it is a literal value that folds and "
+            + "matches nothing real, so it fails closed rather than guessing what was meant"
+        )
         // 3. Mediated, with values.
         XCTAssertEqual(
             ResourceScope.parse(["calendars": .array([.string("iCloud/Work")])]).access("calendars"),

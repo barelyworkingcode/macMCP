@@ -878,6 +878,17 @@ enum MailService {
         case .unscoped: return nil
         case .refuse: return []
         case .allowed(let list): return list
+        // "*" carries the same "no restriction" meaning `.unscoped` does at
+        // this seam -- `SCOPE_MAILBOXES = null` -- and for the same reason:
+        // there is nothing to resolve, so nothing is resolved.
+        case .unrestricted: return nil
+        // Confirmed-empty carries the same "matches nothing" meaning
+        // `.refuse` does at this seam, and only at this seam: by the time a
+        // script is generated at all, `presenceRefusal` and `accountTargets`
+        // / `mailboxTargets` have already decided this call proceeds. What
+        // reaches Apple Events is `SCOPE_MAILBOXES = []`, which is exactly
+        // what an explicitly-nothing scope should scan.
+        case .confirmedEmpty: return []
         }
     }
 
@@ -896,8 +907,20 @@ enum MailService {
     /// intersects with the scope, so it needs no translation here.
     static func scopedMailboxArgument(_ requested: String?, default fallback: String, call: MailCall) -> String {
         if let requested { return requested }
-        if case .allowed = call.scope.mailboxesAccess { return "all" }
-        return fallback
+        switch call.scope.mailboxesAccess {
+        // A scope is in play and has an answer for "every mailbox it may
+        // reach" -- `.allowed` names them, `.unrestricted` and
+        // `.confirmedEmpty` both resolve to "the scope, whatever it is" via
+        // `mailboxTargets` (the scan wildcard is what asks for that; the
+        // actual restriction is still applied downstream). Only `.unscoped`
+        // and `.refuse` fall through to the tool's own default -- `.refuse`
+        // never reaches here in practice (the presence check already
+        // stopped the call), kept only so this switch stays exhaustive.
+        case .allowed, .unrestricted, .confirmedEmpty:
+            return "all"
+        case .unscoped, .refuse:
+            return fallback
+        }
     }
 
     /// The reconciliation rule applied to the two scope-relevant arguments the
@@ -5124,19 +5147,43 @@ var savedDraft = (function() {
     static func draftDestinationRefusal(call: MailCall) -> MCPCallResult? {
         // `.refuse` is `presenceRefusal`'s to answer and it has already run;
         // `.unscoped` is macmcp on a bare stdio pipe and must be untouched.
-        guard case .allowed(let allowed) = call.scope.mailboxesAccess else { return nil }
-        guard MailScope.names(draftDestination, oneOf: allowed) else {
+        // Written as an exhaustive switch rather than `guard case .allowed
+        // ... else { return nil }`: that shape's `else` used to catch only
+        // those two already-handled states, and silently caught
+        // `.confirmedEmpty` too the moment it was added -- a profile with
+        // zero mailboxes in scope could draft into Drafts anyway, which is
+        // exactly the hole this function exists to close.
+        switch call.scope.mailboxesAccess {
+        case .unscoped, .refuse:
+            return nil
+        // Every mailbox reachable, Drafts included -- nothing to check.
+        case .unrestricted:
+            return nil
+        // Zero mailboxes in scope, Drafts among the rest of them.
+        case .confirmedEmpty:
             return scopeViolationResult(
                 "a draft is saved in the sending account's \"\(draftDestination)\" mailbox, which "
-                + "is outside the mailboxes this client may reach. It may reach: "
-                + allowed.joined(separator: ", ") + ". Nothing was composed and nothing was "
-                + "written. `mail_create_draft` takes no mailbox argument -- the destination is "
-                + "always the account's own \(draftDestination) -- so this profile cannot create "
-                + "drafts at all until \(draftDestination) is one of the mailboxes it may reach. "
-                + "It is the same refusal mail_move gives for a move into \(draftDestination)."
+                + "is outside the mailboxes this client may reach. This client's mail_mailboxes is "
+                + "confirmed empty — it may reach no mailbox at all. Nothing was composed and "
+                + "nothing was written. `mail_create_draft` takes no mailbox argument -- the "
+                + "destination is always the account's own \(draftDestination) -- so this profile "
+                + "cannot create drafts at all until \(draftDestination) is one of the mailboxes it "
+                + "may reach."
             )
+        case .allowed(let allowed):
+            guard MailScope.names(draftDestination, oneOf: allowed) else {
+                return scopeViolationResult(
+                    "a draft is saved in the sending account's \"\(draftDestination)\" mailbox, which "
+                    + "is outside the mailboxes this client may reach. It may reach: "
+                    + allowed.joined(separator: ", ") + ". Nothing was composed and nothing was "
+                    + "written. `mail_create_draft` takes no mailbox argument -- the destination is "
+                    + "always the account's own \(draftDestination) -- so this profile cannot create "
+                    + "drafts at all until \(draftDestination) is one of the mailboxes it may reach. "
+                    + "It is the same refusal mail_move gives for a move into \(draftDestination)."
+                )
+            }
+            return nil
         }
-        return nil
     }
 
     private static func createDraft(_ ctx: MCPCallContext) -> MCPCallResult {

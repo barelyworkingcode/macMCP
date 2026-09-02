@@ -174,16 +174,59 @@ enum ScopedRows {
             return .refused(ResourceScope.refusalNoValue(
                 field: fields.leafField, noun: fields.leafNoun))
         }
-        guard case .allowed(let containerValues) = containers,
-              case .allowed(let leafValues) = leaves else { return .unscoped }
 
-        let wantContainers = Set(containerValues.map(ResourceScope.fold))
+        // Confirmed-empty on either axis makes the cross-product empty by
+        // construction, whatever the other axis says -- an operator who
+        // explicitly confirmed "nothing here" for one has already answered
+        // the whole question. `.confined([])`, not `.misconfigured`: this was
+        // reviewed, not omitted, and `calendars_list` etc. should answer `[]`
+        // rather than error.
+        //
+        // This used to be `guard case .allowed(let a) = containers, case
+        // .allowed(let b) = leaves else { return .unscoped }` -- a shape
+        // whose `else` was safe only because `.unscoped` and `.refuse` were
+        // the sole other states, and both were already peeled off above.
+        // `.unrestricted` and `.confirmedEmpty` are two more states that
+        // reach that same `else`, and `.unscoped` is the wrong answer for
+        // both (fail-open: unrestricted on *every* axis rather than the one
+        // that earned it). Written as two exhaustive switches instead, so a
+        // future case fails to compile here rather than falling through.
+        if case .confirmedEmpty = containers { return .confined([]) }
+        if case .confirmedEmpty = leaves { return .confined([]) }
+
+        let wantContainers: Set<String>?
+        switch containers {
+        case .unscoped, .refuse, .confirmedEmpty:
+            // Handled above; kept so the switch is exhaustive against a case
+            // added to `Access` later.
+            return .refused(ResourceScope.refusalNoValue(
+                field: fields.containerField, noun: fields.containerNoun))
+        case .unrestricted:
+            wantContainers = nil
+        case .allowed(let containerValues):
+            wantContainers = Set(containerValues.map(ResourceScope.fold))
+        }
         // The container half first, because a leaf value is only reachable
         // through an account the scope also names -- the cross-product, which
-        // is the direction that narrows.
+        // is the direction that narrows. `wantContainers == nil` is
+        // `.unrestricted`: nothing to resolve, so nothing filters.
         let inContainers = rows.indices.filter {
-            wantContainers.contains(ResourceScope.fold(rows[$0].container))
+            wantContainers == nil || wantContainers!.contains(ResourceScope.fold(rows[$0].container))
         }
+
+        let leafValues: [String]
+        switch leaves {
+        case .unscoped, .refuse, .confirmedEmpty:
+            return .refused(ResourceScope.refusalNoValue(field: fields.leafField, noun: fields.leafNoun))
+        // Every row already admitted by the container half is admitted,
+        // full stop -- no per-value lookup, so no per-value ambiguity to
+        // check either.
+        case .unrestricted:
+            return .confined(inContainers.sorted())
+        case .allowed(let values):
+            leafValues = values
+        }
+
         var admitted: Set<Int> = []
         var ambiguous: [String] = []
         for value in leafValues {
@@ -208,6 +251,16 @@ enum ScopedRows {
         // profile.
         let indices = admitted.sorted()
         if indices.isEmpty {
+            guard case .allowed(let containerValues) = containers else {
+                // `.unrestricted` containers with an `.allowed` (but
+                // non-matching) leaves value: every row is in `inContainers`
+                // by construction, so an empty `indices` here means no row's
+                // path matched any leaf value -- a leaf typo, not a missing
+                // container.
+                return .misconfigured(misconfiguration(
+                    rows: rows, containerValues: rows.map(\.container),
+                    leafValues: leafValues, fields: fields))
+            }
             return .misconfigured(misconfiguration(
                 rows: rows, containerValues: containerValues,
                 leafValues: leafValues, fields: fields))

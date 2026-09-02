@@ -189,6 +189,36 @@ final class MailScopeHardeningTests: XCTestCase {
             call: MailCall(budget: 30, scope: .none)))
     }
 
+    /// `mail_mailboxes: []` -- confirmed empty, not absent -- must still
+    /// refuse a draft. Written as an exhaustive `switch` for exactly this
+    /// reason: the prior `guard case .allowed(...) else { return nil }`
+    /// shape's `else` branch was safe only while `.unscoped` and `.refuse`
+    /// were the sole other states, and it started silently admitting this
+    /// one -- a profile with zero mailboxes in scope could draft into
+    /// Drafts anyway -- the moment `.confirmedEmpty` became reachable.
+    func testConfirmedEmptyMailboxesStillRefusesADraft() {
+        let call = MailCall(budget: 30, scope: MailScope.parse([
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([])
+        ]))
+        guard let refusal = MailService.draftDestinationRefusal(call: call) else {
+            return XCTFail("confirmed-empty mail_mailboxes must still refuse a draft")
+        }
+        XCTAssertEqual(refusal.meta?["scope_violation"], .bool(true))
+        let text = refusal.content.first?.text ?? ""
+        XCTAssertTrue(text.contains("confirmed empty"), text)
+    }
+
+    /// `mail_mailboxes: ["*"]` reaches every mailbox, Drafts included --
+    /// nothing to check, and drafting is not refused.
+    func testWildcardMailboxesDoesNotRefuseADraft() {
+        let call = MailCall(budget: 30, scope: MailScope.parse([
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([.string("*")])
+        ]))
+        XCTAssertNil(MailService.draftDestinationRefusal(call: call))
+    }
+
     /// **`mail_send` is deliberately not bound by this**, and the asymmetry is
     /// a decision rather than an oversight, so it is pinned. What that tool
     /// produces is a message on the wire; the Sent copy is bookkeeping about a
