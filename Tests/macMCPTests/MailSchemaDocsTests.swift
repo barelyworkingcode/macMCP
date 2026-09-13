@@ -90,6 +90,9 @@ final class MailSchemaDocsTests: XCTestCase {
             "mail_save_attachment": MailService.Budget.saveAttachment,
             "mail_get_source": MailService.Budget.getSource,
             "mail_move": MailService.Budget.move,
+            "mail_move_to_junk": MailService.Budget.moveToJunk,
+            "mail_mark_reviewed": MailService.Budget.markRead,
+            "mail_clear_scan_cache": MailService.Budget.scanCache,
             "mail_mark_read": MailService.Budget.markRead,
         ]
         XCTAssertEqual(Set(defaults.keys), Set(tools.keys), "a mail tool with no budget documented")

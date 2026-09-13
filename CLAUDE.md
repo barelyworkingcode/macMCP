@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 47 tools across 13 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 50 tools across 13 services. No external dependencies.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ Entry point initialises `NSApplication` (`.prohibited` -- no dock icon) for macO
 | Location | 3 | CoreLocation (RunLoop-pumped, 15s timeout) |
 | Maps | 3 | `CLGeocoder` + `NSWorkspace` URL schemes |
 | Capture | 2 | `/usr/sbin/screencapture`, `/usr/bin/afrecord` |
-| Mail | 11 | JXA via `/usr/bin/osascript -l JavaScript` |
+| Mail | 14 | JXA via `/usr/bin/osascript -l JavaScript` |
 | Messages | 4 | SQLite3 on `~/Library/Messages/chat.db` (read), AppleScript (send) |
 | Shortcuts | 2 | `/usr/bin/shortcuts` CLI |
 | Utilities | 1 | `/usr/bin/afplay` |

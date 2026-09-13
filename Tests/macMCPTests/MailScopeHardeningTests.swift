@@ -366,7 +366,8 @@ final class MailScopeHardeningTests: XCTestCase {
         let governed = [
             "mail_list_accounts", "mail_list_mailboxes", "mail_get_emails", "mail_get_email",
             "mail_search", "mail_send", "mail_create_draft", "mail_save_attachment",
-            "mail_get_source", "mail_move", "mail_mark_read"
+            "mail_get_source", "mail_move", "mail_move_to_junk", "mail_mark_reviewed",
+            "mail_clear_scan_cache", "mail_mark_read"
         ]
         for tool in governed {
             let missingMailboxes = MailService.presenceRefusal(tool: tool, call: onlyAccounts)

@@ -219,8 +219,17 @@ enum MailService {
         /// is up to 12 attempts over the destination's id column: ~10s on a
         /// 12,000-message INBOX.
         static let move: TimeInterval = 120
+        /// A find plus a resolve-and-verify against one fixed destination
+        /// (no target_mailbox/target_account resolution ambiguity to search
+        /// through), so this is cheaper than a general move: ~90% of `move`.
+        static let moveToJunk: TimeInterval = 100
         /// One find and one property write: ~1s.
         static let markRead: TimeInterval = 60
+        /// Deletes rows from macMCP's own local SQLite cache and sends no
+        /// Apple Event at all. Documented anyway, per `timeoutProp`'s own
+        /// rationale for uniformity: every mail_* tool takes this argument,
+        /// so a caller does not have to know in advance which ones need it.
+        static let scanCache: TimeInterval = 30
     }
 
     /// The `timeout_seconds` argument, worded with this tool's own default.
@@ -1340,6 +1349,12 @@ enum MailService {
         /// the **path**: a leaf name does not identify a mailbox, and an
         /// account can hold two called `Archive`.
         scopeMailboxes: [String]? = nil,
+        /// Fetches the RFC Message-ID column too, and carries it on every row
+        /// as `rfc_message_id`. `false` by default and for every existing
+        /// caller: it is one more Apple Event per mailbox, and only
+        /// `unreviewed_only` (`MailScanCache`) needs the identity a row can be
+        /// recorded against.
+        includeMessageID: Bool = false,
         /// Overridable only so a test can drive the exhausted-budget path, which
         /// is otherwise unreachable without a mailbox that changes for twenty
         /// seconds. A negative value expires it before the first row.
@@ -1446,6 +1461,10 @@ enum MailService {
                         hay += ' ' + (tos[i] || []).join(' ') + ' ' + (ccs[i] || []).join(' ')
                              + ' ' + (tns[i] || []).join(' ') + ' ' + (cns[i] || []).join(' ');
         """
+        let midFetch = !includeMessageID ? "" : "mid = mb.messages.messageId();"
+        let midField = !includeMessageID ? "" : "rfc_message_id: mid ? bareId(mid[i]) : null,"
+        let midReverifyRead = !includeMessageID ? "" : "rmid = m.messageId();"
+        let midReverifyWrite = !includeMessageID ? "" : "row.rfc_message_id = rmid == null ? null : bareId(rmid);"
 
         return """
         \(queryLine)
@@ -1493,6 +1512,7 @@ enum MailService {
             var m = err.message == null ? ('' + err) : ('' + err.message);
             return m.length === 0 ? 'it could not be read' : m;
         }
+        function bareId(v) { return v == null ? null : ('' + v).replace(/^</, '').replace(/>$/, ''); }
 
         // Re-reads the rows that are actually being returned, one message at a
         // time, and hands back the ones it can stand behind.
@@ -1541,10 +1561,11 @@ enum MailService {
                 var here = false;
                 try { here = m.exists() === true; } catch (e1) { here = false; }
                 if (!here) { letGo(claimed, row); continue; }
-                var subj, sndr, when, rdst;
+                var subj, sndr, when, rdst, rmid;
                 try {
                     subj = m.subject(); sndr = m.sender();
                     when = m.dateReceived(); rdst = m.readStatus();
+                    \(midReverifyRead)
                 } catch (e2) { letGo(claimed, row); continue; }
                 if (!mbSamePlace(mbWhere(m), acctName, path)) { letGo(claimed, row); continue; }
                 row.subject = subj == null ? '' : '' + subj;
@@ -1552,6 +1573,7 @@ enum MailService {
                 row.date_received = when ? '' + when : '';
                 row.t = when ? when.getTime() : 0;
                 row.read = rdst ? true : false;
+                \(midReverifyWrite)
                 // The query was applied to a column that has just been shown
                 // not to line up, so it is applied again to the message's own
                 // subject and sender. Recipients are not re-read: four more
@@ -1578,7 +1600,7 @@ enum MailService {
             }
             try {
                 var mb = entries[e].mbox;
-                var su = null, se = null, dt = null, rd = null;
+                var su = null, se = null, dt = null, rd = null, mid = null;
                 var tos = null, ccs = null, tns = null, cns = null;
                 var ids = mb.messages.id();
                 if (ids.length > 0) {
@@ -1586,8 +1608,9 @@ enum MailService {
                     se = mb.messages.sender();
                     dt = mb.messages.dateReceived();
                     rd = mb.messages.readStatus();
+        \(midFetch)
         \(recipientFetch)
-                    var stable = sameLength(ids, [su, se, dt, rd, tos, ccs, tns, cns])
+                    var stable = sameLength(ids, [su, se, dt, rd, mid, tos, ccs, tns, cns])
                         && unchanged(ids, mb.messages.id());
 
                     // Counts, not pairings. `ids` arrived in a single Apple
@@ -1624,6 +1647,7 @@ enum MailService {
                             sender: se[i] == null ? '' : '' + se[i],
                             date_received: dt[i] ? '' + dt[i] : '',
                             read: rd[i] ? true : false,
+                            \(midField)
                             t: dt[i] ? dt[i].getTime() : 0,
                             matchedOnRecipients: onRecipients
                         });
@@ -1890,7 +1914,8 @@ enum MailService {
         searchRecipients: Bool,
         limit: Int,
         timeout: TimeInterval,
-        call: MailCall
+        call: MailCall,
+        includeMessageID: Bool = false
     ) -> ScanOutcome {
         var outcome = ScanOutcome()
         outcome.filtered = query != nil
@@ -1914,7 +1939,8 @@ enum MailService {
                 query: query,
                 searchRecipients: searchRecipients,
                 limit: limit,
-                scopeMailboxes: allowedList(call.scope.mailboxesAccess)
+                scopeMailboxes: allowedList(call.scope.mailboxesAccess),
+                includeMessageID: includeMessageID
             ))
             """
             let (output, error) = runJXA(script, timeout: timeout, scopable: true, call: call)
@@ -2978,10 +3004,21 @@ enum MailService {
         return (mailboxEnumerationEntries(fromRows: rows, accountFilter: accountFilter), nil)
     }
 
+    /// How much wider than `limit` an `unreviewed_only` scan asks the Mail
+    /// side for, to leave room for rows the cache is about to filter back
+    /// out. Mirrors the same widen-then-filter shape `mail_search`'s body
+    /// sweep already uses for the same reason: a scan reads whole columns
+    /// regardless of how many rows are kept, so widening costs no extra Apple
+    /// Events, only more rows carried through the filter in Swift.
+    private static func unreviewedScanWindow(_ limit: Int) -> Int {
+        min(max(limit * 4, 100), 2000)
+    }
+
     private static func getEmails(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         let limit = max(args?["limit"]?.intValue ?? 10, 0)
         let account = args?["account"]?.stringValue
+        let unreviewedOnly = args?["unreviewed_only"]?.boolValue ?? false
         let call = MailCall.forArguments(args, default: Budget.getEmails, meta: ctx.meta)
         let mailbox = scopedMailboxArgument(args?["mailbox"]?.stringValue, default: "INBOX", call: call)
         if let refusal = scopeRefusal(for: ctx, call: call) { return refusal }
@@ -2989,20 +3026,51 @@ enum MailService {
         let (targets, targetError) = resolveTargets(account: account, call: call)
         if let targetError { return targetError }
 
+        let scanLimit = unreviewedOnly ? unreviewedScanWindow(limit) : limit
         let outcome = scanAllAccounts(
             targets: targets,
             mailbox: mailbox,
             query: nil,
             searchRecipients: false,
-            limit: limit,
+            limit: scanLimit,
             timeout: defaultTimeout,
-            call: call
+            call: call,
+            includeMessageID: unreviewedOnly
         )
 
         if let failure = scanFailure(outcome, targets: targets, mailbox: mailbox, scope: call.scope) { return failure }
 
+        var rows = outcome.rows
+        var shortfall = false
+        if unreviewedOnly {
+            let projectID = projectID(from: ctx.meta)
+            // Rows without a message the cache can identify are kept rather
+            // than dropped -- a message this cannot check the review state
+            // of must not silently disappear from what the caller sees.
+            var byAccount: [String: [String]] = [:]
+            for row in rows {
+                guard let acct = row["account"] as? String,
+                      let rfcId = row["rfc_message_id"] as? String, !rfcId.isEmpty else { continue }
+                byAccount[acct, default: []].append(rfcId)
+            }
+            var unreviewedIDs: Set<String> = []
+            for (acct, ids) in byAccount {
+                unreviewedIDs.formUnion(MailScanCache.unreviewed(projectID: projectID, account: acct, messageIDs: ids))
+            }
+            let before = rows.count
+            rows = rows.filter { row in
+                guard let rfcId = row["rfc_message_id"] as? String, !rfcId.isEmpty else { return true }
+                return unreviewedIDs.contains(rfcId)
+            }
+            // A window that was itself capped by scope (scan_complete false,
+            // or the window came back full) and still fell short of `limit`
+            // once filtered may not have exhausted the mailbox -- there could
+            // be more unreviewed rows past what this window read.
+            shortfall = rows.count < limit && (before >= scanLimit || !outcome.scanComplete)
+        }
+
         var payload: [String: Any] = [
-            "messages": presentRows(outcome.rows, limit: limit),
+            "messages": presentRows(rows, limit: limit),
             "total_messages": outcome.total,
             "truncated": outcome.total > limit,
             "messages_scanned": outcome.messagesScanned,
@@ -3014,6 +3082,12 @@ enum MailService {
         if !outcome.excluded.isEmpty { payload["excluded_mailboxes"] = outcome.excluded }
         addChangedMailboxes(&payload, outcome)
         if let note = outcome.coverageNote { payload["note"] = note }
+        if unreviewedOnly {
+            payload["unreviewed_scan_window"] = scanLimit
+            if shortfall {
+                payload["unreviewed_shortfall"] = true
+            }
+        }
         return jsonResult(payload)
     }
 
@@ -6542,6 +6616,266 @@ var savedDraft = (function() {
     """
     }
 
+    /// The `mail_move_to_junk` script, minus the `var mail = Application('Mail');`
+    /// line.
+    ///
+    /// Deliberately narrower than `moveScriptJXA`: the destination is never a
+    /// caller-supplied string, it is the found account's own root-level `Junk`
+    /// mailbox (`mailboxInAccountJXA` with no `scopeMailboxes`, so it resolves
+    /// regardless of `mail_mailboxes`). That is intentional, not an
+    /// oversight -- see the tool's registration comment for why requiring
+    /// Junk in `mail_mailboxes` would hand a read-only triage profile write
+    /// access it never asked for. There is no `target_account`: a junk move
+    /// never crosses an account boundary, so the destination account is
+    /// always `foundAccount` and the numeric-id fast path is always the one
+    /// to try.
+    static func moveToJunkScriptJXA(
+        messageId: String,
+        sourceMailbox: String,
+        account: String?,
+        scopeAccounts: [String]? = nil,
+        scopeMailboxes: [String]? = nil
+    ) -> String {
+        let escapedId = escapeJSString(messageId)
+        let destination = mailboxInAccountJXA(mailbox: "Junk", accountExpr: "foundAccount", varName: "destMbox")
+        return """
+    \(findMessageJXA(
+        account: account,
+        mailbox: sourceMailbox,
+        messageId: messageId,
+        scopeAccounts: scopeAccounts,
+        scopeMailboxes: scopeMailboxes
+    ))
+    var moveResult;
+    if (!found) {
+        moveResult = {error: \(fmNotFoundJXA(messageId: messageId))};
+    } else {
+        var rfcId = null;
+        try { rfcId = found.messageId(); } catch (e) {}
+        rfcId = (rfcId == null) ? null : ('' + rfcId).replace(/^</, '').replace(/>$/, '');
+        var numericId = null;
+        try { numericId = '' + found.id(); } catch (e) {}
+    \(destination)
+        // Same identity guard `moveScriptJXA` applies: the pick is checked
+        // against what the bound mailbox itself reports before anything is
+        // assigned, closing the window in which the Junk mailbox could be
+        // renamed or removed mid-resolution.
+        var destName = mbPathOf(destMbox);
+        if (destName === null || destName.toLowerCase() !== ('' + destMboxPath).toLowerCase()) {
+            moveResult = {error: 'the Junk mailbox resolved to "' + destMboxPath + '" but reads back as "'
+                + destName + '"; nothing was moved'};
+        } else {
+        var origin = fmLocate(found);
+        if (origin === null) {
+            moveResult = {error: 'message \(escapedId) is no longer in Mail; nothing was moved'};
+        } else {
+        var sourceAccount = origin.account;
+        var sourceMailboxName = origin.mailbox;
+        found.mailbox = destMbox;
+        function moveVerifyById() {
+            var again = destMbox.messages.byId(parseInt(numericId, 10));
+            var here = false;
+            try { here = again.exists() === true; } catch (e) { return false; }
+            if (!here) return false;
+            var at = fmLocate(again);
+            return at !== null
+                && ('' + at.mailbox).toLowerCase() === ('' + destName).toLowerCase()
+                && ('' + at.account).toLowerCase() === ('' + destMboxAccount).toLowerCase();
+        }
+        function moveVerifyByColumn() {
+            if (rfcId !== null) {
+                var rids = destMbox.messages.messageId();
+                for (var i = 0; i < rids.length; i++) {
+                    if (rids[i] == null) continue;
+                    if (('' + rids[i]).replace(/^</, '').replace(/>$/, '') === rfcId) return true;
+                }
+                return false;
+            }
+            if (numericId !== null) {
+                var nids = destMbox.messages.id();
+                for (var j = 0; j < nids.length; j++) {
+                    if (('' + nids[j]) === numericId) return true;
+                }
+            }
+            return false;
+        }
+        var COLUMN_AT = \(moveVerifyColumnAttempts);
+        var verified = false;
+        for (var attempt = 0; attempt < \(moveVerifyAttempts) && !verified; attempt++) {
+            try {
+                if (numericId !== null && moveVerifyById()) { verified = true; break; }
+                if (COLUMN_AT.indexOf(attempt) >= 0 && moveVerifyByColumn()) { verified = true; break; }
+            } catch (e) {}
+            delay(\(moveVerifyInterval));
+        }
+        moveResult = {
+            status: 'moved',
+            account: destMboxAccount,
+            mailbox: destName,
+            message_id: numericId,
+            rfc_message_id: rfcId,
+            moved_from: {account: sourceAccount, mailbox: sourceMailboxName},
+            cross_account: false,
+            verified: verified
+        };
+        }
+        }
+    }
+    JSON.stringify(moveResult);
+    """
+    }
+
+    /// `_meta.project_id`, or `""` for an unmediated call. Used only to key
+    /// `MailScanCache` -- nothing security-relevant reads this, unlike
+    /// `MailScope`, so an absent or malformed value degrades to "one shared
+    /// bucket" rather than a refusal.
+    static func projectID(from meta: JSONObject?) -> String {
+        meta?["project_id"]?.stringValue ?? ""
+    }
+
+    private static func moveToJunk(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
+            return errorResult("message_id is required")
+        }
+        let sourceMailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let call = MailCall.forArguments(args, default: Budget.moveToJunk, meta: ctx.meta)
+        // Only the source end is checked against `mail_mailboxes` -- the
+        // destination is always the account's own Junk, which this tool
+        // deliberately does not gate on that field (see moveToJunkScriptJXA).
+        if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: ["mailbox"]) { return refusal }
+        invalidateSourceCache()
+
+        let script = """
+        var mail = Application('Mail');
+        \(moveToJunkScriptJXA(
+            messageId: messageId,
+            sourceMailbox: sourceMailbox,
+            account: args?["account"]?.stringValue,
+            scopeAccounts: allowedList(call.scope.accountsAccess),
+            scopeMailboxes: allowedList(call.scope.mailboxesAccess)
+        ))
+        """
+        let (output, error) = runJXA(script, retries: mutatingRetries, call: call)
+        if let error { return mailError(error) }
+        var payload: [String: Any]
+        switch scriptPayload(output) {
+        case .failure(let message): return mailError(message)
+        case .text(let text): return textResult(text.isEmpty ? "moved to junk" : text)
+        case .object(let object): payload = object
+        }
+        if let scriptError = payload["error"] as? String { return mailError(scriptError) }
+        // Record the verdict for the batch-triage pattern (mail_get_emails'
+        // unreviewed_only) regardless of whether the caller ever calls
+        // mail_mark_reviewed for the messages it judged clean -- a message
+        // moved to Junk has definitely been looked at.
+        if let account = payload["account"] as? String, let rfcId = payload["rfc_message_id"] as? String {
+            MailScanCache.record(
+                projectID: projectID(from: ctx.meta),
+                account: account,
+                messageID: rfcId,
+                verdict: "junk",
+                note: nil
+            )
+        }
+        return jsonResult(payload)
+    }
+
+    /// `mail_mark_reviewed`'s Mail-side half: find the message and read back
+    /// exactly the identifiers `MailScanCache` keys on. No property on the
+    /// message is written -- the verdict is recorded in macMCP's own cache
+    /// only, which is what lets this be `readOnlyHint: true`.
+    private static func markReviewed(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
+        guard let messageId = args?["message_id"]?.coercedStringValue else {
+            return errorResult("message_id is required")
+        }
+        guard let verdict = args?["verdict"]?.stringValue, !verdict.isEmpty else {
+            return errorResult("verdict is required")
+        }
+        let note = args?["note"]?.stringValue
+        let mailbox = args?["mailbox"]?.stringValue ?? "INBOX"
+        let call = MailCall.forArguments(args, default: Budget.markRead, meta: ctx.meta)
+        if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: ["mailbox"]) { return refusal }
+
+        let script = """
+        var mail = Application('Mail');
+        \(findMessageJXA(
+            account: args?["account"]?.stringValue,
+            mailbox: mailbox,
+            messageId: messageId,
+            scopeAccounts: allowedList(call.scope.accountsAccess),
+            scopeMailboxes: allowedList(call.scope.mailboxesAccess)
+        ))
+        if (!found) {
+            JSON.stringify({error: \(fmNotFoundJXA(messageId: messageId))});
+        } else {
+            var rfcId = null;
+            try { rfcId = found.messageId(); } catch (e) {}
+            rfcId = (rfcId == null) ? null : ('' + rfcId).replace(/^</, '').replace(/>$/, '');
+            var numericId = null;
+            try { numericId = '' + found.id(); } catch (e) {}
+            JSON.stringify({
+                message_id: numericId,
+                rfc_message_id: rfcId,
+                account: foundAccount,
+                mailbox: foundMailbox
+            });
+        }
+        """
+        let (output, error) = runJXA(script, call: call)
+        if let error { return mailError(error) }
+        var payload: [String: Any]
+        switch scriptPayload(output) {
+        case .failure(let message): return mailError(message)
+        case .text: return errorResult("message \(messageId) was not found")
+        case .object(let object): payload = object
+        }
+        if let scriptError = payload["error"] as? String { return mailError(scriptError) }
+        guard let account = payload["account"] as? String, let rfcId = payload["rfc_message_id"] as? String else {
+            return errorResult("message \(messageId) has no RFC Message-ID, so no verdict can be recorded against it")
+        }
+        MailScanCache.record(
+            projectID: projectID(from: ctx.meta),
+            account: account,
+            messageID: rfcId,
+            verdict: verdict,
+            note: note
+        )
+        payload["status"] = "recorded"
+        payload["verdict"] = verdict
+        return jsonResult(payload)
+    }
+
+    /// Touches only macMCP's own cache file, never Mail -- so this needs no
+    /// `MailCall`/`runJXA` at all. Still runs `presenceRefusal` under a
+    /// mediated call: a profile with no mail scope at all was never granted
+    /// any mail_* tool, and one that has a mail scope pays nothing extra to
+    /// also cover this one.
+    private static func clearScanCache(_ ctx: MCPCallContext) -> MCPCallResult {
+        let args = ctx.arguments
+        let call = MailCall.forArguments(args, default: Budget.markRead, meta: ctx.meta)
+        if let refusal = presenceRefusal(tool: ctx.toolName, call: call) { return refusal }
+
+        let account = args?["account"]?.stringValue
+        let messageId = args?["message_id"]?.coercedStringValue
+        let olderThanDays = args?["older_than_days"]?.intValue
+        let all = args?["all"]?.boolValue ?? false
+        guard account != nil || messageId != nil || olderThanDays != nil || all else {
+            return errorResult(
+                "at least one of message_id, account or older_than_days is required, "
+                    + "or pass all: true to clear every entry this client has recorded"
+            )
+        }
+        let removed = MailScanCache.clear(
+            projectID: projectID(from: ctx.meta),
+            account: account,
+            messageID: messageId,
+            olderThanDays: olderThanDays
+        )
+        return jsonResult(["removed": removed])
+    }
+
     private static func moveEmail(_ ctx: MCPCallContext) -> MCPCallResult {
         let args = ctx.arguments
         guard let messageId = args?["message_id"]?.coercedStringValue else {
@@ -6783,12 +7117,13 @@ var savedDraft = (function() {
         registry.register(
             MCPTool(
                 name: "mail_get_emails",
-                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty",
+                description: "Get the most recent emails (newest first) from matching mailboxes across accounts. Returns messages plus scan-coverage metadata (total_messages, truncated, messages_scanned, scanned/skipped mailboxes). Mailbox names in the result are paths (Projects/Archive), which is what identifies a mailbox and what you can pass straight back as mailbox/target_mailbox. excluded_mailboxes names what a mailbox 'all' scan deliberately left out — the accounts' own Trash, Junk, Drafts and Outbox — which are out of scope rather than unread, so they do not make scan_complete false. scan_complete says whether every mailbox in scope was actually read; when it is false the counts are a floor rather than a total and note says what was missed. The columns a scan reads arrive in separate Apple Events, so a mailbox that changes between them would pair one message's id with another message's subject. When that is detected, every row being returned from that mailbox is re-read message by message by its own id and carries that message's own subject, sender and date; the mailbox is named in changed_mailboxes with rows_reverified and rows_dropped, and note says what that means for the count. skipped_mailboxes names mailboxes that could not be read at all, each with the reason. If nothing in scope could be read the call is an error rather than an empty result, because total_messages 0 would be a claim that the mailbox is empty. unreviewed_only drives a batch-triage pattern: pass it to walk a large mailbox in pages of `limit` without re-fetching messages mail_move_to_junk or mail_mark_reviewed already recorded a verdict for (macMCP's own local cache, scoped to this client — see those tools). Each returned row then also carries rfc_message_id, the handle both of those take. Internally this scans a wider window than `limit` to leave room for ones already reviewed, so it costs more Apple Events than a plain call; unreviewed_scan_window reports how wide, and unreviewed_shortfall (present only when it fires) says the window came back short of `limit` unreviewed rows and does not by itself mean the mailbox is exhausted — call again once the returned rows have been triaged and progress will keep being made until it does",
                 inputSchema: schema(
                     properties: [
                         "account": stringProp("Account name, or \"On My Mac\" for Mail's local mailboxes (scans every account and the local boxes if omitted)"),
                         "mailbox": stringProp("Mailbox to read, matched case-insensitively in every account and local On-My-Mac boxes (default: INBOX). A mailbox is named by its path: Mail reports leaf names for a flattened tree, so one account can hold two mailboxes called Archive and two called Trash. A bare name means the mailbox at the root of the account (Archive is the account's own Archive, never Projects/Archive); a nested one is named by its full path with / separators (Projects/Archive). A leaf name that only one mailbox in the account carries also works. mail_list_mailboxes lists these paths, and every mailbox reported back to you is one. Pass 'all' to scan every mailbox except the account's own junk/trash/drafts/outbox — those are named in excluded_mailboxes, and a nested folder that happens to be called Trash is ordinary mail and is scanned"),
                         "limit": intProp("Maximum number of emails to return (default: 10)"),
+                        "unreviewed_only": boolProp("Skip messages already recorded in the local scan cache by mail_move_to_junk or mail_mark_reviewed for this client (default: false). Use to batch through a large mailbox a fixed number at a time without re-reading what was already triaged"),
                         "timeout_seconds": timeoutProp(Budget.getEmails)
                     ]
                 ),
@@ -6952,6 +7287,69 @@ var savedDraft = (function() {
             ),
             category: cat,
             handler: moveEmail
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_move_to_junk",
+                description: "Move an email to its own account's Junk mailbox. This is a narrower capability than mail_move on purpose: it takes no target_mailbox and cannot move a message anywhere else, cannot cross an account boundary, and does NOT require Junk to be in a client's mail_mailboxes scope (that field is read+write, and requiring the destination in it would hand a read-only triage profile write access to every other mailbox the field also names). A profile can therefore be granted \"may read INBOX, may triage-move suspicious mail to Junk\" without ever being able to move mail anywhere else, draft, or send -- the intended shape for an agent evaluating untrusted mail, where the mail body itself may contain injected instructions. Refuses, naming the account, if it has no mailbox named Junk at all -- it never falls back to Trash, since recoverability from Junk is the reason this tool exists rather than mail_move. On success this is recorded in the local scan cache (verdict: junk) so a later mail_get_emails call with unreviewed_only can skip it; see mail_mark_reviewed for recording the other verdict",
+                inputSchema: schema(
+                    properties: [
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
+                        "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
+                        "timeout_seconds": timeoutProp(Budget.moveToJunk, mutating: true)
+                    ],
+                    required: ["message_id"]
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
+            ),
+            category: cat,
+            handler: moveToJunk
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_mark_reviewed",
+                description: "Record a triage verdict for a message in macMCP's own local scan cache, without touching Mail.app at all -- no flag, colour or property on the message changes. This is the read-only half of the batch-triage pattern: mail_move_to_junk already records \"junk\" for a message it moves, so call this for the messages you looked at and decided were NOT junk, so a later mail_get_emails with unreviewed_only does not hand them back to you again. The cache is keyed on the account and the message's RFC Message-ID (never the numeric id, which does not survive a move) and is scoped to the calling client -- a different client's triage progress is never visible here and this call never affects what mail_move_to_junk or any other tool does. See mail_clear_scan_cache to remove entries",
+                inputSchema: schema(
+                    properties: [
+                        "message_id": stringOrIntProp("Message ID from mail_get_emails or mail_search results"),
+                        "verdict": stringProp("Free-form label for what was decided, e.g. \"not_junk\". Stored and returned verbatim; mail_get_emails' unreviewed_only only cares whether a verdict was recorded at all, not which one"),
+                        "note": stringProp("Optional free-form note, e.g. why -- stored alongside the verdict"),
+                        "mailbox": stringProp("Mailbox to check first (default: INBOX); automatically falls back to searching all mailboxes. Matches a full path (Projects/Archive) or a leaf name"),
+                        "account": stringProp("Account name to search for the message (optional, speeds up lookup)"),
+                        "timeout_seconds": timeoutProp(Budget.markRead)
+                    ],
+                    required: ["message_id", "verdict"]
+                ),
+                // true: nothing in Mail.app changes, only macMCP's own local
+                // cache file. A profile confined to read access can call this
+                // freely -- it is bookkeeping about calls that profile already
+                // made, not a new capability over Mail.
+                annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
+            ),
+            category: cat,
+            handler: markReviewed
+        )
+
+        registry.register(
+            MCPTool(
+                name: "mail_clear_scan_cache",
+                description: "Delete entries from macMCP's local scan cache (see mail_mark_reviewed and mail_move_to_junk). Only ever affects the calling client's own cache entries. At least one of message_id, account or older_than_days is required, or pass all: true to clear every entry this client has recorded -- an empty call with none of these is refused rather than silently clearing everything. Returns the number of entries removed",
+                inputSchema: schema(
+                    properties: [
+                        "message_id": stringOrIntProp("Clear the cache entry for one message's RFC Message-ID (as returned by mail_move_to_junk, mail_mark_reviewed, mail_get_emails or mail_search)"),
+                        "account": stringProp("Clear every entry for this account"),
+                        "older_than_days": intProp("Clear every entry recorded more than this many days ago"),
+                        "all": boolProp("Clear every entry this client has recorded. Required to be explicitly true when no other filter is given"),
+                        "timeout_seconds": timeoutProp(Budget.scanCache)
+                    ]
+                ),
+                annotations: MCPAnnotations(readOnlyHint: false, openWorldHint: false)
+            ),
+            category: cat,
+            handler: clearScanCache
         )
 
         registry.register(

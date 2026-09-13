@@ -68,6 +68,12 @@ final class ToolAnnotationTests: XCTestCase {
         "mail_save_attachment": (false, false),
         "mail_get_source": (false, false),
         "mail_move": (false, false),
+        "mail_move_to_junk": (false, false),
+        // Touches only macMCP's own local cache file, never Mail -- a
+        // profile confined to read access can call this freely, and
+        // clearing it reaches nothing beyond this Mac either.
+        "mail_mark_reviewed": (true, false),
+        "mail_clear_scan_cache": (false, false),
         "mail_mark_read": (false, false),
 
         // Maps -- geocoding and Maps.app reach Apple; the directions tool is
@@ -129,7 +135,7 @@ final class ToolAnnotationTests: XCTestCase {
 
     func testTheToolSurfaceIsExactlyTheTable() {
         let registered = Set(Self.fullRegistry().allTools().map(\.name))
-        XCTAssertEqual(registered.count, 47, "the tool count changed")
+        XCTAssertEqual(registered.count, 50, "the tool count changed")
         XCTAssertEqual(
             registered.subtracting(Self.expected.keys).sorted(), [],
             "registered but unclassified: decide what these reach before shipping them"
@@ -239,7 +245,7 @@ final class ToolAnnotationWireTests: StdioServerTestCase {
 
     func testEveryToolOnTheWireCarriesBothHintsAsBooleans() throws {
         let tools = try listedTools()
-        XCTAssertEqual(tools.count, 47)
+        XCTAssertEqual(tools.count, 50)
         for tool in tools {
             let name = try XCTUnwrap(tool["name"] as? String)
             let annotations = try XCTUnwrap(
