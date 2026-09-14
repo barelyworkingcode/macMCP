@@ -83,10 +83,13 @@ final class ToolAnnotationTests: XCTestCase {
         "maps_get_directions": (true, false),
 
         // Messages -- reads are SQLite on chat.db; sending is delivery.
+        // save_attachment copies a file already on this disk to another file
+        // on this disk, reaching nothing beyond it.
         "messages_list_chats": (true, false),
         "messages_get_chat": (true, false),
         "messages_search": (true, false),
         "messages_send": (false, true),
+        "messages_save_attachment": (false, false),
 
         // System
         "permissions_check": (true, false),
@@ -135,7 +138,7 @@ final class ToolAnnotationTests: XCTestCase {
 
     func testTheToolSurfaceIsExactlyTheTable() {
         let registered = Set(Self.fullRegistry().allTools().map(\.name))
-        XCTAssertEqual(registered.count, 50, "the tool count changed")
+        XCTAssertEqual(registered.count, 51, "the tool count changed")
         XCTAssertEqual(
             registered.subtracting(Self.expected.keys).sorted(), [],
             "registered but unclassified: decide what these reach before shipping them"
@@ -245,7 +248,7 @@ final class ToolAnnotationWireTests: StdioServerTestCase {
 
     func testEveryToolOnTheWireCarriesBothHintsAsBooleans() throws {
         let tools = try listedTools()
-        XCTAssertEqual(tools.count, 50)
+        XCTAssertEqual(tools.count, 51)
         for tool in tools {
             let name = try XCTUnwrap(tool["name"] as? String)
             let annotations = try XCTUnwrap(

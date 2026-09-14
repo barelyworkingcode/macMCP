@@ -53,7 +53,7 @@ enum PermissionsService {
         registry.register(
             MCPTool(
                 name: "permissions_check",
-                description: "Report current macOS permission status for the TCC-protected services macMCP uses (Location, Calendars, Contacts, Reminders, and Automation of Mail, which every mail_* tool needs). Read-only; does not trigger system prompts. Use Relay > Settings > MCP > Reset Permissions to grant or re-grant.",
+                description: "Report current macOS permission status for the TCC-protected services macMCP uses (Location, Calendars, Contacts, Reminders, and Automation of Mail and of Messages, which mail_* and messages_send need). Does not cover Full Disk Access, which messages_list_chats/messages_get_chat/messages_search need to read chat.db -- macOS has no API to query that grant's status, only to be refused by it. Read-only; does not trigger system prompts. Use Relay > Settings > MCP > Reset Permissions to grant or re-grant.",
                 inputSchema: emptySchema(),
                 annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
@@ -271,6 +271,13 @@ enum PermissionsService {
             PermResult(
                 service: "automation (Mail)",
                 status: statusName(ae: automationStatus(bundleID: "com.apple.mail"))
+            ),
+            // messages_send is the same shape as mail_send: an Apple Event to
+            // Messages.app, which still carries the bundle ID it had as an
+            // iOS app (`com.apple.MobileSMS`) rather than one naming Messages.
+            PermResult(
+                service: "automation (Messages)",
+                status: statusName(ae: automationStatus(bundleID: "com.apple.MobileSMS"))
             ),
         ]
     }

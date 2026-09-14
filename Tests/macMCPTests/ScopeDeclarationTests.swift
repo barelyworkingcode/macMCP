@@ -121,19 +121,23 @@ final class ScopeDeclarationTests: XCTestCase {
         XCTAssertEqual(mailboxes["depends_on"]?.stringsValue, ["mail_accounts"])
 
         // `file_dirs` is deliberately NOT a mail field, which is why its
-        // `applies_to` grew past mail: `capture_screenshot`, `capture_audio`
-        // and `utilities_play_sound` each open a file on this host and none of
-        // them can function without a directory, which is the rule that puts a
-        // tool in this list. `mail_send`, `mail_create_draft` and
-        // `mail_get_source` stay out of it for the opposite reason -- each
+        // `applies_to` grew past mail: `capture_screenshot`, `capture_audio`,
+        // `utilities_play_sound` and `messages_save_attachment` each open a
+        // file on this host and none of them can function without a
+        // directory, which is the rule that puts a tool in this list.
+        // `mail_send`, `mail_create_draft`, `mail_get_source` and
+        // `messages_send` stay out of it for the opposite reason -- each
         // works fine without one, and the parameter is what refuses.
         let dirs = try fragment("file_dirs")
         XCTAssertEqual(dirs["source"]?.stringValue, "project_path")
         XCTAssertEqual(
             dirs["applies_to"]?.stringsValue,
-            ["mail_save_attachment", "capture_screenshot", "capture_audio", "utilities_play_sound"]
+            [
+                "mail_save_attachment", "capture_screenshot", "capture_audio", "utilities_play_sound",
+                "messages_save_attachment"
+            ]
         )
-        for excluded in ["mail_send", "mail_create_draft", "mail_get_source"] {
+        for excluded in ["mail_send", "mail_create_draft", "mail_get_source", "messages_send"] {
             XCTAssertFalse(
                 restrictFieldsGoverning(tool: excluded).contains("file_dirs"),
                 "\(excluded) has an optional parameter needing a directory, not a tool-level need"

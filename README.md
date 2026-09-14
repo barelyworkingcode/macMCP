@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 50 tools across 13 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio. 51 tools across 13 services. No external dependencies.
 
 ## Tools
 
@@ -74,9 +74,10 @@ Standalone Swift MCP server exposing macOS-native tools via stdio. 50 tools acro
 | Tool | Description |
 |------|-------------|
 | `messages_list_chats` | List recent conversations |
-| `messages_get_chat` | Get messages from a chat |
-| `messages_search` | Search messages by text and/or contact |
-| `messages_send` | Send an iMessage |
+| `messages_get_chat` | Get messages from a chat, including image attachments |
+| `messages_search` | Search messages by text and/or contact, including image attachments |
+| `messages_send` | Send an iMessage (text, reliable; an image, verified NOT reliable on this VM -- see CLAUDE.md), confirmed against chat.db rather than just that the request didn't error |
+| `messages_save_attachment` | Save an image attachment to disk |
 
 ### Shortcuts
 | Tool | Description |
@@ -120,7 +121,7 @@ Grant these in System Settings > Privacy & Security as needed:
 - **Calendar** -- Calendars access
 - **Reminders** -- Reminders access
 - **Location** -- Location Services (on first use, macOS will prompt to allow; click **Allow**)
-- **Messages** -- Full Disk Access (reads `chat.db` directly)
+- **Messages** -- Full Disk Access (reads `chat.db` directly, for `messages_list_chats`/`messages_get_chat`/`messages_search`) and Automation permission for Messages.app (`messages_send`, which drives it via AppleScript)
 - **Mail** -- Automation permission for Mail.app (uses JXA)
 
 ## Build & Install

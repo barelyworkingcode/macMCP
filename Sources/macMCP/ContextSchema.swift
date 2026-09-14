@@ -203,21 +203,34 @@ private let mailScopeFields: [ScopeField] = [
         noun: "directory",
         description: "Directories on this host this client may write files into and read files "
             + "from — attachments it sends, attachments and message sources it saves, screenshots "
-            + "and recordings it captures, and audio files it plays",
+            + "and recordings it captures, audio files it plays, and image attachments it sends or "
+            + "saves from Messages",
         source: .projectPath,
         appliesTo: [
-            "mail_save_attachment", "capture_screenshot", "capture_audio", "utilities_play_sound"
+            "mail_save_attachment", "capture_screenshot", "capture_audio", "utilities_play_sound",
+            "messages_save_attachment"
         ]
     )
 ]
+
+// `messages_send`'s `image_path` is confined the same way `mail_send`'s
+// `attachments` is: an optional parameter the tool works fine without, so it
+// stays out of `file_dirs`'s `applies_to` (denying the whole tool over one
+// unset optional argument would gut a write profile that never sends an
+// image) and is checked at the parameter instead, via `HostFileScope.resolve`.
+// `messages_save_attachment`'s `destination` is the opposite shape --
+// required, with no fallback -- which is why it is named above.
 
 // MARK: - Calendar, Contacts, Reminders
 //
 // The three services ADR-011 deferred ("Calendars, contacts and iMessage.
 // Same mechanism, no new decisions"), declared on the mechanism the mail work
-// generalised. `messages_*` is still absent and still deliberately so: it has
-// no resource axis short of per-chat, so a profile that needs it is confined
-// by `allowed_tools` and the access mode alone.
+// generalised. `messages_*` still has no *chat/contact* axis, and still
+// deliberately so: there is no resource axis short of per-chat, so a profile
+// that needs to restrict which conversations a client reaches is confined by
+// `allowed_tools` and the access mode alone. `file_dirs` above is a different
+// axis (which directories on this host, not which chats) and governs one
+// Messages tool for the same reason it governs `mail_save_attachment`.
 //
 // Each service is two fields -- the account and the thing inside it -- with
 // the second `depends_on` the first, which is the `mail_accounts` /
