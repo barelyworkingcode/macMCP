@@ -1,6 +1,6 @@
 # macMCP
 
-Standalone Swift MCP server exposing macOS-native tools via stdio. 51 tools across 13 services. No external dependencies.
+Standalone Swift MCP server exposing macOS-native tools via stdio, grouped by service under `Sources/macMCP/Services/`. No external dependencies.
 
 ## Architecture
 
@@ -368,6 +368,9 @@ swift build              # debug
 Requires Swift 5.9+, macOS 13+. System frameworks only: EventKit, Contacts, CoreLocation, Foundation, SQLite3, AppKit. The binary embeds an `Info.plist` via `-sectcreate` for macOS permission prompts (Location Services).
 
 ## Tests
+
+**Real mail sends:** only to the operator's own address, one `to` recipient, no cc/bcc. Read the
+recipient back from the message before sending where the tooling allows, and delete test drafts after.
 
 ```bash
 swift test
