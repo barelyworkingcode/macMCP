@@ -224,12 +224,12 @@ enum RemindersService {
         registry.register(
             MCPTool(
                 name: "reminders_create",
-                description: "Create a new reminder.",
+                description: "Create a reminder in one list and return a one-line text confirmation with no identifier. priority is clamped to 0-9.",
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Reminder title"),
                         "list_name": stringProp("Reminder list to create in, named as Account/List exactly as reminders_list reports its `list_path` — for example 'iCloud/Groceries'. A bare list name works only when a single list carries it. Omitted, the reminder goes to this Mac's default list; a client whose access profile is scoped gets that default only when it is inside the scope, and is otherwise asked to name one rather than having the reminder filed somewhere it was never granted."),
-                        "due_date": stringProp("Due date in ISO 8601 format (e.g. 2026-03-15T09:00:00Z)"),
+                        "due_date": stringProp("Due date and time, ISO 8601 with a UTC offset or Z, e.g. 2026-03-15T09:00:00Z or 2026-03-15T09:00:00-07:00. A bare date or a time without an offset is refused."),
                         "notes": stringProp("Notes for the reminder"),
                         "priority": intProp("Priority: 0 = none, 1-4 = high, 5 = medium, 6-9 = low")
                     ],
@@ -325,7 +325,7 @@ enum RemindersService {
         registry.register(
             MCPTool(
                 name: "reminders_complete",
-                description: "Mark a reminder as complete. Matches by title (case-insensitive), and only an incomplete one.",
+                description: "Mark one incomplete reminder complete, found by its whole title (case-insensitive) across every list this client may reach, and return a one-line confirmation. When several incomplete reminders share the title, the first one EventKit returns is completed; no list or identifier argument chooses between them. Completed reminders are never matched.",
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Title of the reminder to complete")

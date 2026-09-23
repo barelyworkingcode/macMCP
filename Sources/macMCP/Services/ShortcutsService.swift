@@ -102,7 +102,7 @@ enum ShortcutsService {
         registry.register(
             MCPTool(
                 name: "shortcuts_run",
-                description: "Run a macOS shortcut by name",
+                description: "Run an installed macOS shortcut by its exact name, as shortcuts_list prints it, and return the text it outputs, or a note that it produced none. A shortcut is user-authored automation and can have any side effect, including network requests and sending messages. The call blocks until the shortcut finishes, with no timeout; a shortcut that asks for input or confirmation waits for a person at the Mac. `input` is handed to the shortcut as a text file.",
                 inputSchema: schema(
                     properties: [
                         "name": stringProp("Name of the shortcut to run"),

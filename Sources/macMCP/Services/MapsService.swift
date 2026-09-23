@@ -16,7 +16,7 @@ enum MapsService {
         registry.register(
             MCPTool(
                 name: "maps_search",
-                description: "Search for places or addresses using geocoding. Returns matching results with name, coordinates, and address components.",
+                description: "Geocode an address or a well-known place name with Apple's geocoder and return a JSON array of candidates with latitude, longitude, and whichever of name, street, street_number, city, state, country and postal_code are known. It is not a business or category search: a query such as \"coffee near me\" finds nothing useful. Same backend as location_geocode, with street-level address fields.",
                 inputSchema: schema(
                     properties: ["query": stringProp("Place name or address to search for")],
                     required: ["query"]
@@ -57,7 +57,7 @@ enum MapsService {
         registry.register(
             MCPTool(
                 name: "maps_get_directions",
-                description: "Construct an Apple Maps directions URL for the given origin and destination",
+                description: "Build an Apple Maps directions URL from an origin, a destination and a travel mode, and return JSON {url, destination, origin?, mode?}. Nothing is looked up or opened: no route, distance or travel time is computed, and the places are not validated. With `from` omitted, Maps uses the device's current location when the URL is opened.",
                 inputSchema: schema(
                     properties: [
                         "from": stringProp("Origin address or place name (uses current location if omitted)"),
