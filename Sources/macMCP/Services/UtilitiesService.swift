@@ -58,7 +58,7 @@ enum UtilitiesService {
         registry.register(
             MCPTool(
                 name: "utilities_play_sound",
-                description: "Play an audio file",
+                description: "Play a local audio file through this Mac's speakers and return a one-line confirmation when playback ends; the call blocks for the file's full length. Takes a file path only; a URL is not fetched.",
                 inputSchema: schema(
                     properties: [
                         "path": stringProp("Absolute POSIX path of the audio file to play. Confined to the file_dirs of the calling client's resource scope; a client whose scope carries no file_dirs may not play a file off this host at all, and a path outside those directories is refused")

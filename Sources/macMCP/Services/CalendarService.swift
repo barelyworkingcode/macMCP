@@ -396,7 +396,7 @@ enum CalendarService {
         registry.register(
             MCPTool(
                 name: "calendars_list",
-                description: "List all calendars available on this Mac",
+                description: "List the event calendars this client may read, as a JSON array of {title, path, type, source}. `path` is Account/Calendar and is the value to pass as calendar_name to calendars_list_events and calendars_create_event; `title` alone is not unique, since two accounts can each hold a calendar with the same title. Under a scoped access profile only the calendars inside the scope are listed. Reminder lists are not included; reminders_list reports those.",
                 inputSchema: emptySchema(),
                 annotations: MCPAnnotations(readOnlyHint: true, openWorldHint: false)
             ),
@@ -407,7 +407,7 @@ enum CalendarService {
         registry.register(
             MCPTool(
                 name: "calendars_list_events",
-                description: "List calendar events within a date range",
+                description: "List the events that overlap a date range, as a JSON array of {title, start_date, end_date, calendar, calendar_path, location?, notes?}, with times rendered in this Mac's local UTC offset. A recurring event appears once per occurrence in the range. There is no result cap or pagination, so keep the range as narrow as the question needs. Attendees, URLs and event identifiers are not returned.",
                 inputSchema: schema(
                     properties: [
                         "start_date": stringProp("Start date — ISO 8601: '2026-06-12' (local midnight), '2026-06-12T09:00:00' (local time), or '2026-06-12T09:00:00-07:00'"),
@@ -425,7 +425,7 @@ enum CalendarService {
         registry.register(
             MCPTool(
                 name: "calendars_create_event",
-                description: "Create a new calendar event",
+                description: "Create a timed event on one calendar and return a one-line text confirmation. It takes no attendees, so no invitation is sent. It cannot create an all-day or a recurring event: a bare-date start and end become a timed event from 00:00 to 23:59:59 local time. The confirmation carries no event identifier, and no tool edits or deletes the event afterwards.",
                 inputSchema: schema(
                     properties: [
                         "title": stringProp("Event title"),

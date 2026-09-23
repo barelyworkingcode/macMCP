@@ -20,7 +20,7 @@ enum WebService {
         registry.register(
             MCPTool(
                 name: "web_fetch",
-                description: "Fetch the contents of an http/https URL and return the response body as text",
+                description: "Send an HTTP GET to an http/https URL, following redirects, and return a status line \"HTTP <status> — <content-type> — <n> bytes\" followed by the raw response body as text. HTML is returned as markup, not converted to readable text. A body over 1,000,000 bytes is cut and marked truncated. A 4xx or 5xx response comes back the same way rather than as an error, so read the status line.",
                 inputSchema: schema(
                     properties: [
                         "url": stringProp("The http or https URL to fetch"),

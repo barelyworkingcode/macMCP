@@ -34,6 +34,7 @@ enum ContactsService {
         registry.register(MCPTool(
             name: "contacts_list",
             description: "Search or list contacts. Returns id, name, phones, emails, and addresses. "
+                + "There is no limit or paging: omitting query returns the whole address book. "
                 + "When this client's access profile carries a contacts resource scope, this lists the "
                 + "cards in the contact accounts that scope names and nothing else — including cards "
                 + "that belong to no group.",
@@ -45,7 +46,8 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_get",
-            description: "Get full details for a single contact.",
+            description: "Get one contact by id. Returns the same fields contacts_list returns (id, first and last "
+                + "name, organization, job title, phones, emails, postal addresses); contact notes are never read.",
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
             ], required: ["id"]),
@@ -80,7 +82,9 @@ enum ContactsService {
 
         registry.register(MCPTool(
             name: "contacts_update",
-            description: "Update an existing contact. Only provided fields are changed.",
+            description: "Update an existing contact. Only provided fields are changed. phone and email each "
+                + "REPLACE every existing phone number or email address on the card with the single value "
+                + "given; they do not add one. Postal addresses cannot be changed here.",
             inputSchema: schema(properties: [
                 "id": stringProp("Contact id from contacts_list results"),
                 "first_name": stringProp("First name"),

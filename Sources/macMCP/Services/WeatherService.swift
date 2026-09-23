@@ -16,7 +16,7 @@ enum WeatherService {
         registry.register(
             MCPTool(
                 name: "weather_current",
-                description: "Get current weather conditions for a location",
+                description: "Get current conditions for a latitude/longitude from Open-Meteo and return its raw JSON: temperature_2m and apparent_temperature in °C, relative_humidity_2m in %, wind_speed_10m in km/h, wind_direction_10m in degrees, and weather_code as a WMO weather code number.",
                 inputSchema: schema(
                     properties: [
                         "latitude": .object(["type": .string("number"), "description": .string("Latitude")]),
@@ -33,7 +33,7 @@ enum WeatherService {
         registry.register(
             MCPTool(
                 name: "weather_forecast",
-                description: "Get daily weather forecast for a location",
+                description: "Get a daily forecast for a latitude/longitude from Open-Meteo and return its raw JSON: per day temperature_2m_max and temperature_2m_min in °C, precipitation_sum in mm, and weather_code as a WMO weather code number. days is clamped to 1-16.",
                 inputSchema: schema(
                     properties: [
                         "latitude": .object(["type": .string("number"), "description": .string("Latitude")]),
@@ -51,7 +51,7 @@ enum WeatherService {
         registry.register(
             MCPTool(
                 name: "weather_hourly",
-                description: "Get hourly weather forecast for a location",
+                description: "Get an hourly forecast for a latitude/longitude from Open-Meteo and return its raw JSON: temperature_2m in °C, precipitation_probability in %, and weather_code as a WMO weather code number.",
                 inputSchema: schema(
                     properties: [
                         "latitude": .object(["type": .string("number"), "description": .string("Latitude")]),

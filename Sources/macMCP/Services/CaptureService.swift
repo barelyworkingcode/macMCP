@@ -124,7 +124,7 @@ enum CaptureService {
         registry.register(
             MCPTool(
                 name: "capture_screenshot",
-                description: "Take a screenshot of the screen, a window, or a selection",
+                description: "Save a screenshot of this Mac's screen to a PNG file and return the saved path as text; the image itself is not returned. type \"fullscreen\" (the default) captures at once. \"window\" and \"selection\" are interactive: the call waits until a person at the Mac clicks a window or drags a region, so use them only when someone is there to do it. Needs the Screen Recording permission.",
                 inputSchema: schema(
                     properties: [
                         "path": stringProp("Absolute POSIX path to save the screenshot to (defaults to ~/Desktop/screenshot-{timestamp}.png). Confined to the file_dirs of the calling client's resource scope. A client whose scope carries no file_dirs cannot take a screenshot at all — every call writes a file — and one whose scope names directories writes only inside them: the default location is used when it is one of them, the single allowed directory is used when there is only one, and otherwise you are asked to pass a path naming one of them"),
@@ -140,7 +140,7 @@ enum CaptureService {
         registry.register(
             MCPTool(
                 name: "capture_audio",
-                description: "Record audio from the default input device",
+                description: "Record from this Mac's default input device to a mono AAC .m4a file and return the saved path as text. The call blocks for the whole recording, `duration` seconds (default 10). No audio data or transcript is returned. Needs the Microphone permission.",
                 inputSchema: schema(
                     properties: [
                         "path": stringProp("Absolute POSIX path to save the recording to (defaults to ~/Desktop/recording-{timestamp}.m4a). Confined to the file_dirs of the calling client's resource scope, exactly as capture_screenshot's path is: no file_dirs means no recording, and otherwise the file is written inside one of the named directories"),

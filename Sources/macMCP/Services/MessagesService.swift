@@ -882,7 +882,7 @@ enum MessagesService {
         registry.register(
             MCPTool(
                 name: "messages_list_chats",
-                description: "List recent chat conversations from Messages.app",
+                description: "List chat conversations from Messages.app, most recently active first; chats with no messages are left out. Requires Full Disk Access (reads Messages' local chat.db). Each entry has rowid, chat_identifier, service_name and, when the chat has one, display_name. chat_identifier is the chat_id messages_get_chat takes. Does not return message text",
                 inputSchema: schema(
                     properties: [
                         "limit": intProp("Maximum number of chats to return (default 20)")
@@ -947,13 +947,11 @@ enum MessagesService {
                 description: "Send an iMessage to a phone number or email address, and confirm from chat.db "
                     + "that it actually sent (Messages' own scripting interface has no delivery status). "
                     + "Returns an error if it definitely failed, or an 'unconfirmed' result if that isn't "
-                    + "known within timeout_seconds. text alone is reliable. image_path is NOT: on the "
-                    + "environment this was verified on, every real image send failed after being handed to "
-                    + "Messages (chat.db error 25, 22 or 1 on different attempts, never success), despite the "
-                    + "text half of the same call sending correctly every time — treat image_path as "
-                    + "unverified/likely broken until confirmed working on the machine you're running on, and "
-                    + "always check messages_get_chat afterward rather than trusting an 'unconfirmed' or even "
-                    + "a non-error result at face value for an image.",
+                    + "known within timeout_seconds. Text sends are reliable. Image sends via image_path are "
+                    + "not known to work: in testing every image send failed inside Messages after hand-off "
+                    + "(chat.db error 25, 22 or 1) while the text in the same call was delivered, and a "
+                    + "non-error or 'unconfirmed' result does not show the image arrived. messages_get_chat "
+                    + "shows the image's send_error if it failed.",
                 inputSchema: schema(
                     properties: [
                         "to": stringProp("Recipient phone number or email address"),
@@ -984,11 +982,12 @@ enum MessagesService {
             MCPTool(
                 name: "messages_save_attachment",
                 description: "Save an image attachment to disk, by the attachment_id messages_get_chat or "
-                    + "messages_search reported. Refuses an attachment that is not an image.",
+                    + "messages_search reported. Refuses an attachment that is not an image, or one no longer on "
+                    + "disk. Writes one file at destination, replacing any file already there.",
                 inputSchema: schema(
                     properties: [
                         "attachment_id": intProp("attachment_id from messages_get_chat or messages_search"),
-                        "destination": stringProp("Absolute path to save the image to")
+                        "destination": stringProp("Absolute path of the file to write, including its filename (not a directory). The parent directory must exist. Under a resource scope, must fall inside the client's file_dirs")
                     ],
                     required: ["attachment_id", "destination"]
                 ),
