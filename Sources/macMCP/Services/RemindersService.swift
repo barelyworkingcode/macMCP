@@ -381,8 +381,8 @@ enum RemindersService {
                 if incomplete(in: nil) != nil {
                     return scopeViolationResult(
                         "a reminder titled '\(title)' exists on this Mac, but not in a reminder list "
-                        + "this client may reach. It may reach: "
-                        + admitted.map { rows[$0].path }.joined(separator: ", ") + ". "
+                        + "this client may reach. "
+                        + ScopedRows.reachable(admitted, rows: rows, fields: scopeFields) + " "
                         + "The list actually holding it is deliberately not named here."
                     )
                 }
@@ -402,8 +402,8 @@ enum RemindersService {
                 ) else {
                     return scopeViolationResult(
                         "the reminder titled '\(title)' is in a reminder list this client may not "
-                        + "reach. It may reach: "
-                        + admitted.map { rows[$0].path }.joined(separator: ", ") + ". "
+                        + "reach. "
+                        + ScopedRows.reachable(admitted, rows: rows, fields: scopeFields) + " "
                         + "Nothing was changed."
                     )
                 }
