@@ -178,7 +178,8 @@ struct ScopeField {
 struct ResourceScope: Equatable {
     /// One entry per declared `scope: "restrict"` field whose key was present
     /// in `_meta` **and** parsed as a non-empty string or an array of strings.
-    /// A bare `""` is an unset field and is not stored.
+    /// A bare `""` is an unset field and is not stored; empty strings inside an
+    /// array are dropped.
     ///
     /// A key present with a malformed value is *absent* here and present in
     /// `_meta`, which is deliberate: it must refuse rather than read as "no
@@ -243,10 +244,11 @@ struct ResourceScope: Equatable {
         for field in restrictFields {
             guard let raw = meta[field.name] else { continue }
             // A bare "" is an unset field and refuses like an absent key;
-            // stringsValue would read it as the value [""].
+            // stringsValue would read it as the value [""]. An empty string in
+            // a list names nothing, so `[""]` is an empty list, not a value.
             if case .string("") = raw { continue }
             guard let strings = raw.stringsValue else { continue }
-            parsed[field.name] = strings
+            parsed[field.name] = strings.filter { !$0.isEmpty }
         }
         return ResourceScope(fields: parsed, isScopedFlag: true)
     }

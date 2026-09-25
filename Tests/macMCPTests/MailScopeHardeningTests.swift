@@ -258,13 +258,12 @@ final class MailScopeHardeningTests: XCTestCase {
     // MARK: - A2: a bound that is not an absolute path bounds nothing
 
     /// `realPath` walks components from a `/` seed, so it answered `/` for
-    /// `"."`, `""` and `".."` alike -- and `/` is a prefix of every absolute
+    /// `"."` and `".."` alike -- and `/` is a prefix of every absolute
     /// path, so one such entry turned the containment check into a no-op that
     /// still reported a confinement. Reproduced over stdio: `file_dirs: ["."]`
     /// let `mail_get_source` write a message to `/tmp/zoutside/...`.
     func testANonAbsoluteFileDirsEntryIsRefusedRatherThanResolvedToRoot() {
         for spelling in [JSONValue.array([.string(".")]),
-                         .array([.string("")]),
                          .array([.string("..")])] {
             let scope = MailScope.parse(["file_dirs": spelling])
             guard case .misconfigured(let message) = scope.writeDestination("/tmp/zoutside/x.eml") else {
@@ -282,6 +281,17 @@ final class MailScopeHardeningTests: XCTestCase {
         XCTAssertEqual(
             MailScope.parse(["file_dirs": .string("")]).writeDestination("/tmp/zoutside/x.eml"),
             absent
+        )
+    }
+
+    /// `[""]` names no directory, so it is the explicit empty list `[]` -- a
+    /// refusal -- and not a malformed bound reported as a misconfiguration.
+    func testAListOfOnlyAnEmptyStringFileDirsDecidesExactlyAsAnEmptyList() {
+        let emptyList = MailScope.parse(["file_dirs": .array([])]).writeDestination("/tmp/zoutside/x.eml")
+        guard case .refuse = emptyList else { return XCTFail("file_dirs: [] must refuse: \(emptyList)") }
+        XCTAssertEqual(
+            MailScope.parse(["file_dirs": .array([.string("")])]).writeDestination("/tmp/zoutside/x.eml"),
+            emptyList
         )
     }
 

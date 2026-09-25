@@ -83,6 +83,22 @@ final class ResourceScopeTests: XCTestCase {
         )
     }
 
+    /// An empty string inside a list names nothing, so a list of only empty
+    /// strings is the same explicit "none" as `[]` -- not one value that folds
+    /// to `""` and would match a resource with an empty name.
+    func testAListOfOnlyEmptyStringsIsConfirmedEmpty() {
+        let scope = ResourceScope.parse(["mail_mailboxes": .array([.string("")])])
+        XCTAssertEqual(scope.access("mail_mailboxes"), .confirmedEmpty)
+        XCTAssertEqual(scope.values(of: "mail_mailboxes"), [])
+    }
+
+    func testAnEmptyStringBesideARealValueIsDropped() {
+        XCTAssertEqual(
+            ResourceScope.parse(["mail_mailboxes": .array([.string(""), .string("INBOX")])]).access("mail_mailboxes"),
+            .allowed(["INBOX"])
+        )
+    }
+
     /// The tools here check presence and never read the value, so the
     /// presence check is the only thing standing between `""` and a call that
     /// runs.
