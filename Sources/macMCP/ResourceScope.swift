@@ -169,14 +169,16 @@ struct ScopeField {
 /// States 1 and 2 look identical if a field's absence is represented the same
 /// way whether or not anything else in `_meta` was scoped -- which is exactly
 /// the mistake this type exists to make structurally impossible. `values(of:)`
-/// returning `nil` means only "this field's key was not present in `_meta`";
+/// returning `nil` means only "this field is unset in `_meta`" (absent, a bare
+/// `""`, or a value that did not parse);
 /// whether that is state 1 or state 2 depends on whether the call was mediated
 /// at all, which is what `isScoped` answers, and `access(_:)` (or a service's
 /// named wrappers over it) is what an enforcer should actually call rather
 /// than re-deriving the same branch at every call site.
 struct ResourceScope: Equatable {
     /// One entry per declared `scope: "restrict"` field whose key was present
-    /// in `_meta` **and** parsed as a string or array of strings.
+    /// in `_meta` **and** parsed as a non-empty string or an array of strings.
+    /// A bare `""` is an unset field and is not stored.
     ///
     /// A key present with a malformed value is *absent* here and present in
     /// `_meta`, which is deliberate: it must refuse rather than read as "no
@@ -250,7 +252,7 @@ struct ResourceScope: Equatable {
     }
 
     /// The raw value of one declared field: `nil` for "the key was not present
-    /// (or did not parse)", `[]` for "present and empty". The two used to mean
+    /// (or was a bare `""`, or did not parse)", `[]` for "present and empty". The two used to mean
     /// the same thing everywhere (ADR-011 decision 4); they still do for
     /// `access(_:)`'s purposes when the key is genuinely absent, but a
     /// *present* empty array is now `.confirmedEmpty` rather than `.refuse` --
