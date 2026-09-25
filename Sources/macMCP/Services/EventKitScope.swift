@@ -104,6 +104,23 @@ enum ScopedRows {
         case outOfScope(String)
     }
 
+    // MARK: - Fetching over a selection
+
+    /// Runs `body` over `selection`, except that an empty selection answers
+    /// `[]` without running it.
+    ///
+    /// An empty scope (`.confined([])`, from a field confirmed to hold
+    /// nothing) must never reach an EventKit predicate: there `nil` means every
+    /// calendar, and `[]` is not a documented "none". So an empty selection is
+    /// answered here rather than by asking EventKit.
+    static func fetch<Selection, Result>(
+        _ selection: [Selection]?,
+        _ body: ([Selection]?) -> [Result]
+    ) -> [Result] {
+        if let selection, selection.isEmpty { return [] }
+        return body(selection)
+    }
+
     // MARK: - Which rows a scope admits
 
     /// The cross-product ADR-011's worked example describes, applied to rows.

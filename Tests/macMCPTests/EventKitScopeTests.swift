@@ -520,4 +520,40 @@ final class EventKitScopeTests: XCTestCase {
         XCTAssertTrue(message.contains("outside the reminder lists this client may reach"), message)
         XCTAssertTrue(message.contains("`list_name`"), message)
     }
+
+    // MARK: - An empty selection never reaches EventKit
+
+    /// Runs `ScopedRows.fetch` with a body that records every selection it is
+    /// handed and answers with a sentinel, so a result can only be the sentinel
+    /// if the body really ran.
+    private func fetchRecording(_ selection: [String]?) -> (result: [Int], calls: [[String]?]) {
+        var calls: [[String]?] = []
+        let result = ScopedRows.fetch(selection) { passed -> [Int] in
+            calls.append(passed)
+            return [42]
+        }
+        return (result, calls)
+    }
+
+    /// EventKit reads a `nil` calendar list as "every calendar", so an empty
+    /// scope handed through would widen a confinement that admits nothing into
+    /// one that admits everything.
+    func testAnEmptySelectionReturnsNothingAndNeverRunsTheFetch() {
+        let (result, calls) = fetchRecording([])
+        XCTAssertEqual(result, [])
+        XCTAssertTrue(calls.isEmpty, "body ran with \(calls)")
+    }
+
+    func testANilSelectionIsPassedThroughToTheFetch() {
+        let (result, calls) = fetchRecording(nil)
+        XCTAssertEqual(result, [42])
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertNil(calls.first ?? ["not called"])
+    }
+
+    func testANonEmptySelectionIsPassedThroughUnchanged() {
+        let (result, calls) = fetchRecording(["a", "b"])
+        XCTAssertEqual(result, [42])
+        XCTAssertEqual(calls, [["a", "b"]])
+    }
 }
