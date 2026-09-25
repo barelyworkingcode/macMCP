@@ -401,13 +401,23 @@ enum ScopedRows {
             return .rows(inScope)
         }
         if !pick(Set(rows.indices)).isEmpty {
+            let hint = allowed.isEmpty
+                ? ""
+                : " Omit `\(fields.argument)` to use every \(fields.leafNoun) it may reach."
             return .outOfScope(
                 "\(fields.leafNoun) \"\(requested)\" is outside the \(fields.leafNoun)s this client "
-                + "may reach. It may reach: \(allowed.map { rows[$0].path }.joined(separator: ", ")). "
-                + "Omit `\(fields.argument)` to use every \(fields.leafNoun) it may reach."
+                + "may reach. \(reachable(allowed, rows: rows, fields: fields))" + hint
             )
         }
         return .notFound(notFoundMessage(requested, fields: fields))
+    }
+
+    /// The sentence naming what a scope admits, for a refusal to end on.
+    /// A scope can be confirmed empty, and an empty list would read as a
+    /// sentence with its object missing.
+    static func reachable(_ allowed: [Int], rows: [ScopePath.Row], fields: Fields) -> String {
+        if allowed.isEmpty { return "It may reach no \(fields.leafNoun)s." }
+        return "It may reach: \(allowed.map { rows[$0].path }.joined(separator: ", "))."
     }
 
     private static func notFoundMessage(_ requested: String, fields: Fields) -> String {
@@ -480,6 +490,12 @@ enum ScopedRows {
     ) -> RowMatch {
         if let defaultIndex, allowed.contains(defaultIndex) { return .rows([defaultIndex]) }
         if allowed.count == 1 { return .rows(allowed) }
+        if allowed.isEmpty {
+            return .needsChoice(
+                "this client may reach no \(fields.leafNoun)s, so there is nothing to write to. "
+                + "Nothing was written."
+            )
+        }
         let paths = allowed.map { rows[$0].path }
         return .needsChoice(
             "this client may reach \(paths.count) \(fields.leafNoun)s — \(quoted(paths)) — and this "
