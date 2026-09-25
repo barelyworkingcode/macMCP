@@ -239,7 +239,11 @@ struct ResourceScope: Equatable {
         guard let meta else { return .none }
         var parsed: [String: [String]] = [:]
         for field in restrictFields {
-            guard let raw = meta[field.name], let strings = raw.stringsValue else { continue }
+            guard let raw = meta[field.name] else { continue }
+            // A bare "" is an unset field and refuses like an absent key;
+            // stringsValue would read it as the value [""].
+            if case .string("") = raw { continue }
+            guard let strings = raw.stringsValue else { continue }
             parsed[field.name] = strings
         }
         return ResourceScope(fields: parsed, isScopedFlag: true)
