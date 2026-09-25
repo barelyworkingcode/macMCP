@@ -21,18 +21,20 @@ enum RemindersService {
     }
 
     private static func fetchReminders(in calendars: [EKCalendar]?) -> [EKReminder] {
-        let predicate = store.predicateForReminders(in: calendars)
-        var results: [EKReminder] = []
-        var done = false
-        store.fetchReminders(matching: predicate) { reminders in
-            results = reminders ?? []
-            done = true
+        ScopedRows.fetch(calendars) { calendars in
+            let predicate = store.predicateForReminders(in: calendars)
+            var results: [EKReminder] = []
+            var done = false
+            store.fetchReminders(matching: predicate) { reminders in
+                results = reminders ?? []
+                done = true
+            }
+            let deadline = Date(timeIntervalSinceNow: 15)
+            while !done && Date() < deadline {
+                CFRunLoopRunInMode(.defaultMode, 0.25, true)
+            }
+            return results
         }
-        let deadline = Date(timeIntervalSinceNow: 15)
-        while !done && Date() < deadline {
-            CFRunLoopRunInMode(.defaultMode, 0.25, true)
-        }
-        return results
     }
 
     private static let iso8601: ISO8601DateFormatter = {

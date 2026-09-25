@@ -179,8 +179,10 @@ enum CalendarService {
             }
         }
 
-        let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: calendars)
-        let events = store.events(matching: predicate)
+        let events = ScopedRows.fetch(calendars) { calendars in
+            let predicate = store.predicateForEvents(withStart: startDate, end: endDate, calendars: calendars)
+            return store.events(matching: predicate)
+        }
 
         let results: [[String: Any]] = events.map { event in
             var dict: [String: Any] = [
