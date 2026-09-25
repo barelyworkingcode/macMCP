@@ -69,6 +69,55 @@ final class ResourceScopeTests: XCTestCase {
         XCTAssertEqual(scope.access("calendar_accounts"), .refuse)
     }
 
+    func testAnEmptyStringValueIsReadAsAbsent() {
+        let scope = ResourceScope.parse(["mail_mailboxes": .string("")])
+        XCTAssertNil(scope.values(of: "mail_mailboxes"))
+        XCTAssertEqual(scope.access("mail_mailboxes"), .refuse)
+    }
+
+    /// Only the empty string is unset: a non-empty bare string is still one value.
+    func testANonEmptyBareStringIsStillOneValue() {
+        XCTAssertEqual(
+            ResourceScope.parse(["mail_mailboxes": .string("INBOX")]).access("mail_mailboxes"),
+            .allowed(["INBOX"])
+        )
+    }
+
+    /// An empty string inside a list names nothing, so a list of only empty
+    /// strings is the same explicit "none" as `[]` -- not one value that folds
+    /// to `""` and would match a resource with an empty name.
+    func testAListOfOnlyEmptyStringsIsConfirmedEmpty() {
+        let scope = ResourceScope.parse(["mail_mailboxes": .array([.string("")])])
+        XCTAssertEqual(scope.access("mail_mailboxes"), .confirmedEmpty)
+        XCTAssertEqual(scope.values(of: "mail_mailboxes"), [])
+    }
+
+    func testAnEmptyStringBesideARealValueIsDropped() {
+        XCTAssertEqual(
+            ResourceScope.parse(["mail_mailboxes": .array([.string(""), .string("INBOX")])]).access("mail_mailboxes"),
+            .allowed(["INBOX"])
+        )
+    }
+
+    /// The tools here check presence and never read the value, so the
+    /// presence check is the only thing standing between `""` and a call that
+    /// runs.
+    func testAnEmptyStringRefusesPresenceOnlyToolsExactlyAsAnAbsentKeyDoes() throws {
+        let cases: [(field: String, sibling: String, tool: String)] = [
+            ("mail_mailboxes", "mail_accounts", "mail_send"),
+            ("mail_accounts", "mail_mailboxes", "mail_list_accounts"),
+        ]
+        for (field, sibling, tool) in cases {
+            let siblingValue: JSONValue = .array([.string("Alice")])
+            let absent = try XCTUnwrap(
+                ResourceScope.parse([sibling: siblingValue]).presenceRefusal(tool: tool),
+                "\(tool) with \(field) absent"
+            )
+            let empty = ResourceScope.parse([sibling: siblingValue, field: .string("")])
+            XCTAssertEqual(empty.presenceRefusal(tool: tool), absent, "\(tool) with \(field): \"\"")
+        }
+    }
+
     /// `_meta` is a general channel -- it carries `project_id` today and could
     /// carry an API key tomorrow -- so a scope is built from the **declared**
     /// fields and nothing else. A scope assembled out of whatever happened to

@@ -258,24 +258,41 @@ final class MailScopeHardeningTests: XCTestCase {
     // MARK: - A2: a bound that is not an absolute path bounds nothing
 
     /// `realPath` walks components from a `/` seed, so it answered `/` for
-    /// `"."`, `""` and `".."` alike -- and `/` is a prefix of every absolute
+    /// `"."` and `".."` alike -- and `/` is a prefix of every absolute
     /// path, so one such entry turned the containment check into a no-op that
     /// still reported a confinement. Reproduced over stdio: `file_dirs: ["."]`
     /// let `mail_get_source` write a message to `/tmp/zoutside/...`.
-    ///
-    /// Note the trigger for the `[""]` spelling: a bare JSON string reaches
-    /// `stringsValue` as a one-element array.
     func testANonAbsoluteFileDirsEntryIsRefusedRatherThanResolvedToRoot() {
         for spelling in [JSONValue.array([.string(".")]),
-                         .array([.string("")]),
-                         .array([.string("..")]),
-                         .string("")] {
+                         .array([.string("..")])] {
             let scope = MailScope.parse(["file_dirs": spelling])
             guard case .misconfigured(let message) = scope.writeDestination("/tmp/zoutside/x.eml") else {
                 return XCTFail("\(spelling) must not resolve to the filesystem root")
             }
             XCTAssertTrue(message.contains("not an absolute path"), message)
         }
+    }
+
+    /// A bare `""` is an unset field, not the one-element list `[""]`, so it
+    /// refuses exactly as an absent `file_dirs` does.
+    func testABareEmptyStringFileDirsRefusesLikeAnAbsentField() {
+        let absent = MailScope.parse([:]).writeDestination("/tmp/zoutside/x.eml")
+        guard case .refuse = absent else { return XCTFail("absent file_dirs must refuse: \(absent)") }
+        XCTAssertEqual(
+            MailScope.parse(["file_dirs": .string("")]).writeDestination("/tmp/zoutside/x.eml"),
+            absent
+        )
+    }
+
+    /// `[""]` names no directory, so it is the explicit empty list `[]` -- a
+    /// refusal -- and not a malformed bound reported as a misconfiguration.
+    func testAListOfOnlyAnEmptyStringFileDirsDecidesExactlyAsAnEmptyList() {
+        let emptyList = MailScope.parse(["file_dirs": .array([])]).writeDestination("/tmp/zoutside/x.eml")
+        guard case .refuse = emptyList else { return XCTFail("file_dirs: [] must refuse: \(emptyList)") }
+        XCTAssertEqual(
+            MailScope.parse(["file_dirs": .array([.string("")])]).writeDestination("/tmp/zoutside/x.eml"),
+            emptyList
+        )
     }
 
     func testFileDirsNamingTheFilesystemRootBoundsNothingAndIsRefused() {
