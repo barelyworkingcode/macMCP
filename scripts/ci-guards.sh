@@ -24,36 +24,46 @@ if [ $# -ne 2 ] || [ -z "$1" ] || [ -z "$2" ]; then
     echo "usage: $0 <base-sha> <head-sha>" >&2
     exit 2
 fi
+for sha in "$1" "$2"; do
+    if ! git rev-parse --verify --quiet "$sha^{commit}" > /dev/null; then
+        echo "$0: not a commit in this clone: $sha" >&2
+        exit 2
+    fi
+done
 range="$1...$2"
 self="scripts/ci-guards.sh"
 
 TEST_PATH='(^|/)(test|tests|Tests|__tests__|testdata)/|_test\.go$|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.py$|_test\.py$'
-SKIP_OR_FOCUS='\.Skip(f|Now)?\(|(^|[^A-Za-z0-9_])(it|test|describe|context)\.(skip|only)([^A-Za-z0-9_]|$)|\.only\(|(^|[^A-Za-z0-9_.])[xf](it|describe)\(|XCTSkip|@unittest\.skip|\.skipTest\(|pytest\.mark\.skip|pytest\.skip\('
+SKIP_OR_FOCUS='\.Skip(f|Now)?\(|(^|[^A-Za-z0-9_])(it|test|describe|context)\.(skip|only)([^A-Za-z0-9_]|$)|\.only\(|(^|[^A-Za-z0-9_.])(x(it|describe|test)|f(it|describe))\(|XCTSkip|@unittest\.skip|\.skipTest\(|pytest\.mark\.skip|pytest\.skip\('
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # --text: a PR's own .gitattributes must not be able to hide files as binary.
-# quotePath=false: paths come out as bytes, so patterns and the test-path
-# regex see the real name.
+# quotePath=false: -z output is raw bytes, so patterns and the test-path regex
+# see the real name.
 gitdiff() { git -c core.quotePath=false diff --no-color --no-ext-diff --no-renames --text "$@"; }
 
-gitdiff --name-only -z "$range" -- | tr '\0' '\n' > "$work/paths"
-gitdiff --name-only -z --diff-filter=d "$range" -- | tr '\0' '\n' > "$work/added-paths"
+# Files are referred to by their position in this list everywhere below, never
+# by a name parsed back out of diff text: git escapes some names in headers,
+# and a name can itself be the secret. A newline inside a name becomes "?" so
+# one file stays one line.
+gitdiff --name-status -z "$range" -- | tr '\n\0' '?\n' | awk -v paths="$work/paths" -v deleted="$work/deleted" '
+    NR % 2 == 1 { status = $0; next }
+    { n++; print > paths; if (status == "D") print n > deleted }
+'
+touch "$work/paths" "$work/deleted"
 
 # One row per added line, split into two files with matching line numbers:
-# where ("path:line") and what (the text). Grepping "what" with -n and mapping
-# the hit numbers back to "where" keeps the text out of the output.
-gitdiff --src-prefix=a/ --dst-prefix=b/ --unified=0 "$range" -- | awk -v where="$work/where" -v what="$work/what" '
-    /^diff --git / { header = 1; next }
-    header && /^\+\+\+ / {
-        path = substr($0, 5); sub(/\t$/, "", path)
-        if (path ~ /^".*"$/) path = substr(path, 2, length(path) - 2)
-        path = substr(path, 3); header = 0; next
-    }
+# where ("file-index:line") and what (the text). Grepping "what" with -n and
+# mapping the hit numbers back to "where" keeps the text out of the output.
+# NULs become spaces because BSD awk ends a record at the first one.
+gitdiff --unified=0 "$range" -- | tr '\000' ' ' | awk -v where="$work/where" -v what="$work/what" '
+    /^diff --git / { file++; header = 1; next }
+    header && /^@@ / { header = 0 }
     header { next }
     /^@@ / { split($3, a, ","); line = substr(a[1], 2) + 0; next }
-    /^\+/ { print path ":" line > where; print substr($0, 2) > what; line++ }
+    /^\+/ { print file ":" line > where; print substr($0, 2) > what; line++ }
 '
 touch "$work/where" "$work/what"
 
@@ -74,31 +84,37 @@ matches_patterns() {
     { grep -naiE -f "$work/patterns" "$1" 2>/dev/null || true; } | cut -d: -f1
 }
 
-# mask: reads "path:line" or "path" rows and replaces each path that matches a
-# hygiene pattern with its position in the changed-path list. The row's own
-# text is tested, so a path git printed escaped is still caught. With invalid
-# patterns nothing can be ruled out, so every path is replaced.
-mask() {
-    local row path suffix n
-    while IFS= read -r row; do
-        path=$row; suffix=
-        case "$row" in *:[0-9]*) [ -n "${row##*:}" ] && [ -z "$(printf '%s' "${row##*:}" | tr -d 0-9)" ] && { path=${row%:*}; suffix=:${row##*:}; } ;; esac
-        case "$patterns_state" in
-            unset) printf '%s\n' "$row"; continue ;;
-            ok) printf '%s\n' "$path" | grep -qaiE -f "$work/patterns" 2>/dev/null || { printf '%s\n' "$row"; continue; } ;;
-        esac
-        n=$(awk -v p="$path" '$0 == p { print NR; exit }' "$work/paths")
-        printf 'changed path #%s%s\n' "${n:-?}" "$suffix"
-    done
+# Files whose names may not be printed. With invalid patterns nothing can be
+# ruled out, so that is all of them.
+case "$patterns_state" in
+    ok) matches_patterns "$work/paths" > "$work/secret-names" ;;
+    invalid) awk '{ print NR }' "$work/paths" > "$work/secret-names" ;;
+    *) : > "$work/secret-names" ;;
+esac
+
+# name: reads "file-index" or "file-index:line" rows and prints them with the
+# file's name, or as "changed path #N" when the name may not be printed.
+name() {
+    awk -v secret="$work/secret-names" -v paths="$work/paths" '
+        BEGIN {
+            while ((getline l < secret) > 0) hide[l] = 1
+            while ((getline l < paths) > 0) path[++n] = l
+        }
+        {
+            i = $0; suffix = ""
+            if (index($0, ":")) { i = substr($0, 1, index($0, ":") - 1); suffix = substr($0, index($0, ":")) }
+            print ((i in hide) ? "changed path #" i : path[i]) suffix
+        }
+    '
 }
 
-# where_of FILE: the "where" rows whose numbers are listed in FILE.
-where_of() {
+# rows_of FILE: the "where" rows whose numbers are listed in FILE.
+rows_of() {
     awk 'FILENAME == ARGV[1] { want[$1] = 1; next } FNR in want' "$1" "$work/where"
 }
 
 has_label() {
-    printf '%s' "${PR_LABELS:-}" | grep -qF "\"$1\""
+    printf '%s' "${PR_LABELS:-}" | tr -d '\n' | grep -qE "(^|[[,])[[:space:]]*\"$1\"[[:space:]]*(,|\\])"
 }
 
 indent() { sed 's/^/  /'; }
@@ -121,8 +137,10 @@ guard_tests_only() {
 
 guard_skip_focus() {
     local hits
+    # Exempt by index, so the check never depends on how a name prints.
+    { grep -naE "^($self|.*\.md)$" "$work/paths" || true; } | cut -d: -f1 > "$work/exempt"
     { grep -naE "$SKIP_OR_FOCUS" "$work/what" || true; } | cut -d: -f1 > "$work/skip-rows"
-    hits=$(where_of "$work/skip-rows" | { grep -avE "^($self|.*\.md):[0-9]+$" || true; } | mask)
+    hits=$(rows_of "$work/skip-rows" | awk -F: 'FILENAME == ARGV[1] { skip[$1] = 1; next } !($1 in skip)' "$work/exempt" - | name)
     if [ -z "$hits" ]; then
         echo "skip-focus: ok"
     elif has_label skip-approved; then
@@ -149,11 +167,11 @@ guard_hygiene() {
     matches_patterns "$work/what" > "$work/hygiene-rows"
     hits=$(
         {
-            where_of "$work/hygiene-rows"
+            rows_of "$work/hygiene-rows"
             # Only names the PR leaves behind: deleting or renaming away a bad
             # name is the fix, not the offence.
-            grep -aiE -f "$work/patterns" "$work/added-paths" 2>/dev/null || true
-        } | mask | sort -u
+            awk 'FILENAME == ARGV[1] { gone[$1] = 1; next } !($1 in gone)' "$work/deleted" "$work/secret-names"
+        } | name | sort -u
     )
     if [ -z "$hits" ]; then
         echo "hygiene: ok"
