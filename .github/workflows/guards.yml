@@ -1,0 +1,27 @@
+name: guards
+
+# Labels are inputs to the guards, so adding or removing one re-runs them.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guards-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: tests-only, skip-focus and hygiene guards
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          HYGIENE_PATTERNS: ${{ secrets.HYGIENE_PATTERNS }}
+        run: bash scripts/ci-guards.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
