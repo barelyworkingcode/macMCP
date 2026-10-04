@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "relay-log-line",
+  "title": "Relay service log line",
+  "description": "One JSON object per line on stderr. See logging-standard.md. Lines that do not start with '{' (panics, third-party output) are allowed and are not validated.",
+  "type": "object",
+  "required": ["ts", "level", "msg", "service", "op", "status", "duration_ms", "error", "trace_id"],
+  "properties": {
+    "ts": {
+      "description": "UTC, RFC 3339, millisecond precision.",
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "level": { "enum": ["error", "warn", "info", "debug"] },
+    "msg": { "type": "string", "maxLength": 500 },
+    "service": { "type": "string", "minLength": 1 },
+    "op": {
+      "description": "Dotted operation name, for example schedule.create or job.fire.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
+    },
+    "status": { "enum": ["ok", "error", "denied"] },
+    "duration_ms": { "description": "0 for a line that marks a point in time.", "type": "integer", "minimum": 0 },
+    "error": { "description": "Empty string when status is ok. Names the failure; never carries a body or credential.", "type": "string", "maxLength": 500 },
+    "trace_id": {
+      "description": "Empty string outside any user action, such as startup or a background tick.",
+      "type": "string",
+      "pattern": "^$|^[A-Za-z0-9_-]{8,64}$"
+    },
+    "session_id": { "type": "string", "minLength": 1 },
+    "job_id": { "type": "string", "minLength": 1 },
+    "run_id": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": true
+}
