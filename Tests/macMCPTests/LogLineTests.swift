@@ -224,7 +224,8 @@ final class LogLineTests: XCTestCase {
         let dir = try XCTUnwrap(bundle?.bundleURL.deletingLastPathComponent())
         let exe = dir.appendingPathComponent("macmcp")
         guard FileManager.default.isExecutableFile(atPath: exe.path) else {
-            throw XCTSkip("macmcp executable not found next to the xctest bundle at \(exe.path); run `swift build` first")
+            XCTFail("macmcp executable not found next to the xctest bundle at \(exe.path); run `swift build` first")
+            throw CocoaError(.fileNoSuchFile)
         }
         return exe
     }
