@@ -141,6 +141,16 @@ final class LogLineTests: XCTestCase {
         XCTAssertEqual((o["error"] as? String)?.count, 500)
     }
 
+    func testTruncationCountsUnicodeScalarsNotGraphemes() throws {
+        // 1 base + 600 combining marks compose a single grapheme but 601 scalars.
+        let s = "e" + String(repeating: "\u{0301}", count: 600)
+        let cap = Capture()
+        makeLog(cap).log(.info, s, error: s)
+        let o = try XCTUnwrap(cap.objects().first)
+        XCTAssertEqual((o["msg"] as? String)?.unicodeScalars.count, 500)
+        XCTAssertEqual((o["error"] as? String)?.unicodeScalars.count, 500)
+    }
+
     func testReservedAttrsAreRenamed() throws {
         let cap = Capture()
         makeLog(cap).log(.info, "real", traceId: "abcdef1234567890",
@@ -185,6 +195,7 @@ final class LogLineTests: XCTestCase {
         let o = try cap.objects()
         XCTAssertEqual(o.map { $0["msg"] as? String }.count, 5)
         XCTAssertEqual(o[2]["level"] as? String, "warn")
+        XCTAssertEqual(o[2]["error"] as? String, "debug_window_expired")
         XCTAssertEqual(o[3]["msg"] as? String, "after")
         XCTAssertEqual(o[4]["msg"] as? String, "again")
         XCTAssertEqual(o.filter { $0["level"] as? String == "warn" }.count, 1)
@@ -218,15 +229,16 @@ final class LogLineTests: XCTestCase {
         return exe
     }
 
-    private func run(meta: String?) throws -> (out: String, err: String) {
+    private func run(meta: String?, tool: String = "no_such_tool", env extra: [String: String] = [:]) throws -> (out: String, err: String) {
         let exe = try executableURL()
         let metaPart = meta.map { ",\"_meta\":\($0)" } ?? ""
-        let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"no_such_tool\",\"arguments\":{\"secret\":\"CANARY-TOKEN-7731\"}\(metaPart)}}\n"
+        let req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"\(tool)\",\"arguments\":{\"secret\":\"CANARY-TOKEN-7731\"}\(metaPart)}}\n"
         let p = Process()
         p.executableURL = exe
         var env = ProcessInfo.processInfo.environment
         env.removeValue(forKey: "RELAY_LOG_LEVEL")
         env.removeValue(forKey: "RELAY_SERVICE_ID")
+        for (k, v) in extra { env[k] = v }
         p.environment = env
         let inP = Pipe(), outP = Pipe(), errP = Pipe()
         p.standardInput = inP; p.standardOutput = outP; p.standardError = errP
@@ -292,5 +304,30 @@ final class LogLineTests: XCTestCase {
         XCTAssertNotNil(id.range(of: "^[0-9a-f]{32}$", options: .regularExpression))
         XCTAssertFalse(err.contains("bad id!"))
         XCTAssertFalse(out.contains("trace_id"))
+    }
+
+    func testUnknownToolResponseBytesAndWarnLine() throws {
+        let (out, err) = try run(meta: nil)
+        XCTAssertEqual(out, "{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"text\":\"unknown tool: no_such_tool\",\"type\":\"text\"}],\"isError\":true}}\n")
+        let calls = jsonLines(err).filter { $0["op"] as? String == "tool.call" }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0]["level"] as? String, "warn")
+        XCTAssertEqual(calls[0]["status"] as? String, "error")
+        XCTAssertEqual(calls[0]["tool"] as? String, "no_such_tool")
+    }
+
+    func testEnvLevelAndServiceIdReachTheLog() throws {
+        let (_, quiet) = try run(meta: nil, env: ["RELAY_LOG_LEVEL": "error", "RELAY_SERVICE_ID": "testsvc"])
+        XCTAssertTrue(jsonLines(quiet).filter { $0["op"] as? String == "tool.call" }.isEmpty)
+        let (_, loud) = try run(meta: nil, env: ["RELAY_LOG_LEVEL": "warn", "RELAY_SERVICE_ID": "testsvc"])
+        XCTAssertEqual(try toolCallLine(loud)["service"] as? String, "testsvc")
+    }
+
+    func testScopeDeniedCallLogsWarnDenied() throws {
+        let (_, err) = try run(meta: "{\"project_id\":\"p\",\"trace_id\":\"abcdef1234567890\"}", tool: "mail_list_accounts")
+        let line = try toolCallLine(err)
+        XCTAssertEqual(line["level"] as? String, "warn")
+        XCTAssertEqual(line["status"] as? String, "denied")
+        XCTAssertEqual(line["trace_id"] as? String, "abcdef1234567890")
     }
 }

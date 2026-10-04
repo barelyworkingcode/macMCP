@@ -166,11 +166,11 @@ while let line = readLine(strippingNewline: true) {
         let denied = result.meta?["scope_violation"] == .bool(true)
         let failed = result.isError == true
         StructuredLog.shared.log(
-            denied ? .warn : .info, "tool call", op: "tool.call",
+            (denied || failed) ? .warn : .info, "tool call", op: "tool.call",
             status: denied ? "denied" : (failed ? "error" : "ok"),
             durationMs: elapsedMs,
             error: (denied || failed) ? "tool returned an error" : nil,
-            traceId: traceId, attrs: ["tool": name])
+            traceId: traceId, attrs: ["tool": String(name.unicodeScalars.prefix(500).map(Character.init))])
 
         let contentValues: [JSONValue] = result.content.map { c in
             .object(["type": .string(c.type), "text": .string(c.text)])

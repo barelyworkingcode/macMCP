@@ -83,7 +83,7 @@ final class StructuredLog {
         if let deadline = debugDeadline, self.level == .debug, now() >= deadline {
             self.level = .info
             emit(.warn, "debug logging ended after 30 minutes; level is now info",
-                 op: "log", status: "error", durationMs: 0, error: "", traceId: "", attrs: [:])
+                 op: "log", status: "error", durationMs: 0, error: "debug_window_expired", traceId: "", attrs: [:])
         }
         guard level.rank <= self.level.rank else { return }
         emit(level, msg, op: op ?? "log",
@@ -112,7 +112,11 @@ final class StructuredLog {
     }
 
     private static func truncate(_ s: String) -> String {
-        s.count > maxText ? String(s.prefix(maxText)) : s
+        let scalars = s.unicodeScalars
+        guard scalars.count > maxText else { return s }
+        var out = String.UnicodeScalarView()
+        out.append(contentsOf: scalars.prefix(maxText))
+        return String(out)
     }
 
     private static func timestamp(_ d: Date) -> String {
