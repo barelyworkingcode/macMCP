@@ -157,7 +157,20 @@ while let line = readLine(strippingNewline: true) {
             }
             meta = object
         }
+        // Only the correlation ID is read from `_meta`; no argument or result
+        // text is ever logged, and nothing is added to the result's `_meta`.
+        let traceId = TraceID.accept(req.params?["_meta"]?.objectValue?["trace_id"]?.stringValue)
+        let callStart = Date()
         let result = registry.call(name: name, arguments: arguments, meta: meta)
+        let elapsedMs = max(0, Int(Date().timeIntervalSince(callStart) * 1000))
+        let denied = result.meta?["scope_violation"] == .bool(true)
+        let failed = result.isError == true
+        StructuredLog.shared.log(
+            (denied || failed) ? .warn : .info, "tool call", op: "tool.call",
+            status: denied ? "denied" : (failed ? "error" : "ok"),
+            durationMs: elapsedMs,
+            error: (denied || failed) ? "tool returned an error" : nil,
+            traceId: traceId, attrs: ["tool": String(name.unicodeScalars.prefix(500).map(Character.init))])
 
         let contentValues: [JSONValue] = result.content.map { c in
             .object(["type": .string(c.type), "text": .string(c.text)])
