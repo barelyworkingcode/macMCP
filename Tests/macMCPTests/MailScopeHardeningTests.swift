@@ -227,32 +227,28 @@ final class MailScopeHardeningTests: XCTestCase {
     /// take sending away from every write profile to bound a copy that changes
     /// nothing about who received the mail.
     ///
-    /// A `mail_send` from a Drafts-less profile therefore gets past the scope
-    /// checks and fails on Mail instead -- which is what this asserts, by the
-    /// refusal it does NOT carry.
+    /// The gate `mail_send` runs before composing (`scopeRefusal` with no
+    /// mailbox keys) therefore passes a Drafts-less profile, while
+    /// `draftDestinationRefusal` -- which only `mail_create_draft` consults --
+    /// refuses the same profile. Both are pure predicates, so this never
+    /// reaches Mail; the end-to-end send is `MailSendFixtureTests`.
     func testMailSendIsNotRefusedForNotNamingSentOrDrafts() {
-        let registry = ToolRegistry()
-        MailService.register(registry)
-        let result = registry.call(
-            name: "mail_send",
-            arguments: [
-                "to": .string("bob@relaytest.local"),
-                "subject": .string("probe"),
-                "body": .string("probe"),
-                // Zero budget so the call cannot reach Mail: what is being
-                // asserted is which refusal comes back, not that one does.
-                "timeout_seconds": .int(0)
-            ],
-            meta: [
-                "mail_accounts": .array([.string("Alice")]),
-                "mail_mailboxes": .array([.string("Archive"), .string("INBOX")])
-            ]
-        )
-        XCTAssertNil(result.meta?["scope_violation"], result.content.first?.text ?? "")
-        XCTAssertFalse(
-            (result.content.first?.text ?? "").contains("outside the mailboxes"),
-            result.content.first?.text ?? ""
-        )
+        let args: JSONObject = [
+            "to": .string("bob@relaytest.local"),
+            "subject": .string("probe"),
+            "body": .string("probe")
+        ]
+        let meta: JSONObject = [
+            "mail_accounts": .array([.string("Alice")]),
+            "mail_mailboxes": .array([.string("Archive"), .string("INBOX")])
+        ]
+        let call = MailCall.forArguments(args, default: 30, meta: meta)
+        let ctx = MCPCallContext(arguments: args, meta: meta, toolName: "mail_send")
+        let sendRefusal = MailService.scopeRefusal(for: ctx, call: call, mailboxKeys: [])
+        XCTAssertNil(sendRefusal, sendRefusal?.content.first?.text ?? "")
+
+        let draftRefusal = MailService.draftDestinationRefusal(call: call)
+        XCTAssertEqual(draftRefusal?.meta?["scope_violation"], .bool(true))
     }
 
     // MARK: - A2: a bound that is not an absolute path bounds nothing
