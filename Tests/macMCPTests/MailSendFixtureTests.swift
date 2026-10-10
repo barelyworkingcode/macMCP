@@ -33,15 +33,20 @@ final class MailSendFixtureTests: XCTestCase {
         let root = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         account = ProcessInfo.processInfo.environment["MACMCP_MAIL_ACCOUNT"] ?? "Alice"
         recipient = ProcessInfo.processInfo.environment["MACMCP_MAIL_RECIPIENT"] ?? "bob"
-        recipientMaildir = root
-            .appendingPathComponent("maildirs")
-            .appendingPathComponent(recipient)
-            .appendingPathComponent("Maildir")
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: recipientMaildir.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else {
-            throw XCTSkip("no Maildir at \(recipientMaildir.path) — is the fixture started?")
+        // The recipient becomes a path component and an address local part.
+        guard recipient.range(of: "^[a-z0-9._-]+$", options: .regularExpression) != nil,
+              !recipient.contains("..") else {
+            throw XCTSkip("MACMCP_MAIL_RECIPIENT must match [a-z0-9._-]+ (a fixture user, not an address)")
         }
+        // `testmail.sh reset` deletes Maildir and the fixture recreates it on
+        // delivery, so gate on the user's home, which survives a reset.
+        let home = root.appendingPathComponent("maildirs").appendingPathComponent(recipient)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: home.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw XCTSkip("no fixture user at \(home.path) — is the fixture set up?")
+        }
+        recipientMaildir = home.appendingPathComponent("Maildir")
     }
 
     func testMailSendFromADraftsLessProfileIsDelivered() throws {
@@ -61,14 +66,17 @@ final class MailSendFixtureTests: XCTestCase {
             ]
         )
         let text = result.content.first?.text ?? ""
-        XCTAssertNil(result.meta?["scope_violation"], text)
-        XCTAssertNotEqual(result.isError, true, text)
+        guard result.meta?["scope_violation"] == nil, result.isError != true else {
+            XCTFail("mail_send was refused: \(text)")
+            return
+        }
         XCTAssertTrue(text.contains("sent"), text)
 
         XCTAssertTrue(waitForDelivery(containing: marker), "\(marker) never reached \(recipient!)'s Maildir")
     }
 
-    /// Bounded failure guard only: returns as soon as the file appears.
+    /// Maildir `new`/`cur` may not exist until the first delivery; missing
+    /// directories read as empty. Bounded failure guard only: returns as soon as the file appears.
     private func waitForDelivery(containing marker: String) -> Bool {
         let deadline = Date().addingTimeInterval(60)
         repeat {
