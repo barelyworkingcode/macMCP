@@ -847,8 +847,82 @@ enum MailService {
     /// Not private: every generated comparison emits it, and a test can only
     /// pin that the two halves agree by running one.
     static let scopeFoldJXA = """
-    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().normalize('NFC'); }
+    function scopeFold(v) {
+        return Array.from(('' + v).normalize('NFC'))
+            .map(function(c) { return c.toLowerCase(); })
+            .join('')
+            .normalize('NFC');
+    }
     """
+
+    /// Matches a mailbox `(acctName, boxPath)` against `SCOPE_MAILBOXES` rules
+    /// emitted by `scopeMailboxRulesJXA`. Plain rules (`a === null`) match any
+    /// account; account-qualified rules (`a !== null`) match only that account.
+    /// When `mail_accounts` is wildcard (`"*"`), `scopeParseMailboxRules`
+    /// resolves `Account/Mailbox` prefixes against Mail's live account names.
+    /// If the live account catalog cannot be read (`acctNames === null`), any
+    /// entry containing `/` that needs disambiguation fails closed (is omitted)
+    /// rather than widening into a plain grant.
+    static let scopeMailboxAllowsJXA = """
+    function scopeParseMailboxRules(rawEntries, acctNames) {
+        var accts = null;
+        if (acctNames !== null) {
+            accts = Object.create(null);
+            for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
+        }
+        var rules = [];
+        for (var j = 0; j < rawEntries.length; j++) {
+            var e = '' + rawEntries[j];
+            var sl = e.indexOf('/');
+            if (sl > 0 && sl < e.length - 1) {
+                if (accts === null) continue;
+                var head = scopeFold(e.slice(0, sl));
+                if (accts[head]) {
+                    rules.push({a: head, m: scopeFold(e.slice(sl + 1))});
+                    continue;
+                }
+            }
+            rules.push({a: null, m: scopeFold(e)});
+        }
+        return rules;
+    }
+    function scopeLiveAccountNames() {
+        var names = ['On My Mac'];
+        try {
+            var ns = mail.accounts.name();
+            if (ns == null) return null;
+            for (var i = 0; i < ns.length; i++) names.push('' + ns[i]);
+        } catch (e) { return null; }
+        return names;
+    }
+    function scopeMailboxAllows(rules, acctName, boxPath) {
+        if (rules === null) return true;
+        var a = scopeFold(acctName), m = scopeFold(boxPath);
+        for (var i = 0; i < rules.length; i++) {
+            if (rules[i].m === m && (rules[i].a === null || rules[i].a === a)) return true;
+        }
+        return false;
+    }
+    """
+
+    /// A JS expression evaluating to folded `{a, m}` mailbox scope rules, or
+    /// `null` for "no scope in play". When `scopeAccounts` is a concrete list,
+    /// splitting happens once in Swift via `MailScope.parseMailboxRules`; when
+    /// `scopeAccounts` is `nil` (`mail_accounts: ["*"]`), the emitted expression
+    /// resolves prefixes against Mail's live account names.
+    static func scopeMailboxRulesJXA(_ values: [String]?, scopeAccounts: [String]?) -> String {
+        guard let values else { return "null" }
+        guard let scopeAccounts else {
+            let raw = "[" + values.map { "'\(escapeJSString($0))'" }.joined(separator: ", ") + "]"
+            return "scopeParseMailboxRules(\(raw), scopeLiveAccountNames())"
+        }
+        let rules = MailScope.parseMailboxRules(values, allowedAccounts: scopeAccounts)
+        return "[" + rules.map { rule in
+            let acct = rule.account.map { "'\(escapeJSString(MailScope.fold($0)))'" } ?? "null"
+            let mbox = "'\(escapeJSString(MailScope.fold(rule.mailbox)))'"
+            return "{a:\(acct),m:\(mbox)}"
+        }.joined(separator: ", ") + "]"
+    }
 
     /// A JS array literal of folded strings, or `null` for "no scope in
     /// play". Every scope comparison inside a generated script is against one
@@ -965,7 +1039,15 @@ enum MailService {
             }
         }
         for key in mailboxKeys {
-            if case .refuse(let message) = call.scope.mailboxTargets(requested: args?[key]?.stringValue) {
+            let accountForKey: String?
+            if key == "target_mailbox", accountKeys.contains("target_account") {
+                accountForKey = args?["target_account"]?.stringValue ?? args?["account"]?.stringValue
+            } else if accountKeys.contains("account") {
+                accountForKey = args?["account"]?.stringValue
+            } else {
+                accountForKey = nil
+            }
+            if case .refuse(let message) = call.scope.mailboxTargets(requested: args?[key]?.stringValue, account: accountForKey) {
                 return scopeViolationResult(message)
             }
         }
@@ -1337,6 +1419,10 @@ enum MailService {
         query: String?,
         searchRecipients: Bool,
         limit: Int,
+        /// The allowed account names (`mail_accounts`), used to split
+        /// `Account/Mailbox` entries in `scopeMailboxes` without misreading
+        /// slashes inside mailbox paths such as `[Gmail]/All Mail`.
+        scopeAccounts: [String]? = nil,
         /// The mailbox paths this call may read (ADR-011 `mail_mailboxes`), or
         /// `nil` when no scope is in play.
         ///
@@ -1346,8 +1432,9 @@ enum MailService {
         /// thrown the bytes away, which is a confinement that confines only
         /// what comes back. The intersection is therefore done on the mailbox
         /// list, before a single message column is fetched, and it is done on
-        /// the **path**: a leaf name does not identify a mailbox, and an
-        /// account can hold two called `Archive`.
+        /// the **path** (and account, for `Account/Mailbox` entries): a leaf
+        /// name does not identify a mailbox, and an account can hold two called
+        /// `Archive`.
         scopeMailboxes: [String]? = nil,
         /// Fetches the RFC Message-ID column too, and carries it on every row
         /// as `rfc_message_id`. `false` by default and for every existing
@@ -1375,10 +1462,11 @@ enum MailService {
         // Archive, rather than a top-level `Archive` it may not.
         let scopeFilter = """
         \(scopeFoldJXA)
-        var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
+        \(scopeMailboxAllowsJXA)
+        var SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
         if (SCOPE_MAILBOXES !== null) {
             allBoxes = allBoxes.filter(function(b) {
-                return SCOPE_MAILBOXES.indexOf(scopeFold(b.path)) >= 0;
+                return scopeMailboxAllows(SCOPE_MAILBOXES, b.acctName, b.path);
             });
         }
         """
@@ -1939,6 +2027,7 @@ enum MailService {
                 query: query,
                 searchRecipients: searchRecipients,
                 limit: limit,
+                scopeAccounts: allowedList(call.scope.accountsAccess),
                 scopeMailboxes: allowedList(call.scope.mailboxesAccess),
                 includeMessageID: includeMessageID
             ))
@@ -2247,8 +2336,9 @@ enum MailService {
     // argument above rather than replacing it: they answer different
     // questions, and a caller narrowing further inside its own scope is
     // ordinary use.
+    \(scopeMailboxAllowsJXA)
     var FM_SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
-    var FM_SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
+    var FM_SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
     // Set when a message was found and is not one this client may reach. It is
     // reported as a refusal rather than as "not found": a silent nothing lets
     // an agent build a false model of what it can reach, and the sentence
@@ -2276,7 +2366,7 @@ enum MailService {
         // of `["Archive"]`, and silently allowing it is the one direction this
         // check must never fail in.
         if (!at.pathKnown) { FM_UNLOCATED = true; return false; }
-        return fmAllowed(FM_SCOPE_MAILBOXES, at.mailbox);
+        return scopeMailboxAllows(FM_SCOPE_MAILBOXES, at.account, at.mailbox);
     }
     function fmBind(msg, at) { found = msg; foundAccount = at.account; foundMailbox = at.mailbox; }
     \(accountCheck)
@@ -2316,7 +2406,7 @@ enum MailService {
     // Narrowed before the first column fetch for that reason.
     if (FM_SCOPE_ACCOUNTS !== null || FM_SCOPE_MAILBOXES !== null) {
         fmBoxes = fmBoxes.filter(function(b) {
-            return fmAllowed(FM_SCOPE_ACCOUNTS, b.acctName) && fmAllowed(FM_SCOPE_MAILBOXES, b.path);
+            return fmAllowed(FM_SCOPE_ACCOUNTS, b.acctName) && scopeMailboxAllows(FM_SCOPE_MAILBOXES, b.acctName, b.path);
         });
     }
     (function() {
@@ -2466,23 +2556,24 @@ enum MailService {
         mailbox: String,
         accountExpr: String,
         varName: String = "mbox",
+        scopeAccounts: [String]? = nil,
         scopeMailboxes: [String]? = nil
     ) -> String {
         let escapedMailbox = escapeJSString(mailbox)
         return """
     \(boundByNameJXA)
     \(scopeFoldJXA)
+    \(scopeMailboxAllowsJXA)
     var \(varName)Account = null;
     var \(varName)Path = null;
     var \(varName) = (function() {
         var wantName = scopeFold('\(escapedMailbox)');
         var wantAcct = \(accountExpr);
-        var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
-        function inScope(box) {
-            return SCOPE_MAILBOXES === null
-                || SCOPE_MAILBOXES.indexOf(scopeFold(box.path)) >= 0;
+        var SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
+        function inScope(box, acctName) {
+            return scopeMailboxAllows(SCOPE_MAILBOXES, acctName, box.path);
         }
-        function reachable(boxes) { return boxes.filter(inScope); }
+        function reachable(boxes, acctName) { return boxes.filter(function(b) { return inScope(b, acctName); }); }
         // Name what the account does have, by path. The mailboxes are already
         // fetched by then, so it costs nothing, and "no mailbox named X" on its
         // own leaves a caller guessing at spelling, localisation and which
@@ -2518,13 +2609,13 @@ enum MailService {
         // what makes the refusal `moveScriptJXA` raises name the mailbox the
         // caller asked for rather than a "no such mailbox" that is both untrue
         // and indistinguishable from a typo.
-        function pick(allBoxes, where) {
-            var boxes = reachable(allBoxes);
+        function pick(allBoxes, where, acctName) {
+            var boxes = reachable(allBoxes, acctName);
             var exact = [], leaf = [], exactOutOfScope = [];
             for (var i = 0; i < allBoxes.length; i++) {
                 if (allBoxes[i].element === null) continue;
                 if (scopeFold(allBoxes[i].path) !== wantName) continue;
-                if (inScope(allBoxes[i])) exact.push(allBoxes[i]); else exactOutOfScope.push(allBoxes[i]);
+                if (inScope(allBoxes[i], acctName)) exact.push(allBoxes[i]); else exactOutOfScope.push(allBoxes[i]);
             }
             for (var j = 0; j < boxes.length; j++) {
                 if (boxes[j].element === null) continue;
@@ -2553,7 +2644,7 @@ enum MailService {
             for (var a = 0; a < accts.length; a++) {
                 if (scopeFold(accts[a].name) === scopeFold(wantAcct)) {
                     var boxes = boundByNameOrThrow(accts[a].element.mailboxes, 'the mailbox list of account "' + accts[a].name + '"');
-                    var hit = pick(boxes, 'account "' + accts[a].name + '"');
+                    var hit = pick(boxes, 'account "' + accts[a].name + '"', accts[a].name);
                     \(varName)Account = accts[a].name;
                     \(varName)Path = hit.path;
                     return hit.element;
@@ -2562,7 +2653,7 @@ enum MailService {
             throw new Error('account not found: ' + wantAcct);
         }
         var localBoxes = boundByNameOrThrow(mail.mailboxes, 'the mailbox list of On My Mac');
-        var localHit = pick(localBoxes, 'On My Mac');
+        var localHit = pick(localBoxes, 'On My Mac', 'On My Mac');
         \(varName)Account = 'On My Mac';
         \(varName)Path = localHit.path;
         return localHit.element;
@@ -2619,12 +2710,56 @@ enum MailService {
     static func senderJXA(
         from: String?,
         account: String?,
-        scopeAccounts: [String]? = nil
+        scopeAccounts: [String]? = nil,
+        scopeMailboxes: [String]? = nil,
+        requiredMailbox: String? = nil
     ) -> (lines: String, prop: String) {
+        let scopeSentinel = escapeJSString(MailScopeRefusal.sentinel)
+        let mailboxGuardDecl: String
+        if let requiredMailbox, scopeMailboxes != nil {
+            let escapedReq = escapeJSString(requiredMailbox)
+            mailboxGuardDecl = """
+            \(scopeMailboxAllowsJXA)
+            var SEND_SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
+            var SEND_REQUIRED_MAILBOX = '\(escapedReq)';
+            function sendRequireMailbox(acctName, addr) {
+                if (!scopeMailboxAllows(SEND_SCOPE_MAILBOXES, acctName, SEND_REQUIRED_MAILBOX)) {
+                    throw new Error('\(scopeSentinel)a draft is saved in account "' + acctName
+                        + '"\\'s "' + SEND_REQUIRED_MAILBOX
+                        + '" mailbox, which is outside the mailboxes this client may reach; nothing was composed');
+                }
+                if (addr == null) return;
+                var want = ('' + addr).trim().toLowerCase();
+                var allAccts = mail.accounts();
+                for (var k = 0; k < allAccts.length; k++) {
+                    var nm = '' + allAccts[k].name();
+                    if (scopeFold(nm) === scopeFold(acctName)) continue;
+                    if (sendScopeAllows(nm) && scopeMailboxAllows(SEND_SCOPE_MAILBOXES, nm, SEND_REQUIRED_MAILBOX)) continue;
+                    var others = null;
+                    try { others = allAccts[k].emailAddresses(); } catch (e) { others = null; }
+                    if (others === null) {
+                        throw new Error('could not verify that address "' + want
+                            + '" is not shared with another account outside the accounts or mailboxes allowed for "'
+                            + SEND_REQUIRED_MAILBOX + '"; nothing was composed');
+                    }
+                    for (var j = 0; j < others.length; j++) {
+                        if (('' + others[j]).trim().toLowerCase() === want) {
+                            throw new Error('\(scopeSentinel)address "' + want
+                                + '" is shared with another account outside the accounts or mailboxes allowed for "'
+                                + SEND_REQUIRED_MAILBOX + '", so ownership is ambiguous; nothing was composed');
+                        }
+                    }
+                }
+            }
+            """
+        } else {
+            mailboxGuardDecl = "function sendRequireMailbox() {}"
+        }
         // Emitted by every branch below, so a scoped account walk reads the
         // same in all of them.
         let scopeDecl = """
         \(scopeFoldJXA)
+        \(mailboxGuardDecl)
         var SEND_SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
         function sendScopeAllows(name) {
             if (SEND_SCOPE_ACCOUNTS === null) return true;
@@ -2633,7 +2768,6 @@ enum MailService {
             return false;
         }
         """
-        let scopeSentinel = escapeJSString(MailScopeRefusal.sentinel)
         if let from = from {
             let escapedFrom = escapeJSString(from)
             let wanted = escapeJSString(parseAddress(from).address.lowercased())
@@ -2656,7 +2790,10 @@ enum MailService {
                         // not send as is not a suggestion.
                         if (mayUse) known.push(one);
                         if (one.toLowerCase() !== want) continue;
-                        if (mayUse) return '\(escapedFrom)';
+                        if (mayUse) {
+                            sendRequireMailbox('' + accts[i].name(), want);
+                            return '\(escapedFrom)';
+                        }
                         outOfScope = true;
                     }
                 }
@@ -2682,7 +2819,10 @@ enum MailService {
                             throw new Error('\(scopeSentinel)account "\(escapedAccount)" is outside the mail accounts this client may reach, so nothing was composed');
                         }
                         var addrs = accts[i].emailAddresses();
-                        if (addrs.length > 0) return addrs[0];
+                        if (addrs.length > 0) {
+                            sendRequireMailbox('' + accts[i].name(), addrs[0]);
+                            return addrs[0];
+                        }
                         throw new Error('account has no email addresses: \(escapedAccount)');
                     }
                 }
@@ -2698,8 +2838,44 @@ enum MailService {
         //
         // Scoped, Mail's default is not an answer to anything the caller
         // asked, so the identity is resolved to the scope instead.
-        guard let scopeAccounts else { return ("var senderAddr = null;", "") }
-        let named = scopeAccounts.map { "\"\($0)\"" }.joined(separator: ", ")
+        if scopeAccounts == nil {
+            guard requiredMailbox != nil, scopeMailboxes != nil else {
+                return ("var senderAddr = null;", "")
+            }
+            let lines = """
+            \(scopeDecl)
+            var senderAddr = (function() {
+                var accts = mail.accounts();
+                var eligible = [];
+                var allAllowed = accts.length > 0;
+                for (var i = 0; i < accts.length; i++) {
+                    if (scopeMailboxAllows(SEND_SCOPE_MAILBOXES, '' + accts[i].name(), SEND_REQUIRED_MAILBOX)) {
+                        eligible.push(accts[i]);
+                    } else {
+                        allAllowed = false;
+                    }
+                }
+                if (allAllowed) return null;
+                if (eligible.length === 0) {
+                    throw new Error('\(scopeSentinel)none of Mail\\'s accounts may write to "' + SEND_REQUIRED_MAILBOX + '" under this client\\'s mail_mailboxes scope, so nothing was composed');
+                }
+                if (eligible.length > 1) {
+                    var names = [];
+                    for (var n = 0; n < eligible.length; n++) names.push('' + eligible[n].name());
+                    throw new Error('\(scopeSentinel)this client may write "' + SEND_REQUIRED_MAILBOX + '" in more than one account (' + names.join(', ')
+                        + ') and named neither `from` nor `account`. Name one -- nothing was composed');
+                }
+                var addrs = eligible[0].emailAddresses();
+                if (addrs.length > 0) {
+                    sendRequireMailbox('' + eligible[0].name(), addrs[0]);
+                    return addrs[0];
+                }
+                throw new Error('account has no email addresses: ' + eligible[0].name());
+            })();
+            """
+            return (lines, "if (senderAddr !== null) msg.sender = senderAddr;")
+        }
+        let named = (scopeAccounts ?? []).map { "\"\($0)\"" }.joined(separator: ", ")
         let lines = """
         \(scopeDecl)
         var senderAddr = (function() {
@@ -2718,7 +2894,10 @@ enum MailService {
                     + ') and named neither `from` nor `account`. Mail would have used its own default account, which need not be one of those. Name one -- nothing was composed');
             }
             var addrs = allowed[0].emailAddresses();
-            if (addrs.length > 0) return addrs[0];
+            if (addrs.length > 0) {
+                sendRequireMailbox('' + allowed[0].name(), addrs[0]);
+                return addrs[0];
+            }
             throw new Error('account has no email addresses: ' + allowed[0].name());
         })();
         """
@@ -2835,20 +3014,21 @@ enum MailService {
         // already enumerated.
         let pathsOf = """
         \(scopeFoldJXA)
+        \(scopeMailboxAllowsJXA)
         var SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
-        var SCOPE_MAILBOXES = \(scopeArrayJXA(scopeMailboxes));
+        var SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
         function scopeAllows(list, value) {
             if (list === null) return true;
             var v = scopeFold(value);
             for (var i = 0; i < list.length; i++) { if (list[i] === v) return true; }
             return false;
         }
-        function pathsOf(collection) {
+        function pathsOf(collection, acctName) {
             var bound = boundByName(collection);
             if (bound === null) throw new Error('the mailbox list kept changing while it was being read; try again in a moment');
             var out = [];
             for (var i = 0; i < bound.length; i++) {
-                if (!scopeAllows(SCOPE_MAILBOXES, bound[i].path)) continue;
+                if (!scopeMailboxAllows(SCOPE_MAILBOXES, acctName, bound[i].path)) continue;
                 out.push(bound[i].path);
             }
             return out;
@@ -2861,9 +3041,9 @@ enum MailService {
         // depends on, so it is the costliest place to keep it. What could not
         // be read is named as `unread` rather than shown as an empty account,
         // because "this account holds no mailboxes" is a different answer.
-        function listingFor(collection) {
+        function listingFor(collection, acctName) {
             try {
-                return {mailboxes: pathsOf(collection)};
+                return {mailboxes: pathsOf(collection, acctName)};
             } catch (err) {
                 var m = err == null ? '' : ('' + (err.message == null ? err : err.message));
                 return {mailboxes: [], unread: m.length === 0 ? 'it could not be read' : m};
@@ -2875,7 +3055,7 @@ enum MailService {
             script = """
             \(boundByNameJXA)
             \(pathsOf)
-            JSON.stringify(pathsOf(mail.mailboxes));
+            JSON.stringify(pathsOf(mail.mailboxes, '\(escapeJSString(localAccountName))'));
             """
         } else if let account {
             let escaped = escapeJSString(account)
@@ -2886,7 +3066,7 @@ enum MailService {
                 var accts = boundByNameOrThrow(mail.accounts, 'the account list');
                 for (var i = 0; i < accts.length; i++) {
                     if (scopeFold(accts[i].name) === scopeFold('\(escaped)')) {
-                        return JSON.stringify(pathsOf(accts[i].element.mailboxes));
+                        return JSON.stringify(pathsOf(accts[i].element.mailboxes, accts[i].name));
                     }
                 }
                 throw new Error('account not found: \(escaped)');
@@ -2900,7 +3080,7 @@ enum MailService {
             var results = [];
             for (var i = 0; i < accts.length; i++) {
                 if (!scopeAllows(SCOPE_ACCOUNTS, accts[i].name)) continue;
-                var one = listingFor(accts[i].element.mailboxes);
+                var one = listingFor(accts[i].element.mailboxes, accts[i].name);
                 results.push({account: accts[i].name, mailboxes: one.mailboxes, unread: one.unread});
             }
             // On My Mac is an account name every mail tool accepts, so it is
@@ -2909,7 +3089,7 @@ enum MailService {
             // account holds no mailboxes" is an answer and omitting it puts a
             // caller back to having to know the name before they can ask.
             if (scopeAllows(SCOPE_ACCOUNTS, '\(escapeJSString(localAccountName))')) {
-                var local = listingFor(mail.mailboxes);
+                var local = listingFor(mail.mailboxes, '\(escapeJSString(localAccountName))');
                 results.push({account: '\(escapeJSString(localAccountName))', mailboxes: local.mailboxes, unread: local.unread});
             }
             JSON.stringify(results);
@@ -4736,6 +4916,7 @@ JSON.stringify(out);
         finalAction: String,
         disposesMessage: Bool,
         call: MailCall,
+        requiredMailbox: String? = nil,
         afterClose: String = "",
         postProcess: (([String: Any]) -> [String: Any])? = nil
     ) -> MCPCallResult {
@@ -4784,10 +4965,13 @@ JSON.stringify(out);
         // is an exfiltration channel and this does not close it, which is why
         // `read` is the default mode and why the tool allowlist matters.
         let scopeAccounts = allowedList(call.scope.accountsAccess)
+        let draftScopeMailboxes = requiredMailbox == nil ? nil : allowedList(call.scope.mailboxesAccess)
         let senderSnippet = senderJXA(
             from: args?["from"]?.stringValue,
             account: args?["account"]?.stringValue,
-            scopeAccounts: scopeAccounts
+            scopeAccounts: scopeAccounts,
+            scopeMailboxes: draftScopeMailboxes,
+            requiredMailbox: requiredMailbox
         )
         let visibleProp = visible ? "" : ",\n    visible: false"
 
@@ -4840,7 +5024,7 @@ JSON.stringify(out);
             subject: subject,
             from: args?["from"]?.stringValue,
             account: args?["account"]?.stringValue,
-            senderResolved: scopeAccounts != nil
+            senderResolved: scopeAccounts != nil || draftScopeMailboxes != nil
         ))
         // With neither `from` nor `account` given this is the only thing that
         // says which identity the message went out as, and it is what points
@@ -5218,7 +5402,7 @@ var savedDraft = (function() {
     /// is the same conclusion `mail_move` reaches, one step later, when
     /// `fmAllowed` checks the *resolved* destination path rather than the
     /// string the caller passed.
-    static func draftDestinationRefusal(call: MailCall) -> MCPCallResult? {
+    static func draftDestinationRefusal(call: MailCall, account: String? = nil) -> MCPCallResult? {
         // `.refuse` is `presenceRefusal`'s to answer and it has already run;
         // `.unscoped` is macmcp on a bare stdio pipe and must be untouched.
         // Written as an exhaustive switch rather than `guard case .allowed
@@ -5245,7 +5429,8 @@ var savedDraft = (function() {
                 + "may reach."
             )
         case .allowed(let allowed):
-            guard MailScope.names(draftDestination, oneOf: allowed) else {
+            let applicable = call.scope.allowedMailboxes(forAccount: account) ?? []
+            guard MailScope.names(draftDestination, oneOf: applicable) else {
                 return scopeViolationResult(
                     "a draft is saved in the sending account's \"\(draftDestination)\" mailbox, which "
                     + "is outside the mailboxes this client may reach. It may reach: "
@@ -5264,12 +5449,15 @@ var savedDraft = (function() {
         let args = ctx.arguments
         let call = MailCall.forArguments(args, default: Budget.createDraft, meta: ctx.meta)
         if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
-        // The mailbox this call writes into. It is not an argument, which is
-        // why it went unchecked; it is still a mailbox this client is reaching.
-        if let refusal = draftDestinationRefusal(call: call) { return refusal }
-        invalidateSourceCache()
         let account = args?["account"]?.stringValue
         let from = args?["from"]?.stringValue
+        // The mailbox this call writes into. It is not an argument, which is
+        // why it went unchecked; it is still a mailbox this client is reaching.
+        // `from` takes precedence over `account` in `senderJXA`, so only narrow
+        // the Swift pre-check by `account` when `from` is absent; `senderJXA`
+        // enforces the actual resolved sender account before creating the message.
+        if let refusal = draftDestinationRefusal(call: call, account: from == nil ? account : nil) { return refusal }
+        invalidateSourceCache()
         let subject = args?["subject"]?.stringValue ?? ""
 
         let finalAction = """
@@ -5324,7 +5512,7 @@ var savedDraft = (function() {
         // compose message, so an autosaved copy is reported rather than
         // deleted -- deleting one Mail is still holding brings it back.
         let verifyBody = args?["verify_body"]?.boolValue ?? false
-        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, afterClose: afterClose) { payload in
+        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, requiredMailbox: draftDestination, afterClose: afterClose) { payload in
             guard let body = args?["body"]?.stringValue,
                   args?["html_body"]?.stringValue == nil,
                   let draft = payload["draft"] as? [String: Any] else { return payload }
@@ -6453,6 +6641,7 @@ var savedDraft = (function() {
             mailbox: targetMailbox,
             accountExpr: "(TARGET_ACCOUNT !== null ? TARGET_ACCOUNT : foundAccount)",
             varName: "destMbox",
+            scopeAccounts: scopeAccounts,
             scopeMailboxes: scopeMailboxes
         )
         return """
@@ -6504,7 +6693,7 @@ var savedDraft = (function() {
         // resolution all sit between the string the caller wrote and the
         // mailbox that would be written to. `found` was already checked at the
         // other end, off the message, by `fmScopeAllows`.
-        } else if (!fmAllowed(FM_SCOPE_ACCOUNTS, destMboxAccount) || !fmAllowed(FM_SCOPE_MAILBOXES, destName)) {
+        } else if (!fmAllowed(FM_SCOPE_ACCOUNTS, destMboxAccount) || !scopeMailboxAllows(FM_SCOPE_MAILBOXES, destMboxAccount, destName)) {
             moveResult = {error: '\(escapeJSString(MailScopeRefusal.sentinel))'
                 + 'the destination resolved to "' + destMboxAccount + ':' + destName
                 + '", which is outside the accounts and mailboxes this client may reach; nothing was moved'};

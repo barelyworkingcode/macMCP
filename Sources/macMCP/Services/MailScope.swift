@@ -140,6 +140,101 @@ extension ResourceScope {
         }
     }
 
+    // MARK: - Account-qualified mailbox entries
+
+    /// One entry in `mail_mailboxes`, split into an optional account qualifier
+    /// and a mailbox path.
+    ///
+    /// **Slash ambiguity.** Mailbox paths themselves contain `/` (e.g.
+    /// `[Gmail]/All Mail`, `Projects/Archive`). An entry is split at its first
+    /// `/` if and only if the first segment equals (under `fold`) one of the
+    /// allowed account names in `mail_accounts` and the remainder is non-empty;
+    /// otherwise the whole entry is a plain mailbox path matching any allowed
+    /// account.
+    struct MailMailboxRule: Equatable {
+        /// `nil` for a plain entry (matches any allowed account); non-nil for
+        /// an `Account/Mailbox` entry (matches only that account).
+        let account: String?
+        let mailbox: String
+    }
+
+    /// Splits `entry` at its first ASCII `/` scalar (never on `Character`,
+    /// which would skip a `/` followed by a combining mark).
+    static func splitFirstSlash(_ entry: String) -> (head: String, tail: String)? {
+        guard let slash = entry.unicodeScalars.firstIndex(of: "/") else { return nil }
+        let head = String(entry.unicodeScalars[..<slash])
+        let tail = String(entry.unicodeScalars[entry.unicodeScalars.index(after: slash)...])
+        guard !head.isEmpty, !tail.isEmpty else { return nil }
+        return (head, tail)
+    }
+
+    /// Parses `mail_mailboxes` entries against `allowedAccounts`.
+    /// When `allowedAccounts` is `nil` (e.g. `mail_accounts: ["*"]`), no entry
+    /// is split here because there is no concrete list of allowed account names
+    /// in Swift; generated JXA resolves prefixes against live account names.
+    static func parseMailboxRules(
+        _ entries: [String],
+        allowedAccounts: [String]?
+    ) -> [MailMailboxRule] {
+        let foldedAccounts = Set((allowedAccounts ?? []).map(fold))
+        return entries.map { entry in
+            if !foldedAccounts.isEmpty,
+               let (head, tail) = splitFirstSlash(entry),
+               foldedAccounts.contains(fold(head)) {
+                return MailMailboxRule(account: head, mailbox: tail)
+            }
+            return MailMailboxRule(account: nil, mailbox: entry)
+        }
+    }
+
+    /// The mailbox paths this scope allows for `account` (or across all allowed
+    /// accounts when `account == nil`). Returns `nil` for `.unscoped` /
+    /// `.unrestricted`, and `[]` for `.refuse` / `.confirmedEmpty`.
+    func allowedMailboxes(forAccount account: String? = nil) -> [String]? {
+        switch mailboxesAccess {
+        case .unscoped, .unrestricted:
+            return nil
+        case .refuse, .confirmedEmpty:
+            return []
+        case .allowed(let entries):
+            switch accountsAccess {
+            case .allowed(let accts):
+                let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: accts)
+                guard let account else {
+                    return rules.map(\.mailbox)
+                }
+                let want = ResourceScope.fold(account)
+                return rules.compactMap { rule in
+                    guard let ruleAccount = rule.account else { return rule.mailbox }
+                    return ResourceScope.fold(ruleAccount) == want ? rule.mailbox : nil
+                }
+            case .unrestricted:
+                // Wildcard `mail_accounts` (`"*"`): Swift does not hold live
+                // account names, so JXA is authoritative. When a specific
+                // `account` is named, treat it as a known account name so
+                // `Account/Mailbox` entries for that account are recognised;
+                // when `account` is omitted, include both full entries and
+                // post-slash tails so valid paths reach JXA without false
+                // refusals.
+                if let account {
+                    let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: [account])
+                    return rules.map(\.mailbox)
+                }
+                var candidates: [String] = []
+                for entry in entries {
+                    candidates.append(entry)
+                    if let (_, tail) = ResourceScope.splitFirstSlash(entry) {
+                        candidates.append(tail)
+                    }
+                }
+                return candidates
+            case .unscoped, .refuse, .confirmedEmpty:
+                let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: nil)
+                return rules.map(\.mailbox)
+            }
+        }
+    }
+
     /// The mailbox paths a scan may read, for a `mailbox` argument.
     ///
     /// `requested` is the argument **as the caller wrote it** -- `nil` for
@@ -148,13 +243,19 @@ extension ResourceScope {
     /// made. `wildcard` is the tool-level "everything" value, which also
     /// resolves to the scope.
     ///
-    /// An explicit argument is matched against the allowed paths first, then
+    /// When `account` is non-nil, only entries applicable to that account (plain
+    /// entries and `Account/Mailbox` entries for that account) are considered.
+    /// An explicit argument is matched against those mailbox paths first, then
     /// against their leaf names, which is the same two-step every mailbox
     /// argument is resolved by (a bare name is a path with one component; a
     /// leaf name is a fallback). The *result* is still the whole allowed list:
     /// the intersection with what Mail actually holds happens inside the scan,
     /// against paths read off Mail rather than against strings.
-    func mailboxTargets(requested: String?, wildcard: String = "all") -> Decision<[String]> {
+    func mailboxTargets(
+        requested: String?,
+        account: String? = nil,
+        wildcard: String = "all"
+    ) -> Decision<[String]> {
         switch mailboxesAccess {
         case .unscoped:
             return .unscoped
@@ -183,8 +284,9 @@ extension ResourceScope {
             guard let requested, requested.lowercased() != wildcard.lowercased() else {
                 return .use(allowed)
             }
-            let leaves = allowed.map { $0.split(separator: "/").last.map(String.init) ?? $0 }
-            guard MailScope.names(requested, oneOf: allowed)
+            let applicable = allowedMailboxes(forAccount: account) ?? []
+            let leaves = applicable.map { $0.split(separator: "/").last.map(String.init) ?? $0 }
+            guard MailScope.names(requested, oneOf: applicable)
                     || MailScope.names(requested, oneOf: leaves) else {
                 return .refuse(
                     "mailbox \"\(requested)\" is outside the mailboxes this client may reach. "
