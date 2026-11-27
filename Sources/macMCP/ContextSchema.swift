@@ -112,7 +112,10 @@ private let mailScopeFields: [ScopeField] = [
         noun: "mailbox",
         description: "Mailbox paths within those accounts this client may reach — for reading and "
             + "for writing alike, so a client that may not read a mailbox may not move a message "
-            + "into it either, and a client without Drafts here cannot create drafts",
+            + "into it either, and a client without Drafts here cannot create drafts. Entries may "
+            + "be plain mailbox paths (matching any allowed account) or Account/Mailbox (e.g. "
+            + "“Work/INBOX”, “Work/[Gmail]/All Mail”), matching only that account's mailbox when "
+            + "the first segment before ‘/’ matches an allowed account name.",
         appliesTo: ["mail_*"],
         dependsOn: ["mail_accounts"],
         enumerate: { values in
@@ -234,7 +237,10 @@ private let mailScopeFields: [ScopeField] = [
 //
 // Each service is two fields -- the account and the thing inside it -- with
 // the second `depends_on` the first, which is the `mail_accounts` /
-// `mail_mailboxes` shape and combines the same way: a **cross-product**.
+// `mail_mailboxes` shape and combines the same way: a **cross-product** (and
+// `mail_mailboxes` additionally accepts `Account/Mailbox` entries to pin a
+// mailbox to one account, split at the first `/` only when the first segment
+// matches an allowed account name).
 // Accounts `[iCloud, On My Mac]` with calendars `[iCloud/Work]` means the
 // calendars in those accounts that are also in that list, which is one
 // calendar. The account field is not redundant beside the leaf field: it is
