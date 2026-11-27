@@ -860,20 +860,36 @@ enum MailService {
     /// rather than widening into a plain grant.
     static let scopeMailboxAllowsJXA = """
     function scopeParseMailboxRules(rawEntries, acctNames) {
-        var accts = null;
+        function qualKey(s) { return scopeFold(s).replace(/\\u03c2/g, '\\u03c3'); }
+        var exactAccts = null;
+        var compatAccts = null;
         if (acctNames !== null) {
-            accts = Object.create(null);
-            for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
+            exactAccts = Object.create(null);
+            compatAccts = Object.create(null);
+            for (var i = 0; i < acctNames.length; i++) {
+                var folded = scopeFold(acctNames[i]);
+                exactAccts[folded] = folded;
+                var qk = qualKey(acctNames[i]);
+                if (compatAccts[qk] === undefined) compatAccts[qk] = folded;
+                else if (compatAccts[qk] !== folded) compatAccts[qk] = false;
+            }
         }
         var rules = [];
         for (var j = 0; j < rawEntries.length; j++) {
             var e = '' + rawEntries[j];
             var sl = e.indexOf('/');
             if (sl > 0 && sl < e.length - 1) {
-                if (accts === null) continue;
-                var head = scopeFold(e.slice(0, sl));
-                if (accts[head]) {
-                    rules.push({a: head, m: scopeFold(e.slice(sl + 1))});
+                if (exactAccts === null) continue;
+                var rawHead = e.slice(0, sl);
+                var head = scopeFold(rawHead);
+                if (exactAccts[head]) {
+                    rules.push({a: exactAccts[head], m: scopeFold(e.slice(sl + 1))});
+                    continue;
+                }
+                var compat = compatAccts[qualKey(rawHead)];
+                if (compat === false) continue;
+                if (compat) {
+                    rules.push({a: compat, m: scopeFold(e.slice(sl + 1))});
                     continue;
                 }
             }
@@ -2729,15 +2745,19 @@ enum MailService {
                 for (var k = 0; k < allAccts.length; k++) {
                     var nm = '' + allAccts[k].name();
                     if (scopeFold(nm) === scopeFold(acctName)) continue;
-                    var others = [];
-                    try { others = allAccts[k].emailAddresses(); } catch (e) { others = []; }
+                    if (sendScopeAllows(nm) && scopeMailboxAllows(SEND_SCOPE_MAILBOXES, nm, SEND_REQUIRED_MAILBOX)) continue;
+                    var others = null;
+                    try { others = allAccts[k].emailAddresses(); } catch (e) { others = null; }
+                    if (others === null) {
+                        throw new Error('could not verify that address "' + want
+                            + '" is not shared with another account outside the accounts or mailboxes allowed for "'
+                            + SEND_REQUIRED_MAILBOX + '"; nothing was composed');
+                    }
                     for (var j = 0; j < others.length; j++) {
                         if (('' + others[j]).trim().toLowerCase() === want) {
-                            if (!sendScopeAllows(nm) || !scopeMailboxAllows(SEND_SCOPE_MAILBOXES, nm, SEND_REQUIRED_MAILBOX)) {
-                                throw new Error('\(scopeSentinel)address "' + want + '" is shared with account "' + nm
-                                    + '", which is outside the accounts or mailboxes allowed for "' + SEND_REQUIRED_MAILBOX
-                                    + '", so ownership is ambiguous; nothing was composed');
-                            }
+                            throw new Error('\(scopeSentinel)address "' + want
+                                + '" is shared with another account outside the accounts or mailboxes allowed for "'
+                                + SEND_REQUIRED_MAILBOX + '", so ownership is ambiguous; nothing was composed');
                         }
                     }
                 }

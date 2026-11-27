@@ -633,6 +633,91 @@ final class MailScopeAccountMailboxTests: XCTestCase {
         let split = MailScopeRefusal.split(payload["error"] as? String ?? "")
         XCTAssertTrue(split.violation, split.message)
         XCTAssertTrue(split.message.contains("ambiguous"), split.message)
+        XCTAssertFalse(split.message.contains("Personal"), "refusal must not disclose other account names: \(split.message)")
+    }
+
+    func testUnreadExcludedAccountEmailAddressesFailsClosedWithoutDisclosingAccountName() throws {
+        let throwingOtherMail = """
+        var mail = makeMail({accounts: [
+            {name: 'Work', emailAddresses: ['work@example'], mailboxes: [{name: 'Drafts'}]},
+            {name: 'Personal', emailAddresses: ['personal@example'], mailboxes: [{name: 'Drafts'}]}
+        ]});
+        var origAccounts = mail.accounts;
+        mail.accounts = function() {
+            var list = origAccounts();
+            list[1].emailAddresses = function() { throw new Error('account busy'); };
+            return list;
+        };
+        """
+        let snippet = MailService.senderJXA(
+            from: "work@example",
+            account: nil,
+            scopeAccounts: ["Personal", "Work"],
+            scopeMailboxes: ["Work/Drafts"],
+            requiredMailbox: "Drafts"
+        )
+        let payload = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(throwingOtherMail)
+        var out;
+        try {
+            \(snippet.lines)
+            out = {sender: senderAddr, error: null};
+        } catch (e) {
+            out = {sender: null, error: '' + (e && e.message ? e.message : e)};
+        }
+        JSON.stringify(out);
+        """)
+        XCTAssertNil(payload["sender"] as? String)
+        let err = payload["error"] as? String ?? ""
+        XCTAssertTrue(err.contains("could not verify"), err)
+        XCTAssertFalse(err.contains("Personal"), "error must not disclose excluded account name: \(err)")
+    }
+
+    func testWildcardGreekSigmaQualifierMatchesLiveAccountAndBlocksLiteralCollision() throws {
+        // Live account `ΟΣ` vs rule `οσ/INBOX` under wildcard `mail_accounts`:
+        // JXA must match `ΟΣ:INBOX` and must NOT turn `οσ/INBOX` into a plain
+        // grant that admits a literal `Personal:οσ/INBOX` folder.
+        let greekCollisionMail = """
+        var mail = makeMail({accounts: [
+            {name: 'ΟΣ', emailAddresses: ['os@example'], mailboxes: [
+                {name: 'INBOX', messages: [{id: 600, messageId: 'os-inbox@example', subject: 'Greek inbox', date: 2000}]}
+            ]},
+            {name: 'Personal', emailAddresses: ['p@example'], mailboxes: [
+                {name: 'οσ'},
+                {name: 'INBOX', container: 'οσ', messages: [{id: 601, messageId: 'p-lit@example', subject: 'Literal collision', date: 1000}]}
+            ]}
+        ]});
+        """
+        let greekScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(greekCollisionMail)
+        \(MailService.scanScriptJXA(
+            account: "ΟΣ",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["οσ/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(greekScan["scanned"] as? [String] ?? [], ["ΟΣ:INBOX"])
+
+        let personalScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(greekCollisionMail)
+        \(MailService.scanScriptJXA(
+            account: "Personal",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["οσ/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(personalScan["scanned"] as? [String] ?? [], [])
     }
 
     func testWildcardAutoSelectedDraftSenderIsEnforcedByPreSendGuard() throws {
