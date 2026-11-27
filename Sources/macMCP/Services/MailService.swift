@@ -847,7 +847,12 @@ enum MailService {
     /// Not private: every generated comparison emits it, and a test can only
     /// pin that the two halves agree by running one.
     static let scopeFoldJXA = """
-    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().normalize('NFC'); }
+    function scopeFold(v) {
+        return Array.from(('' + v).normalize('NFC'))
+            .map(function(c) { return c.toLowerCase(); })
+            .join('')
+            .normalize('NFC');
+    }
     """
 
     /// Matches a mailbox `(acctName, boxPath)` against `SCOPE_MAILBOXES` rules
@@ -860,36 +865,20 @@ enum MailService {
     /// rather than widening into a plain grant.
     static let scopeMailboxAllowsJXA = """
     function scopeParseMailboxRules(rawEntries, acctNames) {
-        function qualKey(s) { return scopeFold(s).replace(/\\u03c2/g, '\\u03c3'); }
-        var exactAccts = null;
-        var compatAccts = null;
+        var accts = null;
         if (acctNames !== null) {
-            exactAccts = Object.create(null);
-            compatAccts = Object.create(null);
-            for (var i = 0; i < acctNames.length; i++) {
-                var folded = scopeFold(acctNames[i]);
-                exactAccts[folded] = folded;
-                var qk = qualKey(acctNames[i]);
-                if (compatAccts[qk] === undefined) compatAccts[qk] = folded;
-                else if (compatAccts[qk] !== folded) compatAccts[qk] = false;
-            }
+            accts = Object.create(null);
+            for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
         }
         var rules = [];
         for (var j = 0; j < rawEntries.length; j++) {
             var e = '' + rawEntries[j];
             var sl = e.indexOf('/');
             if (sl > 0 && sl < e.length - 1) {
-                if (exactAccts === null) continue;
-                var rawHead = e.slice(0, sl);
-                var head = scopeFold(rawHead);
-                if (exactAccts[head]) {
-                    rules.push({a: exactAccts[head], m: scopeFold(e.slice(sl + 1))});
-                    continue;
-                }
-                var compat = compatAccts[qualKey(rawHead)];
-                if (compat === false) continue;
-                if (compat) {
-                    rules.push({a: compat, m: scopeFold(e.slice(sl + 1))});
+                if (accts === null) continue;
+                var head = scopeFold(e.slice(0, sl));
+                if (accts[head]) {
+                    rules.push({a: head, m: scopeFold(e.slice(sl + 1))});
                     continue;
                 }
             }

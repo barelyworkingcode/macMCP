@@ -675,13 +675,18 @@ final class MailScopeAccountMailboxTests: XCTestCase {
     }
 
     func testWildcardGreekSigmaQualifierMatchesLiveAccountAndBlocksLiteralCollision() throws {
-        // Live account `ΟΣ` vs rule `οσ/INBOX` under wildcard `mail_accounts`:
-        // JXA must match `ΟΣ:INBOX` and must NOT turn `οσ/INBOX` into a plain
-        // grant that admits a literal `Personal:οσ/INBOX` folder.
+        // Per-code-point lowercasing in `scopeFold` matches Swift's `fold`:
+        // `ΟΣ` folds to `οσ`, while `ος` (final sigma) stays `ος`.
+        // With both `ΟΣ` and `ος` live plus `Personal` holding a literal
+        // `οσ/INBOX`, grant `οσ/INBOX` must admit ONLY `ΟΣ:INBOX`, refusing
+        // both `ος:INBOX` and `Personal:οσ/INBOX`.
         let greekCollisionMail = """
         var mail = makeMail({accounts: [
             {name: 'ΟΣ', emailAddresses: ['os@example'], mailboxes: [
                 {name: 'INBOX', messages: [{id: 600, messageId: 'os-inbox@example', subject: 'Greek inbox', date: 2000}]}
+            ]},
+            {name: 'ος', emailAddresses: ['final@example'], mailboxes: [
+                {name: 'INBOX', messages: [{id: 602, messageId: 'final-inbox@example', subject: 'Final sigma inbox', date: 1500}]}
             ]},
             {name: 'Personal', emailAddresses: ['p@example'], mailboxes: [
                 {name: 'οσ'},
@@ -704,6 +709,21 @@ final class MailScopeAccountMailboxTests: XCTestCase {
         """)
         XCTAssertEqual(greekScan["scanned"] as? [String] ?? [], ["ΟΣ:INBOX"])
 
+        let finalSigmaScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(greekCollisionMail)
+        \(MailService.scanScriptJXA(
+            account: "ος",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["οσ/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(finalSigmaScan["scanned"] as? [String] ?? [], [])
+
         let personalScan = try JXA.runJSON("""
         \(MailStubJS.source)
         \(greekCollisionMail)
@@ -718,6 +738,29 @@ final class MailScopeAccountMailboxTests: XCTestCase {
         ))
         """)
         XCTAssertEqual(personalScan["scanned"] as? [String] ?? [], [])
+
+        // With ONLY `ος` live, `οσ/INBOX` does not match `ος` (matching Swift's fold).
+        let onlyFinalSigmaMail = """
+        var mail = makeMail({accounts: [
+            {name: 'ος', emailAddresses: ['final@example'], mailboxes: [
+                {name: 'INBOX', messages: [{id: 602, messageId: 'final-inbox@example', subject: 'Final sigma inbox', date: 1500}]}
+            ]}
+        ]});
+        """
+        let onlyFinalScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(onlyFinalSigmaMail)
+        \(MailService.scanScriptJXA(
+            account: "ος",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["οσ/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(onlyFinalScan["scanned"] as? [String] ?? [], [])
     }
 
     func testWildcardAutoSelectedDraftSenderIsEnforcedByPreSendGuard() throws {
