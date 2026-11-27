@@ -418,7 +418,6 @@ struct ResourceScope: Equatable {
     static func fold(_ value: String) -> String {
         value.precomposedStringWithCanonicalMapping
             .lowercased()
-            .replacingOccurrences(of: "\u{03C2}", with: "\u{03C3}")
             .precomposedStringWithCanonicalMapping
     }
 

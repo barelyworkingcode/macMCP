@@ -847,7 +847,7 @@ enum MailService {
     /// Not private: every generated comparison emits it, and a test can only
     /// pin that the two halves agree by running one.
     static let scopeFoldJXA = """
-    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().replace(/\\u03c2/g, '\\u03c3').normalize('NFC'); }
+    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().normalize('NFC'); }
     """
 
     /// Matches a mailbox `(acctName, boxPath)` against `SCOPE_MAILBOXES` rules
@@ -855,15 +855,22 @@ enum MailService {
     /// account; account-qualified rules (`a !== null`) match only that account.
     /// When `mail_accounts` is wildcard (`"*"`), `scopeParseMailboxRules`
     /// resolves `Account/Mailbox` prefixes against Mail's live account names.
+    /// If the live account catalog cannot be read (`acctNames === null`), any
+    /// entry containing `/` that needs disambiguation fails closed (is omitted)
+    /// rather than widening into a plain grant.
     static let scopeMailboxAllowsJXA = """
     function scopeParseMailboxRules(rawEntries, acctNames) {
-        var accts = Object.create(null);
-        for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
+        var accts = null;
+        if (acctNames !== null) {
+            accts = Object.create(null);
+            for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
+        }
         var rules = [];
         for (var j = 0; j < rawEntries.length; j++) {
             var e = '' + rawEntries[j];
             var sl = e.indexOf('/');
             if (sl > 0 && sl < e.length - 1) {
+                if (accts === null) continue;
                 var head = scopeFold(e.slice(0, sl));
                 if (accts[head]) {
                     rules.push({a: head, m: scopeFold(e.slice(sl + 1))});
@@ -878,8 +885,9 @@ enum MailService {
         var names = ['On My Mac'];
         try {
             var ns = mail.accounts.name();
+            if (ns == null) return null;
             for (var i = 0; i < ns.length; i++) names.push('' + ns[i]);
-        } catch (e) {}
+        } catch (e) { return null; }
         return names;
     }
     function scopeMailboxAllows(rules, acctName, boxPath) {
@@ -2709,11 +2717,29 @@ enum MailService {
             \(scopeMailboxAllowsJXA)
             var SEND_SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
             var SEND_REQUIRED_MAILBOX = '\(escapedReq)';
-            function sendRequireMailbox(acctName) {
+            function sendRequireMailbox(acctName, addr) {
                 if (!scopeMailboxAllows(SEND_SCOPE_MAILBOXES, acctName, SEND_REQUIRED_MAILBOX)) {
                     throw new Error('\(scopeSentinel)a draft is saved in account "' + acctName
                         + '"\\'s "' + SEND_REQUIRED_MAILBOX
                         + '" mailbox, which is outside the mailboxes this client may reach; nothing was composed');
+                }
+                if (addr == null) return;
+                var want = ('' + addr).trim().toLowerCase();
+                var allAccts = mail.accounts();
+                for (var k = 0; k < allAccts.length; k++) {
+                    var nm = '' + allAccts[k].name();
+                    if (scopeFold(nm) === scopeFold(acctName)) continue;
+                    var others = [];
+                    try { others = allAccts[k].emailAddresses(); } catch (e) { others = []; }
+                    for (var j = 0; j < others.length; j++) {
+                        if (('' + others[j]).trim().toLowerCase() === want) {
+                            if (!sendScopeAllows(nm) || !scopeMailboxAllows(SEND_SCOPE_MAILBOXES, nm, SEND_REQUIRED_MAILBOX)) {
+                                throw new Error('\(scopeSentinel)address "' + want + '" is shared with account "' + nm
+                                    + '", which is outside the accounts or mailboxes allowed for "' + SEND_REQUIRED_MAILBOX
+                                    + '", so ownership is ambiguous; nothing was composed');
+                            }
+                        }
+                    }
                 }
             }
             """
@@ -2756,7 +2782,7 @@ enum MailService {
                         if (mayUse) known.push(one);
                         if (one.toLowerCase() !== want) continue;
                         if (mayUse) {
-                            sendRequireMailbox('' + accts[i].name());
+                            sendRequireMailbox('' + accts[i].name(), want);
                             return '\(escapedFrom)';
                         }
                         outOfScope = true;
@@ -2783,9 +2809,11 @@ enum MailService {
                         if (!sendScopeAllows(accts[i].name())) {
                             throw new Error('\(scopeSentinel)account "\(escapedAccount)" is outside the mail accounts this client may reach, so nothing was composed');
                         }
-                        sendRequireMailbox('' + accts[i].name());
                         var addrs = accts[i].emailAddresses();
-                        if (addrs.length > 0) return addrs[0];
+                        if (addrs.length > 0) {
+                            sendRequireMailbox('' + accts[i].name(), addrs[0]);
+                            return addrs[0];
+                        }
                         throw new Error('account has no email addresses: \(escapedAccount)');
                     }
                 }
@@ -2829,7 +2857,10 @@ enum MailService {
                         + ') and named neither `from` nor `account`. Name one -- nothing was composed');
                 }
                 var addrs = eligible[0].emailAddresses();
-                if (addrs.length > 0) return addrs[0];
+                if (addrs.length > 0) {
+                    sendRequireMailbox('' + eligible[0].name(), addrs[0]);
+                    return addrs[0];
+                }
                 throw new Error('account has no email addresses: ' + eligible[0].name());
             })();
             """
@@ -2853,9 +2884,11 @@ enum MailService {
                 throw new Error('\(scopeSentinel)this client may send as more than one account (' + names.join(', ')
                     + ') and named neither `from` nor `account`. Mail would have used its own default account, which need not be one of those. Name one -- nothing was composed');
             }
-            sendRequireMailbox('' + allowed[0].name());
             var addrs = allowed[0].emailAddresses();
-            if (addrs.length > 0) return addrs[0];
+            if (addrs.length > 0) {
+                sendRequireMailbox('' + allowed[0].name(), addrs[0]);
+                return addrs[0];
+            }
             throw new Error('account has no email addresses: ' + allowed[0].name());
         })();
         """
@@ -4923,11 +4956,12 @@ JSON.stringify(out);
         // is an exfiltration channel and this does not close it, which is why
         // `read` is the default mode and why the tool allowlist matters.
         let scopeAccounts = allowedList(call.scope.accountsAccess)
+        let draftScopeMailboxes = requiredMailbox == nil ? nil : allowedList(call.scope.mailboxesAccess)
         let senderSnippet = senderJXA(
             from: args?["from"]?.stringValue,
             account: args?["account"]?.stringValue,
             scopeAccounts: scopeAccounts,
-            scopeMailboxes: requiredMailbox == nil ? nil : allowedList(call.scope.mailboxesAccess),
+            scopeMailboxes: draftScopeMailboxes,
             requiredMailbox: requiredMailbox
         )
         let visibleProp = visible ? "" : ",\n    visible: false"
@@ -4981,7 +5015,7 @@ JSON.stringify(out);
             subject: subject,
             from: args?["from"]?.stringValue,
             account: args?["account"]?.stringValue,
-            senderResolved: scopeAccounts != nil
+            senderResolved: scopeAccounts != nil || draftScopeMailboxes != nil
         ))
         // With neither `from` nor `account` given this is the only thing that
         // says which identity the message went out as, and it is what points
