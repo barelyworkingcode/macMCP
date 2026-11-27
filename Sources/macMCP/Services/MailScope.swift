@@ -158,21 +158,30 @@ extension ResourceScope {
         let mailbox: String
     }
 
+    /// Splits `entry` at its first ASCII `/` scalar (never on `Character`,
+    /// which would skip a `/` followed by a combining mark).
+    static func splitFirstSlash(_ entry: String) -> (head: String, tail: String)? {
+        guard let slash = entry.unicodeScalars.firstIndex(of: "/") else { return nil }
+        let head = String(entry.unicodeScalars[..<slash])
+        let tail = String(entry.unicodeScalars[entry.unicodeScalars.index(after: slash)...])
+        guard !head.isEmpty, !tail.isEmpty else { return nil }
+        return (head, tail)
+    }
+
     /// Parses `mail_mailboxes` entries against `allowedAccounts`.
     /// When `allowedAccounts` is `nil` (e.g. `mail_accounts: ["*"]`), no entry
-    /// is split because there is no concrete list of allowed account names.
+    /// is split here because there is no concrete list of allowed account names
+    /// in Swift; generated JXA resolves prefixes against live account names.
     static func parseMailboxRules(
         _ entries: [String],
         allowedAccounts: [String]?
     ) -> [MailMailboxRule] {
         let foldedAccounts = Set((allowedAccounts ?? []).map(fold))
         return entries.map { entry in
-            if !foldedAccounts.isEmpty, let slash = entry.firstIndex(of: "/") {
-                let head = String(entry[..<slash])
-                let tail = String(entry[entry.index(after: slash)...])
-                if !tail.isEmpty, foldedAccounts.contains(fold(head)) {
-                    return MailMailboxRule(account: head, mailbox: tail)
-                }
+            if !foldedAccounts.isEmpty,
+               let (head, tail) = splitFirstSlash(entry),
+               foldedAccounts.contains(fold(head)) {
+                return MailMailboxRule(account: head, mailbox: tail)
             }
             return MailMailboxRule(account: nil, mailbox: entry)
         }
@@ -188,20 +197,40 @@ extension ResourceScope {
         case .refuse, .confirmedEmpty:
             return []
         case .allowed(let entries):
-            let allowedAccounts: [String]?
-            if case .allowed(let accts) = accountsAccess {
-                allowedAccounts = accts
-            } else {
-                allowedAccounts = nil
-            }
-            let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: allowedAccounts)
-            guard let account else {
+            switch accountsAccess {
+            case .allowed(let accts):
+                let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: accts)
+                guard let account else {
+                    return rules.map(\.mailbox)
+                }
+                let want = ResourceScope.fold(account)
+                return rules.compactMap { rule in
+                    guard let ruleAccount = rule.account else { return rule.mailbox }
+                    return ResourceScope.fold(ruleAccount) == want ? rule.mailbox : nil
+                }
+            case .unrestricted:
+                // Wildcard `mail_accounts` (`"*"`): Swift does not hold live
+                // account names, so JXA is authoritative. When a specific
+                // `account` is named, treat it as a known account name so
+                // `Account/Mailbox` entries for that account are recognised;
+                // when `account` is omitted, include both full entries and
+                // post-slash tails so valid paths reach JXA without false
+                // refusals.
+                if let account {
+                    let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: [account])
+                    return rules.map(\.mailbox)
+                }
+                var candidates: [String] = []
+                for entry in entries {
+                    candidates.append(entry)
+                    if let (_, tail) = ResourceScope.splitFirstSlash(entry) {
+                        candidates.append(tail)
+                    }
+                }
+                return candidates
+            case .unscoped, .refuse, .confirmedEmpty:
+                let rules = ResourceScope.parseMailboxRules(entries, allowedAccounts: nil)
                 return rules.map(\.mailbox)
-            }
-            let want = ResourceScope.fold(account)
-            return rules.compactMap { rule in
-                guard let ruleAccount = rule.account else { return rule.mailbox }
-                return ResourceScope.fold(ruleAccount) == want ? rule.mailbox : nil
             }
         }
     }

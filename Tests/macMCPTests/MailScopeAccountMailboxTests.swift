@@ -419,4 +419,207 @@ final class MailScopeAccountMailboxTests: XCTestCase {
         XCTAssertEqual(allowedResult["account"] as? String, "Personal")
         XCTAssertEqual(allowedResult["mailbox"] as? String, "Work")
     }
+
+    // MARK: - Reviewer finding 1: senderJXA enforces draft destination on actual sender account
+
+    private func runSender(
+        from: String?,
+        account: String?,
+        scopeAccounts: [String]?,
+        scopeMailboxes: [String]?,
+        requiredMailbox: String? = "Drafts"
+    ) throws -> (sender: String?, error: String?) {
+        let snippet = MailService.senderJXA(
+            from: from,
+            account: account,
+            scopeAccounts: scopeAccounts,
+            scopeMailboxes: scopeMailboxes,
+            requiredMailbox: requiredMailbox
+        )
+        let payload = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(Self.twoAccounts)
+        var out;
+        try {
+            \(snippet.lines)
+            out = {sender: senderAddr, error: null};
+        } catch (e) {
+            out = {sender: null, error: '' + (e && e.message ? e.message : e)};
+        }
+        JSON.stringify(out);
+        """)
+        return (payload["sender"] as? String, payload["error"] as? String)
+    }
+
+    func testSenderJXARefusesPersonalFromWhenOnlyWorkDraftsGranted() throws {
+        // `from` takes precedence over `account`: even when `account: "Work"`
+        // is also passed, a Personal `from` resolves to Personal and must be
+        // refused before any OutgoingMessage is created.
+        let refused = try runSender(
+            from: "me@personal.example",
+            account: "Work",
+            scopeAccounts: ["Personal", "Work"],
+            scopeMailboxes: ["Work/Drafts"]
+        )
+        XCTAssertNil(refused.sender)
+        let split = MailScopeRefusal.split(refused.error ?? "")
+        XCTAssertTrue(split.violation, split.message)
+        XCTAssertTrue(split.message.contains("Personal"), split.message)
+
+        // Work `from` is allowed.
+        let allowed = try runSender(
+            from: "me@work.example",
+            account: nil,
+            scopeAccounts: ["Personal", "Work"],
+            scopeMailboxes: ["Work/Drafts"]
+        )
+        XCTAssertNil(allowed.error)
+        XCTAssertEqual(allowed.sender, "me@work.example")
+
+        // Wildcard `mail_accounts` with `Work/Drafts`: Personal `from` refused,
+        // and omitted `from`/`account` resolves to Work instead of Mail's default.
+        let wildcardRefused = try runSender(
+            from: "me@personal.example",
+            account: nil,
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/Drafts"]
+        )
+        XCTAssertTrue(MailScopeRefusal.split(wildcardRefused.error ?? "").violation)
+
+        let wildcardOmitted = try runSender(
+            from: nil,
+            account: nil,
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/Drafts"]
+        )
+        XCTAssertNil(wildcardOmitted.error)
+        XCTAssertEqual(wildcardOmitted.sender, "me@work.example")
+    }
+
+    // MARK: - Reviewer finding 2: wildcard mail_accounts resolves qualifiers against live accounts
+
+    private static let wildcardCollisionAccounts = """
+    var mail = makeMail({accounts: [
+        {name: 'Personal', emailAddresses: ['me@personal.example'], mailboxes: [
+            {name: 'INBOX', messages: [{id: 300, messageId: 'p-inbox@example', subject: 'Personal inbox', date: 4000}]},
+            {name: 'Work'},
+            {name: 'INBOX', container: 'Work', messages: [{id: 301, messageId: 'p-work-inbox@example', subject: 'Literal Work/INBOX in Personal', date: 3500}]}
+        ]},
+        {name: 'Work', emailAddresses: ['me@work.example'], mailboxes: [
+            {name: 'INBOX', messages: [{id: 400, messageId: 'w-inbox@example', subject: 'Work inbox', date: 4500}]}
+        ]}
+    ]});
+    """
+
+    func testWildcardAccountsResolvesAccountQualifierAgainstLiveAccountsAndBlocksCollision() throws {
+        // Under mail_accounts: ["*"] (`scopeAccounts: nil`) and
+        // mail_mailboxes: ["Work/INBOX"], `Personal` holds a literal nested
+        // mailbox `Work/INBOX` and `Work` holds `INBOX`. `Work/INBOX` must
+        // resolve against live account names to Work's INBOX and refuse
+        // Personal's literal `Work/INBOX` folder.
+        let personalScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(Self.wildcardCollisionAccounts)
+        \(MailService.scanScriptJXA(
+            account: "Personal",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(personalScan["scanned"] as? [String] ?? [], [])
+
+        let workScan = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(Self.wildcardCollisionAccounts)
+        \(MailService.scanScriptJXA(
+            account: "Work",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(workScan["scanned"] as? [String] ?? [], ["Work:INBOX"])
+
+        let findPersonalCollision = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(Self.wildcardCollisionAccounts)
+        \(MailService.findMessageJXA(
+            account: nil,
+            mailbox: "Work/INBOX",
+            messageId: "301",
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/INBOX"]
+        ))
+        JSON.stringify({bound: found === null ? null : ('' + found.id()), outOfScope: FM_OUT_OF_SCOPE});
+        """)
+        XCTAssertNil(findPersonalCollision["bound"] as? String)
+        XCTAssertEqual(findPersonalCollision["outOfScope"] as? Bool, true)
+
+        let findWorkInbox = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(Self.wildcardCollisionAccounts)
+        \(MailService.findMessageJXA(
+            account: nil,
+            mailbox: "INBOX",
+            messageId: "400",
+            scopeAccounts: nil,
+            scopeMailboxes: ["Work/INBOX"]
+        ))
+        JSON.stringify({bound: found === null ? null : ('' + found.id()), outOfScope: FM_OUT_OF_SCOPE});
+        """)
+        XCTAssertEqual(findWorkInbox["bound"] as? String, "400")
+        XCTAssertEqual(findWorkInbox["outOfScope"] as? Bool, false)
+    }
+
+    // MARK: - Reviewer finding 3: scalar slash split & Greek final sigma folding
+
+    func testSplitFirstSlashSplitsBeforeCombiningMark() {
+        let rules = MailScope.parseMailboxRules(
+            ["Work/\u{0301}INBOX"],
+            allowedAccounts: ["Work"]
+        )
+        XCTAssertEqual(rules, [
+            MailScope.MailMailboxRule(account: "Work", mailbox: "\u{0301}INBOX")
+        ])
+    }
+
+    func testSwiftAndJXAFoldGreekFinalSigmaIdentically() throws {
+        let greekMail = """
+        var mail = makeMail({accounts: [
+            {name: 'ΟΣ', emailAddresses: ['os@example'], mailboxes: [
+                {name: 'INBOX', messages: [{id: 500, messageId: 'os@example', subject: 'Greek', date: 1000}]}
+            ]},
+            {name: 'Personal', emailAddresses: ['p@example'], mailboxes: [
+                {name: 'INBOX', messages: [{id: 501, messageId: 'p@example', subject: 'Personal', date: 1000}]}
+            ]}
+        ]});
+        """
+        let foldedInJS = try JXA.run("""
+        \(MailService.scopeFoldJXA)
+        scopeFold('ΟΣ');
+        """)
+        XCTAssertEqual(foldedInJS, MailScope.fold("ΟΣ"))
+
+        let scanHit = try JXA.runJSON("""
+        \(MailStubJS.source)
+        \(greekMail)
+        \(MailService.scanScriptJXA(
+            account: "ΟΣ",
+            mailbox: "all",
+            query: nil,
+            searchRecipients: false,
+            limit: 20,
+            scopeAccounts: ["ΟΣ", "Personal"],
+            scopeMailboxes: ["ΟΣ/INBOX"]
+        ))
+        """)
+        XCTAssertEqual(scanHit["scanned"] as? [String] ?? [], ["ΟΣ:INBOX"])
+    }
 }

@@ -847,13 +847,41 @@ enum MailService {
     /// Not private: every generated comparison emits it, and a test can only
     /// pin that the two halves agree by running one.
     static let scopeFoldJXA = """
-    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().normalize('NFC'); }
+    function scopeFold(v) { return ('' + v).normalize('NFC').toLowerCase().replace(/\\u03c2/g, '\\u03c3').normalize('NFC'); }
     """
 
     /// Matches a mailbox `(acctName, boxPath)` against `SCOPE_MAILBOXES` rules
     /// emitted by `scopeMailboxRulesJXA`. Plain rules (`a === null`) match any
     /// account; account-qualified rules (`a !== null`) match only that account.
+    /// When `mail_accounts` is wildcard (`"*"`), `scopeParseMailboxRules`
+    /// resolves `Account/Mailbox` prefixes against Mail's live account names.
     static let scopeMailboxAllowsJXA = """
+    function scopeParseMailboxRules(rawEntries, acctNames) {
+        var accts = Object.create(null);
+        for (var i = 0; i < acctNames.length; i++) accts[scopeFold(acctNames[i])] = 1;
+        var rules = [];
+        for (var j = 0; j < rawEntries.length; j++) {
+            var e = '' + rawEntries[j];
+            var sl = e.indexOf('/');
+            if (sl > 0 && sl < e.length - 1) {
+                var head = scopeFold(e.slice(0, sl));
+                if (accts[head]) {
+                    rules.push({a: head, m: scopeFold(e.slice(sl + 1))});
+                    continue;
+                }
+            }
+            rules.push({a: null, m: scopeFold(e)});
+        }
+        return rules;
+    }
+    function scopeLiveAccountNames() {
+        var names = ['On My Mac'];
+        try {
+            var ns = mail.accounts.name();
+            for (var i = 0; i < ns.length; i++) names.push('' + ns[i]);
+        } catch (e) {}
+        return names;
+    }
     function scopeMailboxAllows(rules, acctName, boxPath) {
         if (rules === null) return true;
         var a = scopeFold(acctName), m = scopeFold(boxPath);
@@ -864,12 +892,17 @@ enum MailService {
     }
     """
 
-    /// A JS array literal of folded `{a, m}` mailbox scope rules, or `null` for
-    /// "no scope in play". Splitting of `Account/Mailbox` entries happens once
-    /// here in Swift via `MailScope.parseMailboxRules` so Swift and every
-    /// generated script resolve slash ambiguity identically.
+    /// A JS expression evaluating to folded `{a, m}` mailbox scope rules, or
+    /// `null` for "no scope in play". When `scopeAccounts` is a concrete list,
+    /// splitting happens once in Swift via `MailScope.parseMailboxRules`; when
+    /// `scopeAccounts` is `nil` (`mail_accounts: ["*"]`), the emitted expression
+    /// resolves prefixes against Mail's live account names.
     static func scopeMailboxRulesJXA(_ values: [String]?, scopeAccounts: [String]?) -> String {
         guard let values else { return "null" }
+        guard let scopeAccounts else {
+            let raw = "[" + values.map { "'\(escapeJSString($0))'" }.joined(separator: ", ") + "]"
+            return "scopeParseMailboxRules(\(raw), scopeLiveAccountNames())"
+        }
         let rules = MailScope.parseMailboxRules(values, allowedAccounts: scopeAccounts)
         return "[" + rules.map { rule in
             let acct = rule.account.map { "'\(escapeJSString(MailScope.fold($0)))'" } ?? "null"
@@ -2664,12 +2697,34 @@ enum MailService {
     static func senderJXA(
         from: String?,
         account: String?,
-        scopeAccounts: [String]? = nil
+        scopeAccounts: [String]? = nil,
+        scopeMailboxes: [String]? = nil,
+        requiredMailbox: String? = nil
     ) -> (lines: String, prop: String) {
+        let scopeSentinel = escapeJSString(MailScopeRefusal.sentinel)
+        let mailboxGuardDecl: String
+        if let requiredMailbox, scopeMailboxes != nil {
+            let escapedReq = escapeJSString(requiredMailbox)
+            mailboxGuardDecl = """
+            \(scopeMailboxAllowsJXA)
+            var SEND_SCOPE_MAILBOXES = \(scopeMailboxRulesJXA(scopeMailboxes, scopeAccounts: scopeAccounts));
+            var SEND_REQUIRED_MAILBOX = '\(escapedReq)';
+            function sendRequireMailbox(acctName) {
+                if (!scopeMailboxAllows(SEND_SCOPE_MAILBOXES, acctName, SEND_REQUIRED_MAILBOX)) {
+                    throw new Error('\(scopeSentinel)a draft is saved in account "' + acctName
+                        + '"\\'s "' + SEND_REQUIRED_MAILBOX
+                        + '" mailbox, which is outside the mailboxes this client may reach; nothing was composed');
+                }
+            }
+            """
+        } else {
+            mailboxGuardDecl = "function sendRequireMailbox() {}"
+        }
         // Emitted by every branch below, so a scoped account walk reads the
         // same in all of them.
         let scopeDecl = """
         \(scopeFoldJXA)
+        \(mailboxGuardDecl)
         var SEND_SCOPE_ACCOUNTS = \(scopeArrayJXA(scopeAccounts));
         function sendScopeAllows(name) {
             if (SEND_SCOPE_ACCOUNTS === null) return true;
@@ -2678,7 +2733,6 @@ enum MailService {
             return false;
         }
         """
-        let scopeSentinel = escapeJSString(MailScopeRefusal.sentinel)
         if let from = from {
             let escapedFrom = escapeJSString(from)
             let wanted = escapeJSString(parseAddress(from).address.lowercased())
@@ -2701,7 +2755,10 @@ enum MailService {
                         // not send as is not a suggestion.
                         if (mayUse) known.push(one);
                         if (one.toLowerCase() !== want) continue;
-                        if (mayUse) return '\(escapedFrom)';
+                        if (mayUse) {
+                            sendRequireMailbox('' + accts[i].name());
+                            return '\(escapedFrom)';
+                        }
                         outOfScope = true;
                     }
                 }
@@ -2726,6 +2783,7 @@ enum MailService {
                         if (!sendScopeAllows(accts[i].name())) {
                             throw new Error('\(scopeSentinel)account "\(escapedAccount)" is outside the mail accounts this client may reach, so nothing was composed');
                         }
+                        sendRequireMailbox('' + accts[i].name());
                         var addrs = accts[i].emailAddresses();
                         if (addrs.length > 0) return addrs[0];
                         throw new Error('account has no email addresses: \(escapedAccount)');
@@ -2743,8 +2801,41 @@ enum MailService {
         //
         // Scoped, Mail's default is not an answer to anything the caller
         // asked, so the identity is resolved to the scope instead.
-        guard let scopeAccounts else { return ("var senderAddr = null;", "") }
-        let named = scopeAccounts.map { "\"\($0)\"" }.joined(separator: ", ")
+        if scopeAccounts == nil {
+            guard requiredMailbox != nil, scopeMailboxes != nil else {
+                return ("var senderAddr = null;", "")
+            }
+            let lines = """
+            \(scopeDecl)
+            var senderAddr = (function() {
+                var accts = mail.accounts();
+                var eligible = [];
+                var allAllowed = accts.length > 0;
+                for (var i = 0; i < accts.length; i++) {
+                    if (scopeMailboxAllows(SEND_SCOPE_MAILBOXES, '' + accts[i].name(), SEND_REQUIRED_MAILBOX)) {
+                        eligible.push(accts[i]);
+                    } else {
+                        allAllowed = false;
+                    }
+                }
+                if (allAllowed) return null;
+                if (eligible.length === 0) {
+                    throw new Error('\(scopeSentinel)none of Mail\\'s accounts may write to "' + SEND_REQUIRED_MAILBOX + '" under this client\\'s mail_mailboxes scope, so nothing was composed');
+                }
+                if (eligible.length > 1) {
+                    var names = [];
+                    for (var n = 0; n < eligible.length; n++) names.push('' + eligible[n].name());
+                    throw new Error('\(scopeSentinel)this client may write "' + SEND_REQUIRED_MAILBOX + '" in more than one account (' + names.join(', ')
+                        + ') and named neither `from` nor `account`. Name one -- nothing was composed');
+                }
+                var addrs = eligible[0].emailAddresses();
+                if (addrs.length > 0) return addrs[0];
+                throw new Error('account has no email addresses: ' + eligible[0].name());
+            })();
+            """
+            return (lines, "if (senderAddr !== null) msg.sender = senderAddr;")
+        }
+        let named = (scopeAccounts ?? []).map { "\"\($0)\"" }.joined(separator: ", ")
         let lines = """
         \(scopeDecl)
         var senderAddr = (function() {
@@ -2762,6 +2853,7 @@ enum MailService {
                 throw new Error('\(scopeSentinel)this client may send as more than one account (' + names.join(', ')
                     + ') and named neither `from` nor `account`. Mail would have used its own default account, which need not be one of those. Name one -- nothing was composed');
             }
+            sendRequireMailbox('' + allowed[0].name());
             var addrs = allowed[0].emailAddresses();
             if (addrs.length > 0) return addrs[0];
             throw new Error('account has no email addresses: ' + allowed[0].name());
@@ -4782,6 +4874,7 @@ JSON.stringify(out);
         finalAction: String,
         disposesMessage: Bool,
         call: MailCall,
+        requiredMailbox: String? = nil,
         afterClose: String = "",
         postProcess: (([String: Any]) -> [String: Any])? = nil
     ) -> MCPCallResult {
@@ -4833,7 +4926,9 @@ JSON.stringify(out);
         let senderSnippet = senderJXA(
             from: args?["from"]?.stringValue,
             account: args?["account"]?.stringValue,
-            scopeAccounts: scopeAccounts
+            scopeAccounts: scopeAccounts,
+            scopeMailboxes: requiredMailbox == nil ? nil : allowedList(call.scope.mailboxesAccess),
+            requiredMailbox: requiredMailbox
         )
         let visibleProp = visible ? "" : ",\n    visible: false"
 
@@ -5312,11 +5407,14 @@ var savedDraft = (function() {
         let call = MailCall.forArguments(args, default: Budget.createDraft, meta: ctx.meta)
         if let refusal = scopeRefusal(for: ctx, call: call, mailboxKeys: []) { return refusal }
         let account = args?["account"]?.stringValue
+        let from = args?["from"]?.stringValue
         // The mailbox this call writes into. It is not an argument, which is
         // why it went unchecked; it is still a mailbox this client is reaching.
-        if let refusal = draftDestinationRefusal(call: call, account: account) { return refusal }
+        // `from` takes precedence over `account` in `senderJXA`, so only narrow
+        // the Swift pre-check by `account` when `from` is absent; `senderJXA`
+        // enforces the actual resolved sender account before creating the message.
+        if let refusal = draftDestinationRefusal(call: call, account: from == nil ? account : nil) { return refusal }
         invalidateSourceCache()
-        let from = args?["from"]?.stringValue
         let subject = args?["subject"]?.stringValue ?? ""
 
         let finalAction = """
@@ -5371,7 +5469,7 @@ var savedDraft = (function() {
         // compose message, so an autosaved copy is reported rather than
         // deleted -- deleting one Mail is still holding brings it back.
         let verifyBody = args?["verify_body"]?.boolValue ?? false
-        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, afterClose: afterClose) { payload in
+        return composeEmail(args, visible: false, finalAction: finalAction, disposesMessage: false, call: call, requiredMailbox: draftDestination, afterClose: afterClose) { payload in
             guard let body = args?["body"]?.stringValue,
                   args?["html_body"]?.stringValue == nil,
                   let draft = payload["draft"] as? [String: Any] else { return payload }
